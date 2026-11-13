@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.github.amwtke.pipeliner.api.Split;
 import io.github.amwtke.pipeliner.core.dataplane.*;
 import io.github.amwtke.pipeliner.core.store.ChunkEvent;
+import io.github.amwtke.pipeliner.core.store.StaleEpochException;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
 import java.util.*;
@@ -19,8 +20,9 @@ class RedisDataPlaneTest {
     static StatefulRedisConnection<String, String> raw;
 
     static final String R = "r1";
-    static final String IN = Keys.channel(R, "e1");
-    static final String OUT = Keys.channel(R, "e2");
+    static final long E = 5;   // master epoch used by the tests
+    static final String IN = Keys.channel(R, "e1", 0);
+    static final String OUT = Keys.channel(R, "e2", 0);
 
     @BeforeAll
     static void up() {
@@ -57,8 +59,8 @@ class RedisDataPlaneTest {
 
     @Test
     void commitOk() {
-        dp.ensureGroup(IN);
-        dp.ensureGroup(OUT);
+        dp.ensureGroup(R, IN, E);
+        dp.ensureGroup(R, OUT, E);
         add(IN, "x");
         StreamEntry e = dp.read("c1", Collections.singletonList(IN), 10, 0).get(0);
         assertEquals("x", e.getFields().get("c"));
@@ -78,7 +80,7 @@ class RedisDataPlaneTest {
 
     @Test
     void commitBusy() {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         add(IN, "x");
         add(OUT, "a");
         add(OUT, "b");
@@ -94,7 +96,7 @@ class RedisDataPlaneTest {
 
     @Test
     void commitConflictAfterAutoClaim() throws Exception {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         add(IN, "x");
         StreamEntry e = dp.read("A", Collections.singletonList(IN), 10, 0).get(0);
         Thread.sleep(120);
@@ -110,7 +112,7 @@ class RedisDataPlaneTest {
 
     @Test
     void autoClaimRespectsMinIdleAndRenewResetsIdle() throws Exception {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         add(IN, "x");
         StreamEntry e = dp.read("A", Collections.singletonList(IN), 10, 0).get(0);
         assertTrue(dp.autoClaim("B", IN, 60_000, 10).isEmpty());
@@ -129,31 +131,31 @@ class RedisDataPlaneTest {
     @Test
     void enqueueSplitIdempotent() {
         Split s = new Split("S0000", Collections.singletonMap("k", "v"));
-        assertTrue(dp.enqueueSplit(R, "p1", s));
-        assertFalse(dp.enqueueSplit(R, "p1", s));
-        assertEquals(1, dp.streamLength(Keys.splitQueue(R, "p1")));
-        dp.ensureGroup(Keys.splitQueue(R, "p1"));
-        StreamEntry e = dp.read("c", Collections.singletonList(Keys.splitQueue(R, "p1")), 5, 0).get(0);
+        assertTrue(dp.enqueueSplit(R, "p1", 0, s, E));
+        assertFalse(dp.enqueueSplit(R, "p1", 0, s, E));
+        assertEquals(1, dp.streamLength(Keys.splitQueue(R, "p1", 0)));
+        dp.ensureGroup(R, Keys.splitQueue(R, "p1", 0), E);
+        StreamEntry e = dp.read("c", Collections.singletonList(Keys.splitQueue(R, "p1", 0)), 5, 0).get(0);
         assertEquals("S0000", io.github.amwtke.pipeliner.core.codec.ChunkCodec.decodeSplit(e.getFields().get("s")).getSplitId());
     }
 
     @Test
     void deadLetterRequeueClear() {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         add(IN, "bad");
         StreamEntry e = dp.read("c", Collections.singletonList(IN), 5, 0).get(0);
         dp.deadLetter(DeadLetterRequest.builder().roundId(R).pipelineId("p1").inputStreamKey(IN)
                 .inputEntryId(e.getEntryId()).inputFields(e.getFields()).error("boom").event(ev("cx")).build());
         assertEquals(0, dp.streamLength(IN));
         assertEquals(0, pendingCount(IN));
-        String dlq = Keys.dlq(R, "p1");
+        String dlq = Keys.dlq(R, "p1", 0);
         assertEquals(1, dp.streamLength(dlq));
         Map<String, String> f = raw.sync().xrange(dlq, io.lettuce.core.Range.unbounded()).get(0).getBody();
         assertEquals(IN, f.get("src"));
         assertEquals("bad", f.get("c"));
         assertEquals("boom", f.get("err"));
         assertEquals(1, dp.readJournal(R, "0-0", 10).size());
-        assertEquals(1, dp.requeueDeadLetters(R, "p1"));
+        assertEquals(1, dp.requeueDeadLetters(R, "p1", 0, E));
         assertEquals(0, dp.streamLength(dlq));
         assertEquals(1, dp.streamLength(IN));
         List<StreamEntry> again = dp.read("c", Collections.singletonList(IN), 5, 0);
@@ -163,26 +165,26 @@ class RedisDataPlaneTest {
         // clear
         dp.deadLetter(DeadLetterRequest.builder().roundId(R).pipelineId("p1").inputStreamKey(IN)
                 .inputEntryId(again.get(0).getEntryId()).inputFields(again.get(0).getFields()).error("e2").build());
-        assertEquals(1, dp.clearDeadLetters(R, "p1"));
+        assertEquals(1, dp.clearDeadLetters(R, "p1", 0, E));
         assertEquals(0, dp.streamLength(dlq));
     }
 
     @Test
     void duplicateDeadLetterIsNoOp() {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         add(IN, "bad");
         StreamEntry e = dp.read("c", Collections.singletonList(IN), 5, 0).get(0);
         DeadLetterRequest req = DeadLetterRequest.builder().roundId(R).pipelineId("p1").inputStreamKey(IN)
                 .inputEntryId(e.getEntryId()).inputFields(e.getFields()).error("boom").event(ev("cx")).build();
         dp.deadLetter(req);
         dp.deadLetter(req);   // e.g. a second worker that autoclaimed the same entry
-        assertEquals(1, dp.streamLength(Keys.dlq(R, "p1")));
+        assertEquals(1, dp.streamLength(Keys.dlq(R, "p1", 0)));
         assertEquals(1, dp.readJournal(R, "0-0", 10).size());
     }
 
     @Test
     void autoClaimReportsDeliveryCount() throws Exception {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         add(IN, "x");
         StreamEntry e = dp.read("A", Collections.singletonList(IN), 10, 0).get(0);
         assertEquals(0, e.getDeliveryCount(), "plain reads do not fill it");
@@ -222,7 +224,7 @@ class RedisDataPlaneTest {
         List<ChunkEvent> p3 = dp.readJournal(R, p2.get(1).getEventId(), 10);
         assertEquals(1, p3.size());
         assertTrue(dp.readJournal(R, p3.get(0).getEventId(), 10).isEmpty());
-        dp.trimJournal(R, p2.get(0).getEventId());
+        dp.trimJournal(R, p2.get(0).getEventId(), E);
         List<ChunkEvent> rest = dp.readJournal(R, "0-0", 10);
         assertEquals(3, rest.size());
         assertEquals("c2", rest.get(0).getChunkId());
@@ -256,37 +258,141 @@ class RedisDataPlaneTest {
         dp.addActiveRound("r1");
         dp.addActiveRound("r2");
         assertEquals(new HashSet<>(Arrays.asList("r1", "r2")), dp.activeRounds());
-        dp.removeActiveRound("r1");
+        dp.removeActiveRound("r1", E);
         assertEquals(Collections.singleton("r2"), dp.activeRounds());
-        dp.setDesiredParallelism(R, "p1", 3);
-        dp.setDesiredParallelism(R, "p2", 2);
-        dp.setDesiredParallelism(R, "p2", 0);
+        dp.setDesiredParallelism(R, "p1", 3, 4, E);
+        dp.setDesiredParallelism(R, "p2", 2, 4, E);
+        dp.setDesiredParallelism(R, "p2", 0, 4, E);
         assertEquals(Collections.singletonMap("p1", 3), dp.desiredParallelism(R));
-        dp.assignLocalRun(R, "run1", "podA", 2);
+        assertEquals(Collections.singletonMap("p1", new DesiredState(3, 4)), dp.desiredState(R));
+        dp.assignLocalRun(R, "run1", "podA", 2, E);
         assertEquals(Collections.singletonMap("run1", "podA|2"), dp.localRunAssignments(R));
-        dp.clearLocalRun(R, "run1");
+        dp.clearLocalRun(R, "run1", E);
         assertTrue(dp.localRunAssignments(R).isEmpty());
         assertFalse(dp.isPaused(R));
-        dp.setPaused(R, true);
+        dp.setPaused(R, true, E);
         assertTrue(dp.isPaused(R));
-        dp.setPaused(R, false);
+        dp.setPaused(R, false, E);
         assertFalse(dp.isPaused(R));
         assertFalse(dp.globalThrottle());
-        dp.setGlobalThrottle(true);
+        dp.setGlobalThrottle(true, 0);
         assertTrue(dp.globalThrottle());
-        dp.setGlobalThrottle(false);
+        dp.setGlobalThrottle(false, 0);
         assertFalse(dp.globalThrottle());
         dp.heartbeat("w1", Collections.singletonMap("host", "h"));
         assertTrue(dp.liveWorkers(5000).containsKey("w1"));
         assertTrue(dp.liveWorkers(5000).get("w1") > 0);
         assertTrue(dp.usedMemoryBytes() > 0);
-        dp.deleteKeys(Arrays.asList(Keys.workers(), Keys.workerInfo("w1")));
+        raw.sync().del(Keys.workers(), Keys.workerInfo("w1"));
         assertTrue(dp.liveWorkers(5000).isEmpty());
     }
 
     @Test
+    void zombieMasterIsFencedOnEveryDataPlaneMutation() {
+        // master A (epoch 5) is mid-tick: the round has live data
+        assertTrue(dp.fenceRound(R, 5));
+        dp.ensureGroup(R, IN, 5);
+        dp.setDesiredParallelism(R, "p1", 3, 1, 5);
+        dp.assignLocalRun(R, "run1", "podA", 1, 5);
+        dp.setPaused(R, true, 5);
+        dp.addActiveRound(R);
+        Split sp = new Split("S0000", Collections.singletonMap("k", "v"));
+        assertTrue(dp.enqueueSplit(R, "p1", 1, sp, 5));
+        dp.appendJournal(R, ev("c1"));
+        dp.appendJournal(R, ev("c2"));
+        String eid = dp.readJournal(R, "0-0", 10).get(1).getEventId();
+        add(IN, "x");
+        add(IN, "y");
+        StreamEntry bad = dp.read("c", Collections.singletonList(IN), 1, 0).get(0);
+        dp.deadLetter(DeadLetterRequest.builder().roundId(R).pipelineId("p1").attempt(1).inputStreamKey(IN).inputEntryId(bad.getEntryId())
+                .inputFields(bad.getFields()).error("e").event(ev("c3")).build());
+        String dlq = Keys.dlq(R, "p1", 1);
+
+        // master B takes over (epoch 6); A is a zombie that resumes
+        assertTrue(dp.fenceRound(R, 6));
+        assertFalse(dp.fenceRound(R, 5), "A cannot take the fence back");
+        assertThrows(StaleEpochException.class, () -> dp.setDesiredParallelism(R, "p1", 0, 1, 5));
+        assertThrows(StaleEpochException.class, () -> dp.setDesiredParallelism(R, "p9", 2, 1, 5));
+        assertThrows(StaleEpochException.class, () -> dp.assignLocalRun(R, "run1", "podZ", 9, 5));
+        assertThrows(StaleEpochException.class, () -> dp.clearLocalRun(R, "run1", 5));
+        assertThrows(StaleEpochException.class, () -> dp.setPaused(R, false, 5));
+        assertThrows(StaleEpochException.class, () -> dp.enqueueSplit(R, "p1", 1, new Split("S0001", Collections.singletonMap("k", "w")), 5));
+        assertThrows(StaleEpochException.class, () -> dp.trimJournal(R, eid, 5));
+        assertThrows(StaleEpochException.class, () -> dp.deleteKeys(R, Arrays.asList(IN, Keys.splitQueue(R, "p1", 1), dlq, Keys.journal(R)), 5));
+        assertThrows(StaleEpochException.class, () -> dp.requeueDeadLetters(R, "p1", 1, 5));
+        assertThrows(StaleEpochException.class, () -> dp.clearDeadLetters(R, "p1", 1, 5));
+        assertThrows(StaleEpochException.class, () -> dp.ensureGroup(R, Keys.channel(R, "e9", 1), 5));
+        assertThrows(StaleEpochException.class, () -> dp.removeActiveRound(R, 5));
+
+        // nothing changed
+        assertEquals(Collections.singletonMap("p1", new DesiredState(3, 1)), dp.desiredState(R));
+        assertEquals(Collections.singletonMap("run1", "podA|1"), dp.localRunAssignments(R));
+        assertTrue(dp.isPaused(R));
+        assertTrue(dp.activeRounds().contains(R));
+        assertEquals(1, dp.streamLength(Keys.splitQueue(R, "p1", 1)));
+        assertEquals(1, raw.sync().scard(Keys.splitIndex(R, "p1", 1)));
+        assertEquals(3, dp.readJournal(R, "0-0", 10).size());
+        assertEquals(1, dp.streamLength(dlq));
+        assertEquals(1, raw.sync().exists(IN));
+        assertEquals(0, raw.sync().exists(Keys.channel(R, "e9", 1)));
+
+        // B (and anything at its epoch) can mutate
+        dp.setDesiredParallelism(R, "p1", 0, 1, 6);
+        assertTrue(dp.desiredState(R).isEmpty());
+        assertEquals(1, dp.requeueDeadLetters(R, "p1", 1, 6));
+        dp.trimJournal(R, eid, 6);
+        assertEquals(2, dp.readJournal(R, "0-0", 10).size());
+        dp.deleteKeys(R, Arrays.asList(Keys.splitQueue(R, "p1", 1), Keys.splitIndex(R, "p1", 1)), 6);
+        assertEquals(0, dp.streamLength(Keys.splitQueue(R, "p1", 1)));
+    }
+
+    @Test
+    void attemptsHaveDisjointKeys() {
+        assertNotEquals(Keys.channel(R, "e1", 0), Keys.channel(R, "e1", 1));
+        assertNotEquals(Keys.splitQueue(R, "p", 0), Keys.splitQueue(R, "p", 1));
+        assertNotEquals(Keys.splitIndex(R, "p", 0), Keys.splitIndex(R, "p", 1));
+        assertNotEquals(Keys.dlq(R, "p", 0), Keys.dlq(R, "p", 1));
+        // a split enqueued under attempt 1 does not touch attempt 0's queue and is not deduplicated against it
+        Split s = new Split("S0000", Collections.singletonMap("k", "v"));
+        assertTrue(dp.enqueueSplit(R, "p1", 0, s, 1));
+        assertTrue(dp.enqueueSplit(R, "p1", 1, s, 1));
+        assertEquals(1, dp.streamLength(Keys.splitQueue(R, "p1", 0)));
+        assertEquals(1, dp.streamLength(Keys.splitQueue(R, "p1", 1)));
+        dp.deleteKeys(R, Arrays.asList(Keys.splitQueue(R, "p1", 0), Keys.splitIndex(R, "p1", 0)), 1);
+        assertEquals(0, dp.streamLength(Keys.splitQueue(R, "p1", 0)));
+        assertEquals(1, dp.streamLength(Keys.splitQueue(R, "p1", 1)));
+    }
+
+    @Test
+    void throttleFlagExpiresAndRoundSeqIsMonotonic() throws Exception {
+        dp.setGlobalThrottle(true, 300);
+        assertTrue(dp.globalThrottle());
+        assertTrue(raw.sync().pttl(Keys.throttle()) > 0);
+        Thread.sleep(450);
+        assertFalse(dp.globalThrottle(), "a throttle nobody refreshes expires");
+        dp.setGlobalThrottle(true, 0);
+        assertEquals(-1, raw.sync().pttl(Keys.throttle()));
+        dp.setGlobalThrottle(false, 0);
+        long a = dp.nextRoundSeq(), b = dp.nextRoundSeq();
+        assertEquals(a + 1, b);
+    }
+
+    @Test
+    void renewReportsWhetherTheEntryIsStillPending() {
+        dp.ensureGroup(R, IN, 1);
+        add(IN, "x");
+        StreamEntry e = dp.read("A", Collections.singletonList(IN), 1, 0).get(0);
+        assertTrue(dp.renew("A", IN, e.getEntryId()));
+        dp.commit(CommitRequest.builder().roundId(R).inputStreamKey(IN).inputEntryId(e.getEntryId()).highWatermark(10)
+                .outputs(new ArrayList<OutputChunk>()).event(ev("c")).build());
+        assertFalse(dp.renew("A", IN, e.getEntryId()), "acked entry");
+        raw.sync().del(IN);
+        assertThrows(Exception.class, () -> dp.renew("A", IN, e.getEntryId()), "NOGROUP once the stream is gone");
+    }
+
+    @Test
     void blockingReadsDoNotStallSharedConnection() throws Exception {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         int n = 4;
         ExecutorService ex = Executors.newFixedThreadPool(n);
         CountDownLatch started = new CountDownLatch(n);
@@ -317,7 +423,7 @@ class RedisDataPlaneTest {
 
     @Test
     void blockingReadWakesOnData() throws Exception {
-        dp.ensureGroup(IN);
+        dp.ensureGroup(R, IN, E);
         ExecutorService ex = Executors.newSingleThreadExecutor();
         Future<List<StreamEntry>> f = ex.submit(() -> dp.read("w", Collections.singletonList(IN), 1, 5000));
         Thread.sleep(200);
@@ -329,8 +435,8 @@ class RedisDataPlaneTest {
 
     @Test
     void throughput() {
-        dp.ensureGroup(IN);
-        dp.ensureGroup(OUT);
+        dp.ensureGroup(R, IN, E);
+        dp.ensureGroup(R, OUT, E);
         int n = 2000;
         for (int i = 0; i < n; i++) add(IN, "p" + i);
         long t = System.currentTimeMillis();

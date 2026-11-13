@@ -27,4 +27,6 @@ public class RoundRecord {
     private Long finishedAt;
     private String error;
     private boolean incomplete;
+    /** Globally monotonic submit sequence (DataPlane.nextRoundSeq); the base of sink write versions. */
+    private long seq;
 }

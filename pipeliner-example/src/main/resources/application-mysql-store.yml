@@ -1,0 +1,10 @@
+pipeliner:
+  store:
+    type: mysql
+    datasource: pgstore
+  datasources:
+    pgstore:
+      url: jdbc:mysql://127.0.0.1:3306/pipeliner?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC
+      username: pipeliner
+      password: pipeliner
+      driver-class-name: com.mysql.cj.jdbc.Driver

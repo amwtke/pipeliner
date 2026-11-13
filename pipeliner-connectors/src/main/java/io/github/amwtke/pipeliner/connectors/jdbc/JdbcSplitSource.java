@@ -26,8 +26,10 @@ import java.util.Map;
 import javax.sql.DataSource;
 
 /** JDBC split source for MySQL and ClickHouse (hash, distinct or no split). */
+@lombok.extern.slf4j.Slf4j
 public class JdbcSplitSource implements SplitSource {
     private static final String VALUE_PARAM = "__split_value";
+    private static final java.util.Set<String> WARNED = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private final boolean clickhouse;
     private final String dsName, table, dataset, where, query, orderBy, splitMode, splitColumn, columns;
@@ -52,6 +54,9 @@ public class JdbcSplitSource implements SplitSource {
     @Override public String datasetName() { return dataset != null ? dataset : table; }
 
     @Override public List<Split> enumerate(SourceContext ctx) throws Exception {
+        if (orderBy == null && !"none".equals(splitMode) && WARNED.add(String.valueOf(datasetName() != null ? datasetName() : query)))
+            log.warn("JdbcSplitSource {}: {} split without orderBy(...); a split's rows must come back in a deterministic (total) order "
+                    + "or chunks differ between executions of the same split", datasetName() != null ? datasetName() : query, splitMode);
         List<Split> out = new ArrayList<>();
         if ("hash".equals(splitMode)) {
             for (int i = 0; i < buckets; i++) {

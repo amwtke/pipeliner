@@ -45,15 +45,17 @@ final class CompletionChecker {
                 if (status.get(p) != PipelineStatus.RUNNING) continue;
                 PlanPipeline pp = d.plan.pipeline(p);
                 boolean ready = pp.isSource() ? d.pipe(p).isEnumDone() : upstreamDone(pp, status);
-                if (!ready || !inputsEmpty(roundId, pp)) continue;
+                if (!ready || !inputsEmpty(roundId, pp, run.getAttempt())) continue;
                 drainer.drain(roundId, d.plan);
+                // a source is done only when every split chunk record left PENDING (DONE, or DEAD/SKIPPED): never on an empty queue alone
+                if (pp.isSource() && c.s.store.countChunks(roundId, p, ChunkStatus.PENDING) > 0) continue;
                 boolean failed = c.s.store.countChunks(roundId, p, ChunkStatus.DEAD) > 0;
                 PipelineStatus target = failed ? PipelineStatus.FAILED : PipelineStatus.SUCCEEDED;
                 String err = failed ? "dead-lettered chunks in " + p : null;
                 if (c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, target, err, c.epoch())) {
                     status.put(p, target);
                     d.touch();
-                    c.s.plane.setDesiredParallelism(roundId, p, 0);
+                    c.s.plane.setDesiredParallelism(roundId, p, 0, run.getAttempt(), c.epoch());
                     log.info("round {} pipeline {} {}", roundId, p, target);
                 }
             }
@@ -71,9 +73,9 @@ final class CompletionChecker {
         return true;
     }
 
-    private boolean inputsEmpty(String roundId, PlanPipeline pp) {
-        if (pp.isSource()) return c.s.plane.streamLength(Keys.splitQueue(roundId, pp.getPipelineId())) == 0;
-        for (String e : pp.getInputEdgeIds()) if (c.s.plane.streamLength(Keys.channel(roundId, e)) > 0) return false;
+    private boolean inputsEmpty(String roundId, PlanPipeline pp, int attempt) {
+        if (pp.isSource()) return c.s.plane.streamLength(Keys.splitQueue(roundId, pp.getPipelineId(), attempt)) == 0;
+        for (String e : pp.getInputEdgeIds()) if (c.s.plane.streamLength(Keys.channel(roundId, e, attempt)) > 0) return false;
         return true;
     }
 
@@ -81,7 +83,7 @@ final class CompletionChecker {
         String roundId = d.roundId();
         if (!c.s.store.casRunStatus(roundId, pr.getRunId(), RunStatus.RUNNING, RunStatus.FAILED, msg, c.epoch())) return;
         d.touch();
-        for (String p : pr.getPipelineIds()) c.s.plane.setDesiredParallelism(roundId, p, 0);
+        for (String p : pr.getPipelineIds()) c.s.plane.setDesiredParallelism(roundId, p, 0, run.getAttempt(), c.epoch());
         c.s.metrics.runFinished(roundId, pr.getRunId(), "FAILED", JournalDrainer.elapsed(run));
         log.warn("round {} run {} FAILED: {}", roundId, pr.getRunId(), msg);
     }
@@ -103,8 +105,8 @@ final class CompletionChecker {
             }
             if (c.s.store.casRunStatus(roundId, pr.getRunId(), RunStatus.RUNNING, RunStatus.SUCCEEDED, null, c.epoch())) {
                 d.touch();
-                c.s.plane.deleteKeys(RunKeys.of(roundId, d.plan, pr));
-                c.s.plane.clearLocalRun(roundId, pr.getRunId());
+                c.s.plane.deleteKeys(roundId, RunKeys.of(roundId, d.plan, pr, run.getAttempt()), c.epoch());
+                c.s.plane.clearLocalRun(roundId, pr.getRunId(), c.epoch());
                 c.s.metrics.runFinished(roundId, pr.getRunId(), "SUCCEEDED", JournalDrainer.elapsed(run));
                 log.info("round {} run {} SUCCEEDED", roundId, pr.getRunId());
             }
@@ -188,9 +190,9 @@ final class CompletionChecker {
         List<String> keys = RunKeys.control(r);
         if (success) {
             keys.add(Keys.journal(r));
-            for (PlanRun pr : d.plan.getRuns()) keys.addAll(RunKeys.of(r, d.plan, pr));
+            for (PlanRun pr : d.plan.getRuns()) keys.addAll(RunKeys.of(r, d.plan, pr, d.run(pr.getRunId()).getAttempt()));
         }
-        c.s.plane.deleteKeys(keys);
-        c.s.plane.removeActiveRound(r);
+        c.s.plane.deleteKeys(r, keys, c.epoch());
+        c.s.plane.removeActiveRound(r, c.epoch());
     }
 }

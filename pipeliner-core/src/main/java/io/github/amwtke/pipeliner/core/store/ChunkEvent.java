@@ -27,5 +27,7 @@ public class ChunkEvent {
     private Integer costMs;
     private String error;
     private int attempt;
+    /** Attempt of the run that produced the event; null = unknown (never filtered). */
+    private Integer runAttempt;
     private long ts;
 }

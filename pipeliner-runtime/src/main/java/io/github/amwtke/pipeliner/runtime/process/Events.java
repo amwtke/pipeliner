@@ -8,20 +8,20 @@ public final class Events {
 
     public static ChunkEvent done(String roundId, String runId, String pipelineId, String chunkId, String inputEdge,
                                   String owner, ChunkResult r, int attempt) {
-        return ChunkEvent.builder().type("DONE").roundId(roundId).runId(runId).pipelineId(pipelineId).chunkId(chunkId)
+        return ChunkEvent.builder().runAttempt(attempt).type("DONE").roundId(roundId).runId(runId).pipelineId(pipelineId).chunkId(chunkId)
                 .inputEdge(inputEdge).owner(owner).rowsIn(r.rowsIn).rowsOut(new java.util.LinkedHashMap<>(r.rowsOut))
                 .costMs((int) r.costMillis).attempt(attempt).ts(System.currentTimeMillis()).build();
     }
 
     public static ChunkEvent dead(String roundId, String runId, String pipelineId, String chunkId, String inputEdge,
-                                  String owner, String error) {
+                                  String owner, String error, int attempt) {
         return ChunkEvent.builder().type("DEAD").roundId(roundId).runId(runId).pipelineId(pipelineId).chunkId(chunkId)
-                .inputEdge(inputEdge).owner(owner).error(error).ts(System.currentTimeMillis()).build();
+                .inputEdge(inputEdge).owner(owner).error(error).attempt(attempt).runAttempt(attempt).ts(System.currentTimeMillis()).build();
     }
 
     public static ChunkEvent localRun(boolean ok, String roundId, String runId, String pipelineId, String owner, int attempt, String error) {
         return ChunkEvent.builder().type(ok ? "LOCAL_RUN_DONE" : "LOCAL_RUN_FAILED").roundId(roundId).runId(runId)
-                .pipelineId(pipelineId).owner(owner).attempt(attempt).error(error).ts(System.currentTimeMillis()).build();
+                .pipelineId(pipelineId).owner(owner).attempt(attempt).runAttempt(attempt).error(error).ts(System.currentTimeMillis()).build();
     }
 
     /** Short single-line error text. */

@@ -4,6 +4,7 @@ import io.github.amwtke.pipeliner.api.Split;
 import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
 import io.github.amwtke.pipeliner.core.dataplane.*;
 import io.github.amwtke.pipeliner.core.store.ChunkEvent;
+import io.github.amwtke.pipeliner.core.store.StaleEpochException;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -21,7 +22,9 @@ public class InMemoryDataPlane implements DataPlane {
 
     private final AtomicLong seq = new AtomicLong(1000);
     private final Map<String, Stream> streams = new HashMap<>();
-    private final Map<String, Map<String, Integer>> desired = new HashMap<>();
+    private final Map<String, Map<String, DesiredState>> desired = new HashMap<>();
+    private final Map<String, Long> fences = new HashMap<>();
+    private long roundSeq;
     private final Map<String, Map<String, String>> assign = new HashMap<>();
     private final Set<String> paused = new HashSet<>();
     private final Set<String> active = new LinkedHashSet<>();
@@ -33,6 +36,7 @@ public class InMemoryDataPlane implements DataPlane {
     private long leaderExpiry;
     private long epoch;
     private boolean throttle;
+    private long throttleUntil;
     public final AtomicLong busyCount = new AtomicLong();
     public final AtomicLong conflictCount = new AtomicLong();
 
@@ -93,17 +97,31 @@ public class InMemoryDataPlane implements DataPlane {
 
     // rounds
     @Override public synchronized void addActiveRound(String r) { active.add(r); }
-    @Override public synchronized void removeActiveRound(String r) { active.remove(r); }
+    /** Every master mutation: rejected when a newer master epoch fenced the round (nothing changes). */
+    private void fenced(String r, long epoch) {
+        Long f = fences.get(r);
+        if (f != null && f > epoch) throw new StaleEpochException("round " + r + " data plane fenced by epoch " + f + " > " + epoch);
+    }
+    @Override public synchronized boolean fenceRound(String r, long epoch) {
+        Long f = fences.get(r);
+        if (f != null && f > epoch) return false;
+        fences.put(r, epoch);
+        return true;
+    }
+    @Override public synchronized long nextRoundSeq() { return ++roundSeq; }
+    @Override public synchronized void removeActiveRound(String r, long epoch) { fenced(r, epoch); active.remove(r); }
     @Override public synchronized Set<String> activeRounds() { return new LinkedHashSet<>(active); }
-    @Override public synchronized void setDesiredParallelism(String r, String p, int n) {
-        Map<String, Integer> m = desired.get(r);
+    @Override public synchronized void setDesiredParallelism(String r, String p, int n, int attempt, long epoch) {
+        fenced(r, epoch);
+        Map<String, DesiredState> m = desired.get(r);
         if (m == null) { m = new LinkedHashMap<>(); desired.put(r, m); }
-        if (n == 0) m.remove(p); else m.put(p, n);
+        if (n <= 0) m.remove(p); else m.put(p, new DesiredState(n, attempt));
     }
-    @Override public synchronized Map<String, Integer> desiredParallelism(String r) {
-        return desired.get(r) == null ? new HashMap<String, Integer>() : new HashMap<>(desired.get(r));
+    @Override public synchronized Map<String, DesiredState> desiredState(String r) {
+        return desired.get(r) == null ? new HashMap<String, DesiredState>() : new LinkedHashMap<>(desired.get(r));
     }
-    @Override public synchronized void assignLocalRun(String r, String run, String pod, int attempt) {
+    @Override public synchronized void assignLocalRun(String r, String run, String pod, int attempt, long epoch) {
+        fenced(r, epoch);
         Map<String, String> m = assign.get(r);
         if (m == null) { m = new HashMap<>(); assign.put(r, m); }
         m.put(run, pod + "|" + attempt);
@@ -111,24 +129,33 @@ public class InMemoryDataPlane implements DataPlane {
     @Override public synchronized Map<String, String> localRunAssignments(String r) {
         return assign.get(r) == null ? new HashMap<String, String>() : new HashMap<>(assign.get(r));
     }
-    @Override public synchronized void clearLocalRun(String r, String run) { if (assign.get(r) != null) assign.get(r).remove(run); }
-    @Override public synchronized void setPaused(String r, boolean p) { if (p) paused.add(r); else paused.remove(r); }
+    @Override public synchronized void clearLocalRun(String r, String run, long epoch) { fenced(r, epoch); if (assign.get(r) != null) assign.get(r).remove(run); }
+    @Override public synchronized void setPaused(String r, boolean p, long epoch) { fenced(r, epoch); if (p) paused.add(r); else paused.remove(r); }
     @Override public synchronized boolean isPaused(String r) { return paused.contains(r); }
-    @Override public synchronized void setGlobalThrottle(boolean on) { throttle = on; }
-    @Override public synchronized boolean globalThrottle() { return throttle; }
+    public final AtomicLong throttleSets = new AtomicLong();
+    public volatile long lastThrottleTtl;
+    /** Test knob for usedMemoryBytes(). */
+    public volatile long usedMemory;
+    @Override public synchronized void setGlobalThrottle(boolean on, long ttlMillis) {
+        if (on) { throttleSets.incrementAndGet(); lastThrottleTtl = ttlMillis; }
+        throttle = on;
+        throttleUntil = on && ttlMillis > 0 ? System.currentTimeMillis() + ttlMillis : 0;
+    }
+    @Override public synchronized boolean globalThrottle() { return throttle && (throttleUntil == 0 || System.currentTimeMillis() < throttleUntil); }
 
     // streams
-    @Override public synchronized void ensureGroup(String key) { stream(key).group = true; }
+    @Override public synchronized void ensureGroup(String r, String key, long epoch) { fenced(r, epoch); stream(key).group = true; }
 
-    @Override public synchronized boolean enqueueSplit(String r, String p, Split split) {
-        String idx = Keys.splitIndex(r, p);
+    @Override public synchronized boolean enqueueSplit(String r, String p, int attempt, Split split, long epoch) {
+        fenced(r, epoch);
+        String idx = Keys.splitIndex(r, p, attempt);
         Stream i = stream(idx);
         long marker = Long.parseLong(split.getSplitId().substring(1)) + 1;
         if (i.entries.containsKey(marker)) return false;
         i.entries.put(marker, new HashMap<String, String>());
         Map<String, String> f = new HashMap<>();
         f.put("s", ChunkCodec.encodeSplit(split));
-        add(Keys.splitQueue(r, p), f);
+        add(Keys.splitQueue(r, p, attempt), f);
         return true;
     }
 
@@ -178,19 +205,21 @@ public class InMemoryDataPlane implements DataPlane {
         return out;
     }
 
-    @Override public synchronized void renew(String consumer, String key, String entryId) {
+    @Override public synchronized boolean renew(String consumer, String key, String entryId) {
         Stream s = streams.get(key);
-        Pending p = s == null ? null : s.pending.get(num(entryId));
+        if (s == null || !s.group) throw new IllegalStateException("NOGROUP " + key);
+        Pending p = s.pending.get(num(entryId));
         if (p != null) { p.consumer = consumer; p.since = System.currentTimeMillis(); }
+        return p != null;
     }
 
     @Override public synchronized CommitResult commit(CommitRequest req) {
         Set<String> outKeys = new LinkedHashSet<>();
         for (OutputChunk o : req.getOutputs()) outKeys.add(o.getStreamKey());
         for (String k : outKeys) if (streamLength(k) >= req.getHighWatermark()) { busyCount.incrementAndGet(); return CommitResult.BUSY; }
-        Stream in = stream(req.getInputStreamKey());
+        Stream in = streams.get(req.getInputStreamKey());   // like XACK, never creates the key
         long id = num(req.getInputEntryId());
-        if (in.pending.remove(id) == null) { conflictCount.incrementAndGet(); return CommitResult.CONFLICT; }
+        if (in == null || in.pending.remove(id) == null) { conflictCount.incrementAndGet(); return CommitResult.CONFLICT; }
         in.entries.remove(id);
         for (OutputChunk o : req.getOutputs()) {
             Map<String, String> f = new HashMap<>();
@@ -204,21 +233,22 @@ public class InMemoryDataPlane implements DataPlane {
     }
 
     @Override public synchronized void deadLetter(DeadLetterRequest req) {
-        Stream in = stream(req.getInputStreamKey());
+        Stream in = streams.get(req.getInputStreamKey());
         long id = num(req.getInputEntryId());
-        if (in.pending.remove(id) == null) return;   // not pending any more: already committed or dead-lettered
+        if (in == null || in.pending.remove(id) == null) return;   // not pending any more: already committed or dead-lettered
         in.entries.remove(id);
         Map<String, String> f = new HashMap<>(req.getInputFields());
         f.put("src", req.getInputStreamKey());
         f.put("err", req.getError());
-        add(Keys.dlq(req.getRoundId(), req.getPipelineId()), f);
+        add(Keys.dlq(req.getRoundId(), req.getPipelineId(), req.getAttempt()), f);
         Map<String, String> je = new HashMap<>();
         je.put("e", ChunkCodec.encodeEvent(req.getEvent()));
         add(Keys.journal(req.getRoundId()), je);
     }
 
-    @Override public synchronized int requeueDeadLetters(String r, String p) {
-        Stream d = streams.get(Keys.dlq(r, p));
+    @Override public synchronized int requeueDeadLetters(String r, String p, int attempt, long epoch) {
+        fenced(r, epoch);
+        Stream d = streams.get(Keys.dlq(r, p, attempt));
         if (d == null) return 0;
         int n = 0;
         for (Map<String, String> f : new ArrayList<>(d.entries.values())) {
@@ -232,8 +262,9 @@ public class InMemoryDataPlane implements DataPlane {
         return n;
     }
 
-    @Override public synchronized int clearDeadLetters(String r, String p) {
-        Stream d = streams.get(Keys.dlq(r, p));
+    @Override public synchronized int clearDeadLetters(String r, String p, int attempt, long epoch) {
+        fenced(r, epoch);
+        Stream d = streams.get(Keys.dlq(r, p, attempt));
         if (d == null) return 0;
         int n = d.entries.size();
         d.entries.clear();
@@ -259,12 +290,14 @@ public class InMemoryDataPlane implements DataPlane {
         return out;
     }
 
-    @Override public synchronized void trimJournal(String r, String upTo) {
+    @Override public synchronized void trimJournal(String r, String upTo, long epoch) {
+        fenced(r, epoch);
         Stream s = streams.get(Keys.journal(r));
         if (s != null) s.entries.headMap(num(upTo), false).clear();
     }
 
-    @Override public synchronized void deleteKeys(Collection<String> keys) {
+    @Override public synchronized void deleteKeys(String round, Collection<String> keys, long epoch) {
+        fenced(round, epoch);
         for (String k : keys) {
             streams.remove(k);
             String r = roundOf(k);
@@ -279,7 +312,7 @@ public class InMemoryDataPlane implements DataPlane {
         return a < 0 ? "" : key.substring(a + 1, b);
     }
 
-    @Override public long usedMemoryBytes() { return 0; }
+    @Override public long usedMemoryBytes() { return usedMemory; }
     @Override public void releaseThreadResources() {}
     @Override public void close() {}
 }

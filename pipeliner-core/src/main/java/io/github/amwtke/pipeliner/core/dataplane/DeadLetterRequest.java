@@ -11,6 +11,8 @@ import lombok.Data;
 public class DeadLetterRequest {
     private String roundId;
     private String pipelineId;
+    /** Run attempt (selects the DLQ key). */
+    private int attempt;
     private String inputStreamKey;
     private String inputEntryId;
     private Map<String, String> inputFields;

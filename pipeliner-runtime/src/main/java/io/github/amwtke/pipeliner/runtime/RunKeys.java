@@ -11,14 +11,22 @@ import java.util.List;
 public final class RunKeys {
     private RunKeys() {}
 
-    public static List<String> of(String roundId, ExecutionPlan plan, PlanRun pr) {
+    /** Keys of one attempt of the run. */
+    public static List<String> of(String roundId, ExecutionPlan plan, PlanRun pr, int attempt) {
         List<String> keys = new ArrayList<>();
-        for (PlanChannel ch : plan.getChannels()) if (ch.getRunId().equals(pr.getRunId())) keys.add(Keys.channel(roundId, ch.getEdgeId()));
+        for (PlanChannel ch : plan.getChannels()) if (ch.getRunId().equals(pr.getRunId())) keys.add(Keys.channel(roundId, ch.getEdgeId(), attempt));
         for (String p : pr.getPipelineIds()) {
-            keys.add(Keys.splitQueue(roundId, p));
-            keys.add(Keys.splitIndex(roundId, p));
-            keys.add(Keys.dlq(roundId, p));
+            keys.add(Keys.splitQueue(roundId, p, attempt));
+            keys.add(Keys.splitIndex(roundId, p, attempt));
+            keys.add(Keys.dlq(roundId, p, attempt));
         }
+        return keys;
+    }
+
+    /** Keys of every attempt in [0, toExclusive) of the run. */
+    public static List<String> ofAttemptsBefore(String roundId, ExecutionPlan plan, PlanRun pr, int toExclusive) {
+        List<String> keys = new ArrayList<>();
+        for (int a = 0; a < toExclusive; a++) keys.addAll(of(roundId, plan, pr, a));
         return keys;
     }
 

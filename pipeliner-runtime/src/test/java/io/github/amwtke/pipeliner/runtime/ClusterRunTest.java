@@ -89,7 +89,7 @@ class ClusterRunTest {
             assertEquals(expected(240).size(), sinkRows(sink).size());
             assertTrue(h.plane.busyCount.get() > 0, "upstream must have been told BUSY");
             // a commit may add up to ceil(8 rows / 3) = 3 chunks after seeing XLEN < highWatermark
-            assertTrue(h.plane.maxLen(Keys.channel(round, "e1")) <= 4 - 1 + 3, "max e1 length " + h.plane.maxLen(Keys.channel(round, "e1")));
+            assertTrue(h.plane.maxLen(Keys.channel(round, "e1", 0)) <= 4 - 1 + 3, "max e1 length " + h.plane.maxLen(Keys.channel(round, "e1", 0)));
         }
     }
 

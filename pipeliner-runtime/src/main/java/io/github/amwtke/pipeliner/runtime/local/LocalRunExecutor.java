@@ -11,6 +11,7 @@ import io.github.amwtke.pipeliner.core.store.RoundRecord;
 import io.github.amwtke.pipeliner.core.util.ChunkIds;
 import io.github.amwtke.pipeliner.runtime.Services;
 import io.github.amwtke.pipeliner.runtime.context.SourceContextImpl;
+import io.github.amwtke.pipeliner.runtime.instance.PipelineInstance;
 import io.github.amwtke.pipeliner.runtime.process.ChunkProcessor;
 import io.github.amwtke.pipeliner.runtime.process.ChunkResult;
 import io.github.amwtke.pipeliner.runtime.process.Events;
@@ -40,6 +41,7 @@ public final class LocalRunExecutor implements Runnable {
     private final PlanRun run;
     private final int attempt;
     private final Map<String, ChunkProcessor> processors = new HashMap<>();
+    private final List<PipelineInstance.Lease> leases = new ArrayList<>();
     private final List<Thread> threads = new ArrayList<>();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private volatile String failedPipeline;
@@ -53,8 +55,6 @@ public final class LocalRunExecutor implements Runnable {
         this.round = round;
         this.run = plan.run(runId);
         this.attempt = attempt;
-        for (String pid : run.getPipelineIds())
-            processors.put(pid, new ChunkProcessor(s, plan, round.getRoundId(), round.getParams(), pid));
     }
 
     public void start() {
@@ -72,6 +72,7 @@ public final class LocalRunExecutor implements Runnable {
 
     @Override public void run() {
         try {
+            openInstances();
             if (run.getMode() == ExecMode.INLINE) runInline(); else runThreaded();
             if (cancelled) return;
             s.plane.appendJournal(round.getRoundId(), Events.localRun(true, round.getRoundId(), run.getRunId(), null, s.podId(), attempt, null));
@@ -83,7 +84,17 @@ public final class LocalRunExecutor implements Runnable {
                         s.podId(), attempt, Events.describe(t)));
             } catch (RuntimeException e) { log.error("could not report local run failure", e); }
         } finally {
+            for (PipelineInstance.Lease l : leases) l.release();   // also on cancel / failure
             s.plane.releaseThreadResources();
+        }
+    }
+
+    /** Instantiates and opens every pipeline of the run (released when the run ends). */
+    private void openInstances() throws Exception {
+        for (String pid : run.getPipelineIds()) {
+            PipelineInstance.Lease l = s.instances.acquire(plan, round.getRoundId(), round.getParams(), pid, attempt);
+            leases.add(l);
+            processors.put(pid, new ChunkProcessor(s, plan, round.getRoundId(), round.getParams(), pid, l, attempt, round.getSeq()));
         }
     }
 
@@ -121,7 +132,13 @@ public final class LocalRunExecutor implements Runnable {
         }
         List<Thread> copy;
         synchronized (threads) { copy = new ArrayList<>(threads); }
-        for (Thread t : copy) t.join();
+        for (Thread t : copy) {   // keep waiting when cancelled: instances are released only after every pipeline thread is gone
+            boolean interrupted = false;
+            while (t.isAlive()) {
+                try { t.join(); } catch (InterruptedException e) { interrupted = true; }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
+        }
         if (cancelled) throw new CancellationException();
         Throwable f = failure.get();
         if (f != null) throw f instanceof Exception ? (Exception) f : new RuntimeException(f);

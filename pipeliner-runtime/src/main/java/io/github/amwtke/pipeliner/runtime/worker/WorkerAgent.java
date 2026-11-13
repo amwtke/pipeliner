@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.runtime.worker;
 
+import io.github.amwtke.pipeliner.core.dataplane.DesiredState;
 import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
 import io.github.amwtke.pipeliner.core.store.RoundRecord;
 import io.github.amwtke.pipeliner.runtime.Services;
@@ -24,7 +25,9 @@ public final class WorkerAgent implements Runnable {
 
     private final Services s;
     private final ClaimRenewer renewer;
-    private final Map<String, List<ClusterPipelineWorker>> workers = new HashMap<>();
+    private final Map<String, Group> workers = new HashMap<>();
+    /** Threads of superseded attempts that were asked to stop (killed with the agent). */
+    private final List<ClusterPipelineWorker> retiring = new ArrayList<>();
     private final Map<String, LocalHandle> locals = new HashMap<>();
     private final Map<String, RoundRecord> roundCache = new HashMap<>();
     private final Set<String> warned = new HashSet<>();
@@ -54,7 +57,9 @@ public final class WorkerAgent implements Runnable {
             try { t.join(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
         synchronized (this) {
-            for (List<ClusterPipelineWorker> l : workers.values()) for (ClusterPipelineWorker w : l) w.kill();
+            for (Group g : workers.values()) for (ClusterPipelineWorker w : g.list) w.kill();
+            for (ClusterPipelineWorker w : retiring) w.kill();
+            retiring.clear();
             for (LocalHandle h : locals.values()) h.executor.cancel();
             workers.clear();
             locals.clear();
@@ -91,9 +96,9 @@ public final class WorkerAgent implements Runnable {
             catch (RuntimeException e) { log.warn("reconcile of round {} failed: {}", roundId, e.toString()); }
         }
         // stop everything belonging to rounds that are no longer active
-        for (Iterator<Map.Entry<String, List<ClusterPipelineWorker>>> it = workers.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<String, List<ClusterPipelineWorker>> e = it.next();
-            if (!active.contains(roundOf(e.getKey()))) { for (ClusterPipelineWorker w : e.getValue()) w.stop(); it.remove(); }
+        for (Iterator<Map.Entry<String, Group>> it = workers.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, Group> e = it.next();
+            if (!active.contains(roundOf(e.getKey()))) { for (ClusterPipelineWorker w : e.getValue().list) w.stop(); it.remove(); }
         }
         for (Iterator<Map.Entry<String, LocalHandle>> it = locals.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<String, LocalHandle> e = it.next();
@@ -119,30 +124,44 @@ public final class WorkerAgent implements Runnable {
         reconcileLocalRuns(roundId, rr, plan);
     }
 
+    /** Worker threads of one pipeline, all working on the same run attempt. */
+    private static final class Group {
+        final int attempt;
+        final List<ClusterPipelineWorker> list = new ArrayList<>();
+        Group(int attempt) { this.attempt = attempt; }
+    }
+
     private void reconcileWorkers(String roundId, RoundRecord rr, ExecutionPlan plan) {
-        Map<String, Integer> desired = s.plane.desiredParallelism(roundId);
-        for (Map.Entry<String, Integer> e : desired.entrySet()) {
+        Map<String, DesiredState> desired = s.plane.desiredState(roundId);
+        for (Map.Entry<String, DesiredState> e : desired.entrySet()) {
             String pipeline = e.getKey();
             if (plan.pipeline(pipeline) == null) continue;
             String key = roundId + "|" + pipeline;
-            List<ClusterPipelineWorker> list = workers.get(key);
-            if (list == null) { list = new ArrayList<>(); workers.put(key, list); }
+            DesiredState ds = e.getValue();
+            Group g = workers.get(key);
+            if (g != null && g.attempt != ds.getAttempt()) {   // rerun: the old attempt's threads finish their chunk and exit; fresh instance for the new one
+                for (ClusterPipelineWorker w : g.list) { w.stop(); retiring.add(w); }
+                g = null;
+            }
+            if (g == null) { g = new Group(ds.getAttempt()); workers.put(key, g); }
+            List<ClusterPipelineWorker> list = g.list;
             list.removeIf(w -> w.stopRequested() || !w.alive());
-            int n = e.getValue();
+            int n = ds.getParallelism();
             while (list.size() > n) list.remove(list.size() - 1).stop();
             while (list.size() < n) {
                 int idx = list.size();
-                ClusterPipelineWorker w = new ClusterPipelineWorker(s, plan, rr, pipeline, s.podId() + "#" + idx, renewer);
+                ClusterPipelineWorker w = new ClusterPipelineWorker(s, plan, rr, pipeline, ds.getAttempt(), s.podId() + "#" + idx, renewer);
                 list.add(w);
-                w.start("pg-w-" + roundId + "-" + pipeline + "-" + idx);
+                w.start("pg-w-" + roundId + "-" + pipeline + "-" + ds.getAttempt() + "-" + idx);
             }
         }
         String prefix = roundId + "|";
-        for (Map.Entry<String, List<ClusterPipelineWorker>> e : workers.entrySet()) {
+        for (Map.Entry<String, Group> e : workers.entrySet()) {
             if (!e.getKey().startsWith(prefix) || desired.containsKey(e.getKey().substring(prefix.length()))) continue;
-            for (ClusterPipelineWorker w : e.getValue()) w.stop();
-            e.getValue().clear();
+            for (ClusterPipelineWorker w : e.getValue().list) w.stop();
+            e.getValue().list.clear();
         }
+        retiring.removeIf(w -> !w.alive());
     }
 
     private void reconcileLocalRuns(String roundId, RoundRecord rr, ExecutionPlan plan) {

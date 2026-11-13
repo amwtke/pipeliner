@@ -250,8 +250,10 @@ public final class Planner {
         for (PipelineSpec p : specs.values()) {
             if (p.getSource() == null && !in.containsKey(p.getId()))
                 throw new PlanException("pipeline " + p.getId() + " has no source and no incoming stream edge");
-            if (p.getRowRunner() != null && p.getBatchRunner() != null)
-                throw new PlanException("pipeline " + p.getId() + " sets both a row runner and a batch runner");
+            if (p.runnerCount() > 1)
+                throw new PlanException("pipeline " + p.getId() + " sets both a row runner and a batch runner, or more than one runner (instance or type)");
+            if (p.isPerThread() && !p.lazyRunner())
+                throw new PlanException("pipeline " + p.getId() + ": runnerPerThread() needs a type-based runner (row(Class) / batch(Class))");
         }
         for (GateSpec s : g.getGates()) {
             if (s.getAfter().isEmpty()) throw new PlanException("gate " + s.getId() + ": 'after' must not be empty");
@@ -349,8 +351,10 @@ public final class Planner {
     // ---------------------------------------------------------------- hash
 
     private static String cn(Object o) {
-        if (o == null) return null;
-        String n = o.getClass().getName();
+        return o == null ? null : stripLambda(o.getClass().getName());
+    }
+
+    private static String stripLambda(String n) {
         int i = n.indexOf("$$Lambda");
         return i >= 0 ? n.substring(0, i) + "$$Lambda" : n;
     }
@@ -384,7 +388,8 @@ public final class Planner {
             p.put("id", s.getId());
             p.put("source", s.getSource() == null ? null : cn(s.getSource()));
             p.put("sourceDataset", s.getSource() == null ? null : s.getSource().datasetName());
-            p.put("runner", s.getRowRunner() != null ? "row:" + cn(s.getRowRunner()) : s.getBatchRunner() != null ? "batch:" + cn(s.getBatchRunner()) : null);
+            p.put("runner", s.hasRunner() ? s.runnerKind() + ":" + stripLambda(s.runnerClassName()) : null);
+            if (s.isPerThread()) p.put("perThread", true);   // only when set, so instance-based hashes stay unchanged
             p.put("ports", new ArrayList<>(s.getPorts()));
             Map<String, Object> sinks = new LinkedHashMap<>();
             for (String port : new TreeSet<>(s.getSinks().keySet())) {

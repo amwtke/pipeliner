@@ -2,6 +2,7 @@ package io.github.amwtke.pipeliner.runtime;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.github.amwtke.pipeliner.api.PipelinerException;
 import io.github.amwtke.pipeliner.api.Row;
 import io.github.amwtke.pipeliner.runtime.process.OutputCutter;
 import java.util.*;
@@ -18,6 +19,16 @@ class OutputCutterTest {
         List<Integer> s = new ArrayList<>();
         for (List<Row> p : parts) s.add(p.size());
         return s;
+    }
+
+    @Test void ungroupedOutputIsRejected() {
+        // key 1 reappears after key 2 closed its group: cutting it silently would split the group over two chunks
+        PipelinerException ex = assertThrows(PipelinerException.class,
+                () -> OutputCutter.cut(rows(1, 1, 2, 1), 100, 1 << 20, Arrays.asList("k")));
+        assertTrue(ex.getMessage().contains("not grouped by chunkKey"), ex.getMessage());
+        // grouped output and unkeyed output are fine, even with repeated values
+        assertEquals(Arrays.asList(4), sizes(OutputCutter.cut(rows(1, 1, 2, 2), 100, 1 << 20, Arrays.asList("k"))));
+        assertEquals(Arrays.asList(4), sizes(OutputCutter.cut(rows(1, 2, 1, 2), 100, 1 << 20, Collections.<String>emptyList())));
     }
 
     @Test void cutsByRowCount() {

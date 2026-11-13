@@ -5,6 +5,7 @@ import io.github.amwtke.pipeliner.api.Split;
 import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
 import io.github.amwtke.pipeliner.core.dataplane.*;
 import io.github.amwtke.pipeliner.core.store.ChunkEvent;
+import io.github.amwtke.pipeliner.core.store.StaleEpochException;
 import io.lettuce.core.*;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
@@ -37,6 +38,10 @@ public class RedisDataPlane implements DataPlane {
     private final Script enqueueS = new Script("enqueue_split");
     private final Script deadS = new Script("dead_letter");
     private final Script requeueS = new Script("requeue_dlq");
+    private final Script fenceS = new Script("fence");
+    private final Script fencedCmdS = new Script("fenced_cmd");
+    private final Script ensureGroupS = new Script("ensure_group");
+    private final Script clearDlqS = new Script("clear_dlq");
     private final Script leaderS = new Script("leader");
     private final Script releaseS = new Script("release_leader");
 
@@ -44,7 +49,7 @@ public class RedisDataPlane implements DataPlane {
         this.client = client;
         this.shared = client.connect(StringCodec.UTF8);
         this.cmd = shared.sync();
-        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, leaderS, releaseS)) s.load();
+        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS)) s.load();
     }
 
     /** A Lua script loaded via SCRIPT LOAD, run with EVALSHA and falling back to EVAL on NOSCRIPT. */
@@ -82,6 +87,26 @@ public class RedisDataPlane implements DataPlane {
             }
             return ((Number) r).longValue();
         }
+    }
+
+    /** Runs a fenced script: KEYS[1]=fence key and ARGV[1]=epoch are prepended; -2 means a newer master holds the round. */
+    private long fenced(Script sc, String roundId, long epoch, String[] keys, String... args) {
+        String[] k = new String[keys.length + 1];
+        k[0] = Keys.fence(roundId);
+        System.arraycopy(keys, 0, k, 1, keys.length);
+        String[] a = new String[args.length + 1];
+        a[0] = String.valueOf(epoch);
+        System.arraycopy(args, 0, a, 1, args.length);
+        long r = sc.run(k, a);
+        if (r == -2) throw new StaleEpochException("round " + roundId + " data plane is fenced by a newer master epoch (epoch " + epoch + ")");
+        return r;
+    }
+
+    private long fencedCmd(String roundId, long epoch, String command, String[] keys, String... args) {
+        String[] a = new String[args.length + 1];
+        a[0] = command;
+        System.arraycopy(args, 0, a, 1, args.length);
+        return fenced(fencedCmdS, roundId, epoch, keys, a);
     }
 
     // membership and leadership
@@ -125,45 +150,59 @@ public class RedisDataPlane implements DataPlane {
 
     // rounds and desired state
 
+    @Override public boolean fenceRound(String roundId, long epoch) {
+        return fenceS.run(new String[] {Keys.fence(roundId)}, String.valueOf(epoch)) == 1;
+    }
+
+    @Override public long nextRoundSeq() { return cmd.incr(Keys.roundSeq()); }
+
     @Override public void addActiveRound(String roundId) { cmd.sadd(Keys.activeRounds(), roundId); }
 
-    @Override public void removeActiveRound(String roundId) { cmd.srem(Keys.activeRounds(), roundId); }
+    @Override public void removeActiveRound(String roundId, long epoch) {
+        fencedCmd(roundId, epoch, "SREM", new String[] {Keys.activeRounds()}, roundId);
+    }
 
     @Override public Set<String> activeRounds() { return new LinkedHashSet<>(cmd.smembers(Keys.activeRounds())); }
 
-    @Override public void setDesiredParallelism(String roundId, String pipelineId, int parallelism) {
-        if (parallelism <= 0) cmd.hdel(Keys.desired(roundId), pipelineId);
-        else cmd.hset(Keys.desired(roundId), pipelineId, String.valueOf(parallelism));
+    @Override public void setDesiredParallelism(String roundId, String pipelineId, int parallelism, int attempt, long epoch) {
+        if (parallelism <= 0) fencedCmd(roundId, epoch, "HDEL", new String[] {Keys.desired(roundId)}, pipelineId);
+        else fencedCmd(roundId, epoch, "HSET", new String[] {Keys.desired(roundId)}, pipelineId, parallelism + "|" + attempt);
     }
 
-    @Override public Map<String, Integer> desiredParallelism(String roundId) {
-        Map<String, Integer> out = new LinkedHashMap<>();
+    @Override public Map<String, DesiredState> desiredState(String roundId) {
+        Map<String, DesiredState> out = new LinkedHashMap<>();
         for (Map.Entry<String, String> e : cmd.hgetall(Keys.desired(roundId)).entrySet()) {
-            out.put(e.getKey(), Integer.valueOf(e.getValue()));
+            String v = e.getValue();
+            int bar = v.indexOf('|');
+            out.put(e.getKey(), bar < 0 ? new DesiredState(Integer.parseInt(v), 0)
+                    : new DesiredState(Integer.parseInt(v.substring(0, bar)), Integer.parseInt(v.substring(bar + 1))));
         }
         return out;
     }
 
-    @Override public void assignLocalRun(String roundId, String runId, String podId, int attempt) {
-        cmd.hset(Keys.assign(roundId), runId, podId + "|" + attempt);
+    @Override public void assignLocalRun(String roundId, String runId, String podId, int attempt, long epoch) {
+        fencedCmd(roundId, epoch, "HSET", new String[] {Keys.assign(roundId)}, runId, podId + "|" + attempt);
     }
 
     @Override public Map<String, String> localRunAssignments(String roundId) {
         return new LinkedHashMap<>(cmd.hgetall(Keys.assign(roundId)));
     }
 
-    @Override public void clearLocalRun(String roundId, String runId) { cmd.hdel(Keys.assign(roundId), runId); }
+    @Override public void clearLocalRun(String roundId, String runId, long epoch) {
+        fencedCmd(roundId, epoch, "HDEL", new String[] {Keys.assign(roundId)}, runId);
+    }
 
-    @Override public void setPaused(String roundId, boolean paused) {
-        if (paused) cmd.set(Keys.paused(roundId), "1");
-        else cmd.del(Keys.paused(roundId));
+    @Override public void setPaused(String roundId, boolean paused, long epoch) {
+        if (paused) fencedCmd(roundId, epoch, "SET", new String[] {Keys.paused(roundId)}, "1");
+        else fencedCmd(roundId, epoch, "DEL", new String[] {Keys.paused(roundId)});
     }
 
     @Override public boolean isPaused(String roundId) { return cmd.exists(Keys.paused(roundId)) > 0; }
 
-    @Override public void setGlobalThrottle(boolean on) {
-        if (on) cmd.set(Keys.throttle(), "1");
-        else cmd.del(Keys.throttle());
+    @Override public void setGlobalThrottle(boolean on, long ttlMillis) {
+        if (!on) cmd.del(Keys.throttle());
+        else if (ttlMillis > 0) cmd.set(Keys.throttle(), "1", SetArgs.Builder.px(ttlMillis));
+        else cmd.set(Keys.throttle(), "1");
     }
 
     @Override public boolean globalThrottle() { return cmd.exists(Keys.throttle()) > 0; }
@@ -190,18 +229,12 @@ public class RedisDataPlane implements DataPlane {
 
     // streams
 
-    @Override public void ensureGroup(String streamKey) {
-        try {
-            cmd.xgroupCreate(XReadArgs.StreamOffset.from(streamKey, "0"), Keys.GROUP, XGroupCreateArgs.Builder.mkstream());
-        } catch (RedisBusyException e) {
-            // group already exists
-        } catch (RedisCommandExecutionException e) {
-            if (e.getMessage() == null || !e.getMessage().startsWith("BUSYGROUP")) throw e;
-        }
+    @Override public void ensureGroup(String roundId, String streamKey, long epoch) {
+        fenced(ensureGroupS, roundId, epoch, new String[] {streamKey}, Keys.GROUP);
     }
 
-    @Override public boolean enqueueSplit(String roundId, String pipelineId, Split split) {
-        return enqueueS.run(new String[] {Keys.splitIndex(roundId, pipelineId), Keys.splitQueue(roundId, pipelineId)},
+    @Override public boolean enqueueSplit(String roundId, String pipelineId, int attempt, Split split, long epoch) {
+        return fenced(enqueueS, roundId, epoch, new String[] {Keys.splitIndex(roundId, pipelineId, attempt), Keys.splitQueue(roundId, pipelineId, attempt)},
                 split.getSplitId(), ChunkCodec.encodeSplit(split)) == 1;
     }
 
@@ -264,8 +297,8 @@ public class RedisDataPlane implements DataPlane {
         return out;
     }
 
-    @Override public void renew(String consumer, String streamKey, String entryId) {
-        cmd.xclaim(streamKey, Consumer.from(Keys.GROUP, consumer), new XClaimArgs().minIdleTime(0).justid(), entryId);
+    @Override public boolean renew(String consumer, String streamKey, String entryId) {
+        return !cmd.xclaim(streamKey, Consumer.from(Keys.GROUP, consumer), new XClaimArgs().minIdleTime(0).justid(), entryId).isEmpty();
     }
 
     @Override public CommitResult commit(CommitRequest req) {
@@ -294,7 +327,7 @@ public class RedisDataPlane implements DataPlane {
     }
 
     @Override public void deadLetter(DeadLetterRequest req) {
-        String[] keys = {req.getInputStreamKey(), Keys.dlq(req.getRoundId(), req.getPipelineId()), Keys.journal(req.getRoundId())};
+        String[] keys = {req.getInputStreamKey(), Keys.dlq(req.getRoundId(), req.getPipelineId(), req.getAttempt()), Keys.journal(req.getRoundId())};
         List<String> args = new ArrayList<>(Arrays.asList(Keys.GROUP, req.getInputEntryId(),
                 req.getError() == null ? "" : req.getError(),
                 req.getEvent() == null ? "" : ChunkCodec.encodeEvent(req.getEvent())));
@@ -307,22 +340,19 @@ public class RedisDataPlane implements DataPlane {
         deadS.run(keys, args.toArray(new String[0]));
     }
 
-    @Override public int requeueDeadLetters(String roundId, String pipelineId) {
-        String[] keys = {Keys.dlq(roundId, pipelineId)};
+    @Override public int requeueDeadLetters(String roundId, String pipelineId, int attempt, long epoch) {
+        String[] keys = {Keys.dlq(roundId, pipelineId, attempt)};
         int total = 0;
         long n;
         do {
-            n = requeueS.run(keys, String.valueOf(REQUEUE_BATCH));
+            n = fenced(requeueS, roundId, epoch, keys, String.valueOf(REQUEUE_BATCH));
             total += n;
         } while (n >= REQUEUE_BATCH);
         return total;
     }
 
-    @Override public int clearDeadLetters(String roundId, String pipelineId) {
-        String key = Keys.dlq(roundId, pipelineId);
-        Long n = cmd.xlen(key);
-        cmd.del(key);
-        return n == null ? 0 : n.intValue();
+    @Override public int clearDeadLetters(String roundId, String pipelineId, int attempt, long epoch) {
+        return (int) fenced(clearDlqS, roundId, epoch, new String[] {Keys.dlq(roundId, pipelineId, attempt)});
     }
 
     @Override public void appendJournal(String roundId, ChunkEvent event) {
@@ -344,13 +374,13 @@ public class RedisDataPlane implements DataPlane {
         return out;
     }
 
-    @Override public void trimJournal(String roundId, String upToId) {
-        cmd.xtrim(Keys.journal(roundId), new XTrimArgs().minId(upToId).exactTrimming());
+    @Override public void trimJournal(String roundId, String upToId, long epoch) {
+        fencedCmd(roundId, epoch, "XTRIM", new String[] {Keys.journal(roundId)}, "MINID", upToId);
     }
 
-    @Override public void deleteKeys(Collection<String> keys) {
+    @Override public void deleteKeys(String roundId, Collection<String> keys, long epoch) {
         if (keys == null || keys.isEmpty()) return;
-        cmd.del(keys.toArray(new String[0]));
+        fencedCmd(roundId, epoch, "DEL", keys.toArray(new String[0]));
     }
 
     @Override public long usedMemoryBytes() {

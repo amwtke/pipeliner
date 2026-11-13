@@ -1,9 +1,11 @@
 package io.github.amwtke.pipeliner.runtime.process;
 
+import io.github.amwtke.pipeliner.api.BatchRunner;
 import io.github.amwtke.pipeliner.api.Chunk;
 import io.github.amwtke.pipeliner.api.Collector;
 import io.github.amwtke.pipeliner.api.PipelinerException;
 import io.github.amwtke.pipeliner.api.Row;
+import io.github.amwtke.pipeliner.api.RowRunner;
 import io.github.amwtke.pipeliner.api.Sink;
 import io.github.amwtke.pipeliner.api.Split;
 import io.github.amwtke.pipeliner.core.graph.PipelineSpec;
@@ -14,6 +16,7 @@ import io.github.amwtke.pipeliner.runtime.Services;
 import io.github.amwtke.pipeliner.runtime.context.RunContextImpl;
 import io.github.amwtke.pipeliner.runtime.context.SinkContextImpl;
 import io.github.amwtke.pipeliner.runtime.context.SourceContextImpl;
+import io.github.amwtke.pipeliner.runtime.instance.PipelineInstance;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,21 +30,34 @@ public final class ChunkProcessor {
     private final Map<String, String> params;
     private final PlanPipeline pp;
     private final PipelineSpec spec;
+    private final PipelineInstance.Lease lease;
+    private final int attempt;
+    private final long writeVersion;
 
-    public ChunkProcessor(Services s, ExecutionPlan plan, String roundId, Map<String, String> params, String pipelineId) {
+    /** The lease supplies the resolved source and runner (own runner when the pipeline is perThread). */
+    public ChunkProcessor(Services s, ExecutionPlan plan, String roundId, Map<String, String> params, String pipelineId, PipelineInstance.Lease lease) {
+        this(s, plan, roundId, params, pipelineId, lease, 0, 0L);
+    }
+
+    /** attempt: the run attempt this processor works for; roundSeq: RoundRecord.seq. writeVersion = roundSeq * 1000 + attempt. */
+    public ChunkProcessor(Services s, ExecutionPlan plan, String roundId, Map<String, String> params, String pipelineId, PipelineInstance.Lease lease,
+                          int attempt, long roundSeq) {
+        this.attempt = attempt;
+        this.writeVersion = roundSeq * 1000L + attempt;
         this.s = s;
         this.plan = plan;
         this.roundId = roundId;
         this.params = params;
         this.pp = plan.pipeline(pipelineId);
         this.spec = plan.getGraph().getPipelines().get(pipelineId);
+        this.lease = lease;
     }
 
     public PlanPipeline pipeline() { return pp; }
 
     /** Reads a source split into the input chunk (chunk id = split id). */
     public Chunk readSource(Split split) throws Exception {
-        List<Row> rows = spec.getSource().read(split, new SourceContextImpl(roundId, params, s.dataSources));
+        List<Row> rows = lease.instance().source().read(split, new SourceContextImpl(roundId, params, s.dataSources));
         return new Chunk(split.getSplitId(), rows, headers(null));
     }
 
@@ -57,7 +73,7 @@ public final class ChunkProcessor {
             res.rowsOut.put("sink:" + e.getKey(), (long) rows.size());
             if (rows.isEmpty()) continue;
             Chunk sinkChunk = new Chunk(ChunkIds.sinkChunk(in.getChunkId(), e.getKey()), rows, headers(null));
-            SinkContextImpl ctx = new SinkContextImpl(roundId, pp.getRunId(), pp.getPipelineId(), params, s.dataSources);
+            SinkContextImpl ctx = new SinkContextImpl(roundId, pp.getRunId(), pp.getPipelineId(), params, s.dataSources, attempt, writeVersion);
             for (Sink sink : e.getValue()) sink.write(sinkChunk, ctx);
         }
 
@@ -67,7 +83,13 @@ public final class ChunkProcessor {
             int ordinal = plan.channel(edgeId).getOrdinal();
             long n = 0;
             int seq = 0;
-            for (List<Row> part : OutputCutter.cut(rows, pp.getChunkRows(), pp.getChunkBytes(), pp.getChunkKey())) {
+            List<List<Row>> parts;
+            try {
+                parts = OutputCutter.cut(rows, pp.getChunkRows(), pp.getChunkBytes(), pp.getChunkKey());
+            } catch (PipelinerException ex) {
+                throw new PipelinerException("output of port " + pe.getKey() + " of pipeline " + pp.getPipelineId() + ": " + ex.getMessage());
+            }
+            for (List<Row> part : parts) {
                 Chunk c = new Chunk(ChunkIds.child(in.getChunkId(), ordinal, seq++), part, headers(edgeId));
                 res.outputs.add(new ChunkResult.EdgeChunk(plan.channel(edgeId), c));
                 n += part.size();
@@ -80,11 +102,13 @@ public final class ChunkProcessor {
 
     private Map<String, List<Row>> run(Chunk in) throws Exception {
         Buffer out = new Buffer(spec.getPorts(), pp.getPipelineId());
-        RunContextImpl ctx = new RunContextImpl(roundId, pp.getRunId(), pp.getPipelineId(), in.getChunkId(), params, s.dataSources, s.fallback);
-        if (spec.getRowRunner() != null) {
-            for (Row r : in.getRows()) spec.getRowRunner().process(r, out, ctx);
-        } else if (spec.getBatchRunner() != null) {
-            spec.getBatchRunner().process(in.getRows(), out, ctx);
+        RunContextImpl ctx = new RunContextImpl(roundId, pp.getRunId(), pp.getPipelineId(), in.getChunkId(), params, s.dataSources, s.fallback, attempt, writeVersion);
+        RowRunner row = lease.rowRunner();
+        BatchRunner batch = lease.batchRunner();
+        if (row != null) {
+            for (Row r : in.getRows()) row.process(r, out, ctx);
+        } else if (batch != null) {
+            batch.process(in.getRows(), out, ctx);
         } else {
             for (Row r : in.getRows()) out.emit(r);
         }

@@ -9,8 +9,17 @@ public final class SinkContextImpl implements SinkContext {
     private final String roundId, runId, pipelineId;
     private final Map<String, String> params;
     private final DataSourceRegistry dataSources;
+    private final int attempt;
+    private final long writeVersion;
 
     public SinkContextImpl(String roundId, String runId, String pipelineId, Map<String, String> params, DataSourceRegistry dataSources) {
+        this(roundId, runId, pipelineId, params, dataSources, 0, 0L);
+    }
+
+    public SinkContextImpl(String roundId, String runId, String pipelineId, Map<String, String> params, DataSourceRegistry dataSources,
+                           int attempt, long writeVersion) {
+        this.attempt = attempt;
+        this.writeVersion = writeVersion;
         this.roundId = roundId;
         this.runId = runId;
         this.pipelineId = pipelineId;
@@ -18,6 +27,8 @@ public final class SinkContextImpl implements SinkContext {
         this.dataSources = dataSources;
     }
 
+    @Override public int attempt() { return attempt; }
+    @Override public long writeVersion() { return writeVersion; }
     @Override public String roundId() { return roundId; }
     @Override public String runId() { return runId; }
     @Override public String pipelineId() { return pipelineId; }

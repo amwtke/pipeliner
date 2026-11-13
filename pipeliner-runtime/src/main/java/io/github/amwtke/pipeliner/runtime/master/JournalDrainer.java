@@ -34,16 +34,23 @@ final class JournalDrainer {
             if (d == null) return;
             handleLocalEvents(roundId, d, events);
             c.s.store.applyChunkEvents(roundId, withoutStale(d, events), last, c.epoch());   // throws StaleEpochException when deposed
-            c.s.plane.trimJournal(roundId, last);
+            c.s.plane.trimJournal(roundId, last, c.epoch());
             offset = last;
         }
     }
 
-    /** Drops DONE/DEAD events of runs that were reset (PENDING) after the event was written, e.g. by rerunFrom. */
+    /**
+     * Drops DONE/DEAD events of runs that were reset (PENDING) after the event was written, e.g. by rerunFrom, and events of an
+     * older run attempt (a zombie worker or a stale local executor): their chunk outcome belongs to discarded state.
+     */
     private List<ChunkEvent> withoutStale(RoundData d, List<ChunkEvent> events) {
         List<ChunkEvent> out = new ArrayList<>(events.size());
         for (ChunkEvent e : events) {
             RunRecord run = ("DONE".equals(e.getType()) || "DEAD".equals(e.getType())) ? d.run(e.getRunId()) : null;
+            if (run != null && e.getRunAttempt() != null && e.getRunAttempt() != run.getAttempt()) {
+                log.debug("dropping {} event of {}/{} from attempt {} (current attempt {})", e.getType(), d.roundId(), e.getRunId(), e.getRunAttempt(), run.getAttempt());
+                continue;
+            }
             if (run != null && run.getStatus() == RunStatus.PENDING) {
                 log.debug("dropping stale {} event of reset run {}/{}", e.getType(), d.roundId(), e.getRunId());
                 continue;
@@ -75,7 +82,7 @@ final class JournalDrainer {
                 if (c.s.store.casRunStatus(roundId, e.getRunId(), RunStatus.RUNNING, RunStatus.FAILED, msg, c.epoch()))
                     c.s.metrics.runFinished(roundId, e.getRunId(), "FAILED", elapsed(run));
             }
-            c.s.plane.clearLocalRun(roundId, e.getRunId());
+            c.s.plane.clearLocalRun(roundId, e.getRunId(), c.epoch());
         }
     }
 

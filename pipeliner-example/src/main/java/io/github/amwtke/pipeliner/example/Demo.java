@@ -11,7 +11,8 @@ public final class Demo {
     public static final List<String> NODES = Arrays.asList("CN-N", "CN-S", "EU", "US", "HQ");
     public static final List<String> SITES = Arrays.asList("SITE-CN", "SITE-EU", "SITE-US");
     public static final int MONTHS = 16;
-    public static final String DB = "pipeliner_demo";
+    /** ClickHouse database; override with -Ddemo.ch-db=... to isolate a test run. */
+    public static final String DB = System.getProperty("demo.ch-db", "pipeliner_demo");
 
     /** Recovery rate rho. */
     public static final BigDecimal RHO = new BigDecimal("0.7");

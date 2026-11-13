@@ -1,7 +1,9 @@
 package io.github.amwtke.pipeliner.runtime.master;
 
 import io.github.amwtke.pipeliner.api.Split;
+import io.github.amwtke.pipeliner.core.dataplane.DesiredState;
 import io.github.amwtke.pipeliner.core.dataplane.Keys;
+import io.github.amwtke.pipeliner.runtime.RunKeys;
 import io.github.amwtke.pipeliner.core.graph.ExecMode;
 import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
 import io.github.amwtke.pipeliner.core.plan.PlanChannel;
@@ -34,11 +36,20 @@ final class RunStarter {
 
     void startRuns(RoundData d) {
         String roundId = d.roundId();
-        Map<String, Integer> desired = null;
+        Map<String, DesiredState> desired = null;
+        Map<String, String> assign = null;
         for (PlanRun pr : d.plan.getRuns()) {
             RunRecord run = d.run(pr.getRunId());
             if (run == null) continue;
             if (run.getStatus() == RunStatus.PENDING) {
+                // idempotent, re-driven from the store state: a run reset by rerunFrom must not keep workers of its old attempt
+                if (desired == null) desired = c.s.plane.desiredState(roundId);
+                for (String p : pr.getPipelineIds())
+                    if (desired.containsKey(p)) { c.s.plane.setDesiredParallelism(roundId, p, 0, run.getAttempt(), c.epoch()); desired.remove(p); }
+                if (pr.getMode() != ExecMode.CLUSTER) {
+                    if (assign == null) assign = c.s.plane.localRunAssignments(roundId);
+                    if (assign.remove(pr.getRunId()) != null) c.s.plane.clearLocalRun(roundId, pr.getRunId(), c.epoch());
+                }
                 if (!gatesOpen(d, pr)) continue;
                 if (!c.s.store.casRunStatus(roundId, pr.getRunId(), RunStatus.PENDING, RunStatus.RUNNING, null, c.epoch())) continue;
                 d.touch();
@@ -52,21 +63,23 @@ final class RunStarter {
             } else if (run.getStatus() == RunStatus.RUNNING) {
                 // crash recovery: a previous master may have died half-way through starting this run
                 boolean anyPending = false, anyDesiredMissing = false;
-                if (desired == null) desired = c.s.plane.desiredParallelism(roundId);
+                if (desired == null) desired = c.s.plane.desiredState(roundId);
                 for (String p : pr.getPipelineIds()) {
                     PipelineRecord rec = d.pipe(p);
                     if (rec.getStatus() == PipelineStatus.PENDING) anyPending = true;
-                    if (rec.getStatus() == PipelineStatus.RUNNING && !desired.containsKey(p)) anyDesiredMissing = true;
+                    if (rec.getStatus() == PipelineStatus.RUNNING && !attemptMatches(desired.get(p), run)) anyDesiredMissing = true;
                 }
                 if (anyPending) { initCluster(d, pr); d.touch(); }
                 if (anyDesiredMissing) {
                     for (String p : pr.getPipelineIds())
-                        if (d.pipe(p).getStatus() == PipelineStatus.RUNNING && !desired.containsKey(p) && run.getStatus() == RunStatus.RUNNING)
-                            c.s.plane.setDesiredParallelism(roundId, p, d.pipe(p).getParallelism());
+                        if (d.pipe(p).getStatus() == PipelineStatus.RUNNING && !attemptMatches(desired.get(p), run) && run.getStatus() == RunStatus.RUNNING)
+                            c.s.plane.setDesiredParallelism(roundId, p, d.pipe(p).getParallelism(), run.getAttempt(), c.epoch());
                 }
             }
         }
     }
+
+    private static boolean attemptMatches(DesiredState ds, RunRecord run) { return ds != null && ds.getAttempt() == run.getAttempt(); }
 
     private boolean gatesOpen(RoundData d, PlanRun pr) {
         for (String g : pr.getInGateIds()) {
@@ -78,15 +91,18 @@ final class RunStarter {
 
     private void initCluster(RoundData d, PlanRun pr) {
         String roundId = d.roundId();
+        int attempt = d.run(pr.getRunId()).getAttempt();
+        // attempt n starts from a clean slate: drop the keys of every older attempt first (fenced, idempotent, re-driven on recovery)
+        if (attempt > 0) c.s.plane.deleteKeys(roundId, RunKeys.ofAttemptsBefore(roundId, d.plan, pr, attempt), c.epoch());
         for (PlanChannel ch : d.plan.getChannels())
-            if (ch.getRunId().equals(pr.getRunId())) c.s.plane.ensureGroup(Keys.channel(roundId, ch.getEdgeId()));
+            if (ch.getRunId().equals(pr.getRunId())) c.s.plane.ensureGroup(roundId, Keys.channel(roundId, ch.getEdgeId(), attempt), c.epoch());
         for (String p : pr.getPipelineIds())
-            if (d.plan.pipeline(p).isSource()) c.s.plane.ensureGroup(Keys.splitQueue(roundId, p));
+            if (d.plan.pipeline(p).isSource()) c.s.plane.ensureGroup(roundId, Keys.splitQueue(roundId, p, attempt), c.epoch());
         for (String p : pr.getPipelineIds()) {
             PipelineRecord rec = d.pipe(p);
             if (rec.getStatus() != PipelineStatus.PENDING) continue;
             if (c.s.store.casPipelineStatus(roundId, p, PipelineStatus.PENDING, PipelineStatus.RUNNING, null, c.epoch()))
-                c.s.plane.setDesiredParallelism(roundId, p, rec.getParallelism());
+                c.s.plane.setDesiredParallelism(roundId, p, rec.getParallelism(), attempt, c.epoch());
         }
     }
 
@@ -103,7 +119,7 @@ final class RunStarter {
         if (pod == null) { log.warn("no live worker able to run local run {}/{}; will retry", roundId, run.getRunId()); return; }
         int attempt = run.getAttempt() + 1;
         if (!c.s.store.updateRunAssignment(roundId, run.getRunId(), pod, attempt, c.epoch())) return;
-        c.s.plane.assignLocalRun(roundId, run.getRunId(), pod, attempt);
+        c.s.plane.assignLocalRun(roundId, run.getRunId(), pod, attempt, c.epoch());
         d.touch();
         log.info("local run {}/{} assigned to {} (attempt {})", roundId, run.getRunId(), pod, attempt);
     }
@@ -151,7 +167,7 @@ final class RunStarter {
             if (assign == null) assign = c.s.plane.localRunAssignments(d.roundId());
             if (!(a + "|" + run.getAttempt()).equals(assign.get(run.getRunId()))) {
                 log.warn("local run {}/{}: assign entry '{}' differs from the store; republishing", d.roundId(), run.getRunId(), assign.get(run.getRunId()));
-                c.s.plane.assignLocalRun(d.roundId(), run.getRunId(), a, run.getAttempt());
+                c.s.plane.assignLocalRun(d.roundId(), run.getRunId(), a, run.getAttempt(), c.epoch());
             }
         }
     }
@@ -178,7 +194,7 @@ final class RunStarter {
                                 .status(ChunkStatus.PENDING).inputEdge("split").splitSpec(ChunkCodec.toJson(s.getSpec()))
                                 .updatedAt(System.currentTimeMillis()).build());
                     }
-                    for (Split s : splits) c.s.plane.enqueueSplit(roundId, p, s);
+                    for (Split s : splits) c.s.plane.enqueueSplit(roundId, p, run.getAttempt(), s, c.epoch());
                     if (!pending.isEmpty()) c.s.store.savePendingChunks(roundId, pending);
                     c.s.store.setPipelineEnumDone(roundId, p, true, c.epoch());
                     d.touch();

@@ -34,6 +34,8 @@ public interface PipelinerEngine {
     /** "e1".., "split:&lt;p&gt;", "dlq:&lt;p&gt;" to XLEN for running runs. */
     Map<String, Long> channelLengths(String roundId);
     RoundStatus awaitRound(String roundId, long timeoutMillis) throws InterruptedException;
+    /** Pipelines currently instantiated (runner/source/sink resolved and opened) on this pod. */
+    List<LiveInstance> liveInstances();
     boolean isLeader();
     String podId();
     void start();

@@ -7,6 +7,8 @@ import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
 import io.github.amwtke.pipeliner.core.plan.PlanGate;
 import io.github.amwtke.pipeliner.core.store.GateRecord;
 import io.github.amwtke.pipeliner.core.store.GateStatus;
+import io.github.amwtke.pipeliner.core.plan.PlanPipeline;
+import io.github.amwtke.pipeliner.core.store.RunRecord;
 import io.github.amwtke.pipeliner.core.store.RunStatus;
 import io.github.amwtke.pipeliner.runtime.context.GateContextImpl;
 import java.util.HashMap;
@@ -58,13 +60,19 @@ final class GateEvaluator {
         try {
             Map<String, String> signals = c.s.store.loadGateSignals(d.roundId(), pg.getGateId());
             GateContextImpl ctx = new GateContextImpl(d.roundId(), pg.getGateId(), d.round().getParams(), signals,
-                    g.getArmedAt(), now, c.s.store, c.s.dataSources);
+                    g.getArmedAt(), now, c.s.store, c.s.dataSources, pid -> attemptOfPipeline(d, pid));
             GateDecision dec = spec.getCondition().evaluate(ctx);
             return dec == null ? GateDecision.WAIT : dec;
         } catch (Exception e) {
             log.warn("gate {}/{} condition threw, treating as WAIT: {}", d.roundId(), pg.getGateId(), e.toString());
             return GateDecision.WAIT;
         }
+    }
+
+    private static int attemptOfPipeline(RoundData d, String pipelineId) {
+        PlanPipeline pp = d.plan.pipeline(pipelineId);
+        RunRecord run = pp == null ? null : d.run(pp.getRunId());
+        return run == null ? 0 : run.getAttempt();
     }
 
     private void onWait(RoundData d, PlanGate pg, GateRecord g, long now) {

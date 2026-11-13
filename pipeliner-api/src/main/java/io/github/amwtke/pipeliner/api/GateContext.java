@@ -14,4 +14,6 @@ public interface GateContext {
     /** DONE chunks of a pipeline in this round. */
     long doneChunkCount(String pipelineId);
     DataSourceRegistry dataSources();
+    /** Current attempt of the run that owns the pipeline (external signals can be scoped to it). */
+    default int runAttemptOf(String pipelineId) { return 0; }
 }

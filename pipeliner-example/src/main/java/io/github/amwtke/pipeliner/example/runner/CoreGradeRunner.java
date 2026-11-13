@@ -7,12 +7,13 @@ import io.github.amwtke.pipeliner.api.Row;
 import io.github.amwtke.pipeliner.api.RowRunner;
 import io.github.amwtke.pipeliner.api.RunContext;
 import java.math.BigDecimal;
+import org.springframework.beans.factory.annotation.Value;
 
 /** Grades recoverable cores: core = rho*gd, refurbishable = g*core, scrap = c*core. */
 public final class CoreGradeRunner implements RowRunner {
     private final long delayMs;
 
-    public CoreGradeRunner(long delayMs) {
+    public CoreGradeRunner(@Value("${demo.core-grade-delay-ms:0}") long delayMs) {
         this.delayMs = delayMs;
     }
 

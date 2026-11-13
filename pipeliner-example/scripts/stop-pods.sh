@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stops every pod started by run-pod.sh (SIGTERM, then SIGKILL after 10s).
 HERE="$(cd "$(dirname "$0")" && pwd)"
-LOGS="$(cd "$HERE/.." && pwd)/logs"
+LOGS="${PIPELINER_LOGS:-$(cd "$HERE/.." && pwd)/logs}"
 for f in "$LOGS"/*.pid; do
   [ -e "$f" ] || continue
   pid=$(cat "$f")

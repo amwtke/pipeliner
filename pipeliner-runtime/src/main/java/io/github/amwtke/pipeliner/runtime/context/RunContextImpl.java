@@ -13,9 +13,18 @@ public final class RunContextImpl implements RunContext {
     private final Map<String, String> params;
     private final DataSourceRegistry dataSources;
     private final GateFallbackCache fallback;
+    private final int attempt;
+    private final long writeVersion;
 
     public RunContextImpl(String roundId, String runId, String pipelineId, String chunkId, Map<String, String> params,
                           DataSourceRegistry dataSources, GateFallbackCache fallback) {
+        this(roundId, runId, pipelineId, chunkId, params, dataSources, fallback, 0, 0L);
+    }
+
+    public RunContextImpl(String roundId, String runId, String pipelineId, String chunkId, Map<String, String> params,
+                          DataSourceRegistry dataSources, GateFallbackCache fallback, int attempt, long writeVersion) {
+        this.attempt = attempt;
+        this.writeVersion = writeVersion;
         this.roundId = roundId;
         this.runId = runId;
         this.pipelineId = pipelineId;
@@ -25,6 +34,8 @@ public final class RunContextImpl implements RunContext {
         this.fallback = fallback;
     }
 
+    @Override public int attempt() { return attempt; }
+    @Override public long writeVersion() { return writeVersion; }
     @Override public String roundId() { return roundId; }
     @Override public String runId() { return runId; }
     @Override public String pipelineId() { return pipelineId; }

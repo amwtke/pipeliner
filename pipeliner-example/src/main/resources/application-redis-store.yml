@@ -1,3 +1,0 @@
-pipeliner:
-  store:
-    type: redis

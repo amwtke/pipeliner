@@ -16,6 +16,7 @@ import io.github.amwtke.pipeliner.core.store.RunRecord;
 import io.github.amwtke.pipeliner.core.store.RunStatus;
 import io.github.amwtke.pipeliner.core.store.StaleEpochException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -66,26 +67,32 @@ public final class AdminOps {
         RoundRecord rr = requireRound(roundId);
         if (rr.getStatus() != RoundStatus.RUNNING && rr.getStatus() != RoundStatus.CREATED) return;
         requireCas(s.store.casRoundStatus(roundId, rr.getStatus(), RoundStatus.PAUSED, null, epoch()), "pause");
-        s.plane.setPaused(roundId, true);
+        s.plane.setPaused(roundId, true, epoch());
     }
 
     void resume(String roundId) {
         RoundRecord rr = requireRound(roundId);
         if (rr.getStatus() != RoundStatus.PAUSED) return;
         requireCas(s.store.casRoundStatus(roundId, RoundStatus.PAUSED, RoundStatus.RUNNING, null, epoch()), "resume");
-        s.plane.setPaused(roundId, false);
+        s.plane.setPaused(roundId, false, epoch());
     }
 
+    /** Store first (the CAS decides), then the fenced data-plane cleanup of every attempt of every run. */
     void cancel(String roundId) {
         RoundRecord rr = requireRound(roundId);
         if (rr.getStatus().terminal()) return;
         ExecutionPlan plan = s.registry.find(rr.getGraphName());
+        RoundView v = s.store.loadRoundState(roundId);
         requireCas(s.store.casRoundStatus(roundId, rr.getStatus(), RoundStatus.CANCELLED, "cancelled", epoch()), "cancel");
-        s.plane.removeActiveRound(roundId);
         List<String> keys = RunKeys.control(roundId);
         keys.add(Keys.journal(roundId));
-        if (plan != null) for (PlanRun pr : plan.getRuns()) keys.addAll(RunKeys.of(roundId, plan, pr));
-        s.plane.deleteKeys(keys);
+        if (plan != null && v != null)
+            for (RunRecord run : v.getRuns()) {
+                PlanRun pr = plan.run(run.getRunId());
+                if (pr != null) keys.addAll(RunKeys.ofAttemptsBefore(roundId, plan, pr, run.getAttempt() + 1));
+            }
+        s.plane.deleteKeys(roundId, keys, epoch());
+        s.plane.removeActiveRound(roundId, epoch());
     }
 
     void openGate(String roundId, String gateId, String operator) {
@@ -93,23 +100,26 @@ public final class AdminOps {
             log.warn("openGate {}/{}: gate is not CLOSED; nothing done", roundId, gateId);
     }
 
+    /** Store transitions first (all fenced CAS), then the fenced requeue of the current attempt's DLQs. */
     void retryRun(String roundId, String runId) {
         Ctx x = ctx(roundId, runId);
         if (x.run.getStatus() != RunStatus.FAILED) { log.warn("retryRun {}/{}: run is {}, not FAILED", roundId, runId, x.run.getStatus()); return; }
         if (x.pr.getMode() != ExecMode.CLUSTER) {
-            s.store.resetRun(roundId, runId, epoch());   // local runs simply replay (sinks are idempotent)
-        } else {
-            requireCas(s.store.casRunStatus(roundId, runId, RunStatus.FAILED, RunStatus.RUNNING, null, epoch()), "retryRun");
-            for (String p : x.pr.getPipelineIds()) s.plane.requeueDeadLetters(roundId, p);
-            revivePipelines(x);
+            // local runs simply replay under a new attempt (sinks are versioned)
+            s.store.resetRuns(roundId, Collections.singletonList(runId), Collections.<String>emptyList(), epoch());
+            reviveRound(roundId);
+            return;
         }
+        requireCas(s.store.casRunStatus(roundId, runId, RunStatus.FAILED, RunStatus.RUNNING, null, epoch()), "retryRun");
+        revivePipelines(x);
         reviveRound(roundId);
+        for (String p : x.pr.getPipelineIds()) s.plane.requeueDeadLetters(roundId, p, x.run.getAttempt(), epoch());
     }
 
+    /** Store first (chunks SKIPPED, round incomplete, pipelines RUNNING), then the fenced DLQ clear. */
     void skipDeadLetters(String roundId, String runId) {
         Ctx x = ctx(roundId, runId);
         if (x.pr.getMode() != ExecMode.CLUSTER) { retryRun(roundId, runId); return; }
-        for (String p : x.pr.getPipelineIds()) s.plane.clearDeadLetters(roundId, p);
         s.store.markChunksSkipped(roundId, runId, epoch());
         s.store.setRoundIncomplete(roundId);
         if (x.run.getStatus() == RunStatus.FAILED) {
@@ -119,6 +129,7 @@ public final class AdminOps {
             for (String p : x.pr.getPipelineIds()) s.store.casPipelineStatus(roundId, p, PipelineStatus.FAILED, PipelineStatus.RUNNING, null, epoch());
         }
         reviveRound(roundId);
+        for (String p : x.pr.getPipelineIds()) s.plane.clearDeadLetters(roundId, p, x.run.getAttempt(), epoch());
     }
 
     /** FAILED pipelines back to RUNNING; workers get their desired parallelism back. */
@@ -127,7 +138,7 @@ public final class AdminOps {
         for (PipelineRecord p : x.view.getPipelines()) {
             if (!p.getRunId().equals(x.run.getRunId())) continue;
             if (p.getStatus() == PipelineStatus.FAILED) s.store.casPipelineStatus(roundId, p.getPipelineId(), PipelineStatus.FAILED, PipelineStatus.RUNNING, null, epoch());
-            if (p.getStatus() != PipelineStatus.SUCCEEDED) s.plane.setDesiredParallelism(roundId, p.getPipelineId(), p.getParallelism());
+            if (p.getStatus() != PipelineStatus.SUCCEEDED) s.plane.setDesiredParallelism(roundId, p.getPipelineId(), p.getParallelism(), x.run.getAttempt(), epoch());
         }
     }
 
@@ -139,29 +150,35 @@ public final class AdminOps {
         if (rr.getStatus() != RoundStatus.CANCELLED) s.plane.addActiveRound(roundId);
     }
 
-    /** Stale journal events of the reset runs are dropped by the journal drainer (their runs are PENDING until restarted). */
+    /**
+     * ONE atomic store reset (runs, pipelines, chunk records, downstream gates incl. their signals, round status), then the
+     * round is re-added. The data plane is not touched here beyond stopping the old workers: the master removes the keys of
+     * all older attempts when it starts the new attempt (RunStarter), so a crash or a zombie in between is harmless. Journal
+     * events of the old attempt are dropped by the journal drainer (attempt filter).
+     */
     void rerunFrom(String roundId, String runId) {
         Ctx x = ctx(roundId, runId);
         if (x.round.getStatus() == RoundStatus.CANCELLED) throw new PipelinerException("round is cancelled");
         List<String> runIds = new ArrayList<>();
         runIds.add(runId);
         runIds.addAll(x.plan.downstreamRuns(runId));
-        for (String id : runIds) {
-            PlanRun pr = x.plan.run(id);
-            for (String p : pr.getPipelineIds()) s.plane.setDesiredParallelism(roundId, p, 0);
-            s.plane.clearLocalRun(roundId, id);
-            s.plane.deleteKeys(RunKeys.of(roundId, x.plan, pr));
-        }
         Set<String> downstream = new HashSet<>(runIds);
         downstream.remove(runId);
+        List<String> gateIds = new ArrayList<>();
         for (PlanGate g : x.plan.getGates())
-            if (!g.getBeforeRuns().isEmpty() && downstream.containsAll(g.getBeforeRuns())) s.store.resetGate(roundId, g.getGateId(), epoch());
-        for (String id : runIds) s.store.resetRun(roundId, id, epoch());
+            if (!g.getBeforeRuns().isEmpty() && downstream.containsAll(g.getBeforeRuns())) gateIds.add(g.getGateId());
+        s.store.resetRuns(roundId, runIds, gateIds, epoch());
         RoundRecord now = requireRound(roundId);
-        if (now.getStatus() != RoundStatus.RUNNING)
+        if (now.getStatus() == RoundStatus.PAUSED || now.getStatus() == RoundStatus.CREATED)
             requireCas(s.store.casRoundStatus(roundId, now.getStatus(), RoundStatus.RUNNING, null, epoch()), "rerunFrom");
-        s.plane.setPaused(roundId, false);
+        s.plane.setPaused(roundId, false, epoch());
         s.plane.addActiveRound(roundId);
+        // best effort: stop the old attempt's workers now; RunStarter re-drives this from the store state if we crash here
+        for (String id : runIds) {
+            PlanRun pr = x.plan.run(id);
+            for (String p : pr.getPipelineIds()) s.plane.setDesiredParallelism(roundId, p, 0, 0, epoch());
+            s.plane.clearLocalRun(roundId, id, epoch());
+        }
         log.info("round {} rerun from {} (reset runs {})", roundId, runId, runIds);
     }
 

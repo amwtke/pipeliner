@@ -79,13 +79,19 @@ public final class TestKit {
         public final InMemoryDataPlane plane = new InMemoryDataPlane();
         private final List<DefaultPipelinerEngine> engines = new ArrayList<>();
         private final ExecutionPlan plan;
+        private final ComponentFactory factory;
 
-        public Harness(PipelineGraph g, Map<String, ExecMode> modes) { this.plan = TestPlanner.plan(g, modes); }
+        public Harness(PipelineGraph g, Map<String, ExecMode> modes) { this(g, modes, new io.github.amwtke.pipeliner.core.util.ReflectionComponentFactory()); }
+
+        public Harness(PipelineGraph g, Map<String, ExecMode> modes, ComponentFactory factory) {
+            this.plan = TestPlanner.plan(g, modes);
+            this.factory = factory;
+        }
 
         public ExecutionPlan plan() { return plan; }
 
         public DefaultPipelinerEngine pod(RuntimeConfig cfg, boolean start) {
-            DefaultPipelinerEngine e = new DefaultPipelinerEngine(cfg, store, plane, new SimpleDataSourceRegistry(new HashMap<String, javax.sql.DataSource>()), null);
+            DefaultPipelinerEngine e = new DefaultPipelinerEngine(cfg, store, plane, new SimpleDataSourceRegistry(new HashMap<String, javax.sql.DataSource>()), null, factory);
             e.registerPlan(plan);
             engines.add(e);
             if (start) e.start();

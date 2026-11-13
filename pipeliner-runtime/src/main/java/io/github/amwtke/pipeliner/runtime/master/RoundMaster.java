@@ -32,8 +32,7 @@ final class RoundMaster {
 
     void tick(String roundId) {
         RoundRecord rr = c.s.store.loadRoundRecord(roundId);
-        if (rr == null || rr.getStatus().terminal()) { c.s.plane.removeActiveRound(roundId); return; }
-        if (rr.getStatus() == RoundStatus.PAUSED) return;
+        if (rr == null || rr.getStatus().terminal()) { c.s.plane.removeActiveRound(roundId, c.epoch()); return; }
         ExecutionPlan plan = c.s.registry.find(rr.getGraphName());
         if (plan == null || !plan.getHash().equals(rr.getPlanHash())) {
             if (warned.add(roundId)) log.warn("round {}: graph '{}' not registered here or plan hash differs; master skips it", roundId, rr.getGraphName());
@@ -41,6 +40,11 @@ final class RoundMaster {
         }
         // take ownership of the round: from now on a deposed master's writes are rejected
         if (!c.s.store.fenceRound(roundId, c.epoch())) throw new StaleEpochException("round " + roundId + " is held by a newer master epoch");
+        if (!c.s.plane.fenceRound(roundId, c.epoch())) throw new StaleEpochException("round " + roundId + " data plane is held by a newer master epoch");
+        // the paused flag is derived from the round status every tick: a zombie's late setPaused is corrected here
+        boolean paused = rr.getStatus() == RoundStatus.PAUSED;
+        if (c.s.plane.isPaused(roundId) != paused) c.s.plane.setPaused(roundId, paused, c.epoch());
+        if (paused) return;
         if (rr.getStatus() == RoundStatus.CREATED
                 && !c.s.store.casRoundStatus(roundId, RoundStatus.CREATED, RoundStatus.RUNNING, null, c.epoch())) return;
 

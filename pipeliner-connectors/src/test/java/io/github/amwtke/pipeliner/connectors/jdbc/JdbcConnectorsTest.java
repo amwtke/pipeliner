@@ -260,6 +260,60 @@ class JdbcConnectorsTest {
         sink.write(chunk("e", new ArrayList<Row>()), kctx());
     }
 
+    // ---- versioned writes ----
+
+    static SinkContext vctx(long version) {
+        return new SinkContext() {
+            public String roundId() { return "r1"; }
+            public String runId() { return "run1"; }
+            public String pipelineId() { return "p1"; }
+            public Map<String, String> params() { return Collections.emptyMap(); }
+            public DataSourceRegistry dataSources() { return reg; }
+            @Override public int attempt() { return (int) (version % 1000); }
+            @Override public long writeVersion() { return version; }
+        };
+    }
+
+    @Test void mysqlVersionedUpsertKeepsTheHighestVersion() throws Exception {
+        need(myUp);
+        exec(my, "DROP TABLE IF EXISTS t_ver", "CREATE TABLE t_ver (pv VARCHAR(10), id INT, amt DECIMAL(18,4), nm VARCHAR(20), pg_version BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(pv,id))");
+        JdbcSink sink = JdbcSinks.mysql("my").table("t_ver").upsertKeys("pv", "id").versionColumn("pg_version").build();
+        List<Row> v2 = Arrays.asList(Row.of("pv", "p", "id", 1L, "amt", new BigDecimal("22"), "nm", "new"), Row.of("pv", "p", "id", 2L, "amt", new BigDecimal("22"), "nm", null));
+        List<Row> v1 = Arrays.asList(Row.of("pv", "p", "id", 1L, "amt", new BigDecimal("11"), "nm", "old"), Row.of("pv", "p", "id", 2L, "amt", new BigDecimal("11"), "nm", "old"));
+        sink.write(chunk("c", v2), vctx(7002));   // the newer attempt/round first ...
+        sink.write(chunk("c", v1), vctx(7001));   // ... then a zombie of an older one
+        JdbcSplitSource src = JdbcSources.mysql("my").table("t_ver").orderBy("id").build();
+        List<Row> back = readAll(src, new HashMap<String, String>());
+        assertEquals(2, back.size());
+        assertEquals(0, new BigDecimal("22").compareTo(back.get(0).getDecimal("amt")));
+        assertEquals("new", back.get(0).get("nm"));
+        assertNull(back.get(1).get("nm"), "null of the newer version survives too");
+        assertEquals(7002L, back.get(0).getLong("pg_version"));
+        sink.write(chunk("c", v2), vctx(7002));   // same version: idempotent replay
+        sink.write(chunk("c", v1), vctx(7003));   // newer: wins
+        back = readAll(src, new HashMap<String, String>());
+        assertEquals("old", back.get(0).get("nm"));
+        assertEquals(7003L, back.get(0).getLong("pg_version"));
+        // the sink sets the version column itself, even when the rows carry one
+        sink.write(chunk("c", Arrays.asList(Row.of("pv", "p", "id", 3L, "amt", BigDecimal.ONE, "nm", "x", "pg_version", 5L))), vctx(8000));
+        assertEquals(8000L, readAll(JdbcSources.mysql("my").table("t_ver").where("id = 3").build(), new HashMap<String, String>()).get(0).getLong("pg_version"));
+    }
+
+    @Test void clickhouseReplacingMergeTreeVersionKeepsTheHighestVersionUnderFinal() throws Exception {
+        need(chUp);
+        exec(ch, "DROP TABLE IF EXISTS t_rver",
+            "CREATE TABLE t_rver (pv String, id Int64, qty Decimal(18,4), pg_version UInt64) ENGINE=ReplacingMergeTree(pg_version) ORDER BY (pv, id)");
+        JdbcSink sink = JdbcSinks.clickhouse("ch").table("t_rver").versionColumn("pg_version").build();
+        List<Row> v2 = Arrays.asList(Row.of("pv", "p", "id", 1L, "qty", new BigDecimal("22")));
+        List<Row> v1 = Arrays.asList(Row.of("pv", "p", "id", 1L, "qty", new BigDecimal("11")));
+        sink.write(chunk("c", v2), vctx(7002));
+        sink.write(chunk("c", v1), vctx(7001));   // zombie writes later, with the lower version
+        List<Row> back = readAll(JdbcSources.clickhouse("ch").table("t_rver").useFinal().build(), new HashMap<String, String>());
+        assertEquals(1, back.size());
+        assertEquals(0, new BigDecimal("22").compareTo(back.get(0).getDecimal("qty")));
+        assertEquals(7002L, back.get(0).getLong("pg_version"));
+    }
+
     // ---- type consistency ----
 
     @Test void typeMappingConsistent() throws Exception {
@@ -290,6 +344,7 @@ class JdbcConnectorsTest {
         assertThrows(IllegalArgumentException.class, () -> JdbcSources.mysql("x").table("t").hashSplit("k", 0).build());
         assertThrows(IllegalArgumentException.class, () -> JdbcSources.mysql("x").table("t").distinctSplit(" ").build());
         assertThrows(IllegalArgumentException.class, () -> JdbcSinks.mysql("x").build());
+        assertThrows(IllegalArgumentException.class, () -> JdbcSinks.mysql("x").table("t").versionColumn(" ").build());
         assertThrows(IllegalArgumentException.class, () -> JdbcSinks.mysql("x").table("t").batchSize(0).build());
         assertThrows(IllegalArgumentException.class, () -> JdbcSinks.clickhouse("x").table("t").upsertKeys("a").build());
         assertEquals("t", JdbcSources.mysql("x").table("t").build().datasetName());

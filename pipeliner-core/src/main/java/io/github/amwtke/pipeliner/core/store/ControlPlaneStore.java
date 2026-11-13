@@ -54,7 +54,7 @@ public interface ControlPlaneStore {
 
     void markGateAlerted(String roundId, String gateId);
 
-    /** To CLOSED; clears armed/deadline/opened/context/alerted (signals kept). */
+    /** To CLOSED; clears armed/deadline/opened/context/alerted (signals kept; resetRuns also deletes them). */
     void resetGate(String roundId, String gateId, long epoch);
 
     /** Idempotent per key. */
@@ -75,8 +75,22 @@ public interface ControlPlaneStore {
     /** DEAD to SKIPPED for the run. */
     void markChunksSkipped(String roundId, String runId, long epoch);
 
-    /** Run to PENDING attempt+1 assignee null; its pipelines to PENDING enumDone=false; deletes its chunk records. */
-    void resetRun(String roundId, String runId, long epoch);
+    /**
+     * Atomic rerun reset (one transaction / one script), fenced by the round epoch: every run to PENDING with attempt+1,
+     * assignee/error null; its pipelines to PENDING enumDone=false; its chunk records and counters deleted; every gate to CLOSED with
+     * armed/deadline/opened/context/alerted cleared AND its signals deleted; a FAILED/SUCCEEDED round back to RUNNING (finishedAt/error cleared).
+     * @throws StaleEpochException when the round is fenced by a higher epoch (nothing is applied)
+     */
+    void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch);
+
+    /** Compatibility: resets one run (see {@link #resetRuns}); a fenced call is a no-op. */
+    default void resetRun(String roundId, String runId, long epoch) {
+        try {
+            resetRuns(roundId, java.util.Collections.singletonList(runId), java.util.Collections.<String>emptyList(), epoch);
+        } catch (StaleEpochException e) {
+            // fenced: nothing applied
+        }
+    }
 
     /** Ordered by pipelineId, chunkId. */
     List<ChunkRecord> queryChunks(ChunkQuery q);

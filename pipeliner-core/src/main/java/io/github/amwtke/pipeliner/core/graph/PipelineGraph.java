@@ -112,6 +112,9 @@ public final class PipelineGraph {
         private SplitSource source;
         private RowRunner rowRunner;
         private BatchRunner batchRunner;
+        private Class<? extends RowRunner> rowRunnerType;
+        private Class<? extends BatchRunner> batchRunnerType;
+        private boolean perThread;
         private final Set<String> ports = new LinkedHashSet<>(Arrays.asList("out"));
         private final Map<String, List<Sink>> sinks = new LinkedHashMap<>();
         private Integer parallelism;
@@ -126,6 +129,11 @@ public final class PipelineGraph {
         public PipelineBuilder source(SplitSource s) { this.source = s; return this; }
         public PipelineBuilder row(RowRunner r) { this.rowRunner = r; return this; }
         public PipelineBuilder batch(BatchRunner r) { this.batchRunner = r; return this; }
+        /** Lazy runner: created through the ComponentFactory when the pipeline starts on a pod, released when it finishes. */
+        public PipelineBuilder row(Class<? extends RowRunner> type) { this.rowRunnerType = type; return this; }
+        public PipelineBuilder batch(Class<? extends BatchRunner> type) { this.batchRunnerType = type; return this; }
+        /** Type-based runner only: each worker thread gets its own runner instance (no thread-safety needed). */
+        public PipelineBuilder runnerPerThread() { this.perThread = true; return this; }
         public PipelineBuilder ports(String... p) { ports.addAll(Arrays.asList(p)); return this; }
         /** Sink on port "out". */
         public PipelineBuilder sink(Sink s) { return sink("out", s); }
@@ -149,7 +157,7 @@ public final class PipelineGraph {
             Map<String, List<Sink>> sk = new LinkedHashMap<>();
             for (Map.Entry<String, List<Sink>> e : sinks.entrySet())
                 sk.put(e.getKey(), Collections.unmodifiableList(new ArrayList<>(e.getValue())));
-            return new PipelineSpec(id, source, rowRunner, batchRunner, Collections.unmodifiableSet(new LinkedHashSet<>(ports)),
+            return new PipelineSpec(id, source, rowRunner, batchRunner, rowRunnerType, batchRunnerType, perThread, Collections.unmodifiableSet(new LinkedHashSet<>(ports)),
                     Collections.unmodifiableMap(sk), parallelism, mode, estimatedRows, chunkRows, chunkBytes,
                     Collections.unmodifiableList(new ArrayList<>(chunkKey)));
         }

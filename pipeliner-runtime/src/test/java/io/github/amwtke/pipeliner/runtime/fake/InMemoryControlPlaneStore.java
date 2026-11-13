@@ -244,24 +244,54 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
             if (runId.equals(c.getRunId()) && c.getStatus() == ChunkStatus.DEAD) c.setStatus(ChunkStatus.SKIPPED);
     }
 
-    @Override public synchronized void resetRun(String roundId, String runId, long epoch) {
-        RunRecord r = runs.get(roundId).get(runId);
-        if (fenced(roundId, epoch)) return;
-        r.setStatus(RunStatus.PENDING);
-        r.setAttempt(r.getAttempt() + 1);
-        r.setAssignee(null);
-        r.setStartedAt(null);
-        r.setFinishedAt(null);
-        r.setError(null);
-        r.setMasterEpoch(Math.max(r.getMasterEpoch(), epoch));
-        for (PipelineRecord p : pipes.get(roundId).values()) {
-            if (!p.getRunId().equals(runId)) continue;
-            p.setStatus(PipelineStatus.PENDING);
-            p.setEnumDone(false);
-            p.setError(null);
-            p.setMasterEpoch(Math.max(p.getMasterEpoch(), epoch));
+    @Override public synchronized void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch) {
+        RoundRecord rr = rounds.get(roundId);
+        if (rr == null || rr.getMasterEpoch() > epoch) throw new StaleEpochException("resetRuns fenced: round " + roundId + " epoch " + epoch);
+        for (String runId : runIds) {
+            RunRecord r = runs.get(roundId).get(runId);
+            if (r != null && r.getMasterEpoch() > epoch) throw new StaleEpochException("resetRuns fenced: run " + runId + " epoch " + r.getMasterEpoch());
         }
-        chunks.get(roundId).values().removeIf(c -> runId.equals(c.getRunId()));
+        rr.setMasterEpoch(epoch);
+        for (String runId : runIds) {
+            RunRecord r = runs.get(roundId).get(runId);
+            if (r == null) continue;
+            r.setStatus(RunStatus.PENDING);
+            r.setAttempt(r.getAttempt() + 1);
+            r.setAssignee(null);
+            r.setStartedAt(null);
+            r.setFinishedAt(null);
+            r.setError(null);
+            r.setMasterEpoch(Math.max(r.getMasterEpoch(), epoch));
+            for (PipelineRecord p : pipes.get(roundId).values()) {
+                if (!p.getRunId().equals(runId)) continue;
+                p.setStatus(PipelineStatus.PENDING);
+                p.setEnumDone(false);
+                p.setStartedAt(null);
+                p.setFinishedAt(null);
+                p.setError(null);
+                p.setMasterEpoch(Math.max(p.getMasterEpoch(), epoch));
+            }
+            chunks.get(roundId).values().removeIf(c -> runId.equals(c.getRunId()));
+        }
+        for (String gateId : gateIds) {
+            GateRecord g = gates.get(roundId).get(gateId);
+            if (g != null) {
+                g.setStatus(GateStatus.CLOSED);
+                g.setArmedAt(null);
+                g.setDeadlineAt(null);
+                g.setOpenedBy(null);
+                g.setOpenedAt(null);
+                g.setContext(new HashMap<String, String>());
+                g.setAlerted(false);
+                g.setMasterEpoch(Math.max(g.getMasterEpoch(), epoch));
+            }
+            signals.remove(roundId + "|" + gateId);
+        }
+        if (rr.getStatus() == RoundStatus.FAILED || rr.getStatus() == RoundStatus.SUCCEEDED) {
+            rr.setStatus(RoundStatus.RUNNING);
+            rr.setFinishedAt(null);
+            rr.setError(null);
+        }
     }
 
     @Override public synchronized List<ChunkRecord> queryChunks(ChunkQuery q) {

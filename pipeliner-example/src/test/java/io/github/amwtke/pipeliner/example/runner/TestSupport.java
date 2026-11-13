@@ -17,7 +17,10 @@ final class TestSupport {
         final Map<String, List<Row>> canned = new LinkedHashMap<>();
         final Map<String, String> params = new LinkedHashMap<>();
 
-        Ctx() { params.put("planVersion", "V1"); }
+        Ctx() {
+            params.put("planVersion", "V1");
+            on("from ex_fault");   // chaos fault switch (Fault.check): empty table = no injected fault
+        }
 
         Ctx on(String sqlFragment, Row... rows) {
             canned.put(sqlFragment, java.util.Arrays.asList(rows));

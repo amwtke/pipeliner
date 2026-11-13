@@ -1,10 +1,12 @@
 package io.github.amwtke.pipeliner.runtime;
 
+import io.github.amwtke.pipeliner.api.ComponentFactory;
 import io.github.amwtke.pipeliner.api.DataSourceRegistry;
 import io.github.amwtke.pipeliner.api.PipelinerException;
 import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
 import io.github.amwtke.pipeliner.core.dataplane.DataPlane;
 import io.github.amwtke.pipeliner.core.dataplane.Keys;
+import io.github.amwtke.pipeliner.core.engine.LiveInstance;
 import io.github.amwtke.pipeliner.core.engine.PipelinerEngine;
 import io.github.amwtke.pipeliner.core.engine.PipelinerMetrics;
 import io.github.amwtke.pipeliner.core.engine.RuntimeConfig;
@@ -26,6 +28,7 @@ import io.github.amwtke.pipeliner.core.store.RoundStatus;
 import io.github.amwtke.pipeliner.core.store.RoundView;
 import io.github.amwtke.pipeliner.core.store.RunRecord;
 import io.github.amwtke.pipeliner.core.store.RunStatus;
+import io.github.amwtke.pipeliner.core.util.ReflectionComponentFactory;
 import io.github.amwtke.pipeliner.runtime.master.MasterLoop;
 import io.github.amwtke.pipeliner.runtime.worker.WorkerAgent;
 import java.text.SimpleDateFormat;
@@ -50,9 +53,15 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
     private boolean started;
 
     public DefaultPipelinerEngine(RuntimeConfig cfg, ControlPlaneStore store, DataPlane plane, DataSourceRegistry dataSources, PipelinerMetrics metrics) {
+        this(cfg, store, plane, dataSources, metrics, new ReflectionComponentFactory());
+    }
+
+    /** The factory creates type-based runners (see PipelineGraph.PipelineBuilder.row(Class)). */
+    public DefaultPipelinerEngine(RuntimeConfig cfg, ControlPlaneStore store, DataPlane plane, DataSourceRegistry dataSources, PipelinerMetrics metrics,
+                                  ComponentFactory factory) {
         if (cfg == null || cfg.getPodId() == null || cfg.getPodId().isEmpty()) throw new PipelinerException("RuntimeConfig.podId is required");
         this.cfg = cfg;
-        this.s = new Services(cfg, store, plane, dataSources, metrics, new GraphRegistry(cfg.getPlanOptions()));
+        this.s = new Services(cfg, store, plane, dataSources, metrics, new GraphRegistry(cfg.getPlanOptions()), factory);
         this.admin = new AdminClient(s);
     }
 
@@ -79,7 +88,7 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
         p.put("bizKey", bizKey);
         long now = System.currentTimeMillis();
         RoundRecord round = RoundRecord.builder().roundId(roundId).graphName(graphName).bizKey(bizKey).planHash(plan.getHash())
-                .planJson(planJson(plan)).params(p).status(RoundStatus.CREATED).createdAt(now).build();
+                .planJson(planJson(plan)).params(p).status(RoundStatus.CREATED).createdAt(now).seq(s.plane.nextRoundSeq()).build();
         List<RunRecord> runs = new ArrayList<>();
         for (PlanRun r : plan.getRuns())
             runs.add(RunRecord.builder().roundId(roundId).runId(r.getRunId()).stage(r.getStage()).mode(r.getMode()).status(RunStatus.PENDING).build());
@@ -125,10 +134,10 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
             PlanRun pr = plan.run(r.getRunId());
             if (pr == null || pr.getMode() != ExecMode.CLUSTER || (r.getStatus() != RunStatus.RUNNING && r.getStatus() != RunStatus.FAILED)) continue;
             for (io.github.amwtke.pipeliner.core.plan.PlanChannel c : plan.getChannels())
-                if (c.getRunId().equals(pr.getRunId())) out.put(c.getEdgeId(), s.plane.streamLength(Keys.channel(roundId, c.getEdgeId())));
+                if (c.getRunId().equals(pr.getRunId())) out.put(c.getEdgeId(), s.plane.streamLength(Keys.channel(roundId, c.getEdgeId(), r.getAttempt())));
             for (String p : pr.getPipelineIds()) {
-                if (plan.pipeline(p).isSource()) out.put("split:" + p, s.plane.streamLength(Keys.splitQueue(roundId, p)));
-                out.put("dlq:" + p, s.plane.streamLength(Keys.dlq(roundId, p)));
+                if (plan.pipeline(p).isSource()) out.put("split:" + p, s.plane.streamLength(Keys.splitQueue(roundId, p, r.getAttempt())));
+                out.put("dlq:" + p, s.plane.streamLength(Keys.dlq(roundId, p, r.getAttempt())));
             }
         }
         return out;
@@ -143,6 +152,8 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
             Thread.sleep(Math.min(50, Math.max(1, deadline - System.currentTimeMillis())));
         }
     }
+
+    @Override public List<LiveInstance> liveInstances() { return s.instances.snapshot(); }
 
     @Override public boolean isLeader() { return master != null && master.isLeader(); }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full-cluster restart: 2 pods, seed, run V1 to completion, submit V2, kill -9 ALL pods while R2 is RUNNING,
 # restart them, let V2 resume to SUCCEEDED, compare V1/V2 checksums.
-# Env: MATERIALS (default 600), STORE_PROFILE (e.g. redis-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
+# Env: MATERIALS (default 600), STORE_PROFILE (default: none = Redis store; e.g. mysql-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"

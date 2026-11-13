@@ -57,10 +57,20 @@ public final class GraphYaml {
         if (runner != null) {
             Map<?, ?> r = map(runner, "runner of " + id);
             String type = String.valueOf(r.get("type")).toLowerCase(Locale.ROOT);
-            String beanName = req(r, "bean", "runner of " + id);
-            if ("row".equals(type)) pb.row(bean(resolver, beanName, RowRunner.class, "pipeline " + id + " runner"));
-            else if ("batch".equals(type)) pb.batch(bean(resolver, beanName, BatchRunner.class, "pipeline " + id + " runner"));
-            else throw new PipelinerException("pipeline " + id + ": runner type must be row or batch, got " + type);
+            boolean row = "row".equals(type);
+            if (!row && !"batch".equals(type)) throw new PipelinerException("pipeline " + id + ": runner type must be row or batch, got " + type);
+            Object perThread = r.get("perThread") != null ? r.get("perThread") : p.get("perThread");
+            if (r.get("class") != null) {   // lazy: instantiated on the workers through the ComponentFactory
+                Class<?> c = runnerClass(str(r.get("class")), row ? RowRunner.class : BatchRunner.class, id);
+                if (row) pb.row(c.asSubclass(RowRunner.class)); else pb.batch(c.asSubclass(BatchRunner.class));
+                if (perThread != null && Boolean.parseBoolean(String.valueOf(perThread))) pb.runnerPerThread();
+            } else {
+                String beanName = req(r, "bean", "runner of " + id);
+                if (row) pb.row(bean(resolver, beanName, RowRunner.class, "pipeline " + id + " runner"));
+                else pb.batch(bean(resolver, beanName, BatchRunner.class, "pipeline " + id + " runner"));
+                if (perThread != null && Boolean.parseBoolean(String.valueOf(perThread)))
+                    throw new PipelinerException("pipeline " + id + ": perThread needs 'class:' (a bean is a shared instance)");
+            }
         }
         List<Object> ports = list(p.get("ports"));
         if (!ports.isEmpty()) {
@@ -148,6 +158,17 @@ public final class GraphYaml {
             throw new PipelinerException("bad duration: " + o);
         }
         return Duration.ofMillis(ms);
+    }
+
+    private static Class<?> runnerClass(String name, Class<?> expected, String id) {
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            Class<?> c = Class.forName(name, false, cl != null ? cl : GraphYaml.class.getClassLoader());
+            if (!expected.isAssignableFrom(c)) throw new PipelinerException("pipeline " + id + " runner: " + name + " is not a " + expected.getSimpleName());
+            return c;
+        } catch (ClassNotFoundException e) {
+            throw new PipelinerException("pipeline " + id + " runner: class '" + name + "' not found");
+        }
     }
 
     private static <T> T bean(ComponentResolver r, String name, Class<T> type, String what) {

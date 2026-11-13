@@ -17,9 +17,13 @@ public final class Keys {
     public static String desired(String r) { return "pg:{" + r + "}:desired"; }
     public static String assign(String r) { return "pg:{" + r + "}:assign"; }
     public static String paused(String r) { return "pg:{" + r + "}:paused"; }
-    public static String channel(String r, String edgeId) { return "pg:{" + r + "}:ch:" + edgeId; }
-    public static String splitQueue(String r, String p) { return "pg:{" + r + "}:split:" + p; }
-    public static String splitIndex(String r, String p) { return "pg:{" + r + "}:splitidx:" + p; }
-    public static String dlq(String r, String p) { return "pg:{" + r + "}:dlq:" + p; }
+    /** Highest master epoch that fenced the round's data plane (see DataPlane.fenceRound). */
+    public static String fence(String r) { return "pg:{" + r + "}:fence"; }
+    public static String roundSeq() { return "pg:roundseq"; }
+    /** Data keys are scoped by the run attempt: a rerun never shares a key with an older attempt. */
+    public static String channel(String r, String edgeId, int attempt) { return "pg:{" + r + "}:ch:" + edgeId + ":" + attempt; }
+    public static String splitQueue(String r, String p, int attempt) { return "pg:{" + r + "}:split:" + p + ":" + attempt; }
+    public static String splitIndex(String r, String p, int attempt) { return "pg:{" + r + "}:splitidx:" + p + ":" + attempt; }
+    public static String dlq(String r, String p, int attempt) { return "pg:{" + r + "}:dlq:" + p + ":" + attempt; }
     public static String journal(String r) { return "pg:{" + r + "}:journal"; }
 }

@@ -1,0 +1,20 @@
+# Chaos profile: tight timings + small queues to amplify races. Keep: renew < claim-idle, tick < leader-ttl, heartbeat < worker-dead.
+pipeliner:
+  runtime:
+    tick-millis: 300
+    leader-ttl-millis: 3000
+    heartbeat-millis: 1000
+    worker-dead-millis: 4000
+    claim-idle-millis: 3000
+    renew-interval-millis: 1000
+    auto-claim-interval-millis: 1000
+    high-watermark: 8
+    low-watermark: 4
+    autoscale: true
+    autoscale-cooldown-millis: 3000
+    max-attempts: 3
+    retry-backoff-millis: 500
+    max-deliveries: 5
+demo:
+  core-grade-delay-ms: 3
+  chunk-rows: 400

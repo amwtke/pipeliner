@@ -34,8 +34,8 @@ public class PipelinerProperties {
     /** Control plane store selection. */
     @Data
     public static class Store {
-        /** mysql or redis. */
-        private String type = "mysql";
+        /** redis (default) or mysql. */
+        private String type = "redis";
         /** Name in pipeliner.datasources or a DataSource bean name (mysql type). */
         private String datasource = "pgstore";
     }

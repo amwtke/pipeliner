@@ -16,6 +16,7 @@ public final class BigNetRunner implements BatchRunner {
     @Override
     public void process(List<Row> rows, Collector out, RunContext ctx) {
         if (rows.isEmpty()) return;
+        Fault.check(ctx);
         Map<String, Object> p = Collections.singletonMap("ids", Lk.distinct(rows, "material_id"));
         Map<String, BigDecimal> inv = Lk.decimals(ctx.lookup("mysql", "select material_id, node, qty from ex_inventory where material_id in (:ids)", p), "qty", "material_id", "node");
         Map<String, BigDecimal> ss = Lk.decimals(ctx.lookup("mysql", "select material_id, node, qty from ex_safety_stock where material_id in (:ids)", p), "qty", "material_id", "node");

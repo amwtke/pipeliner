@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end: 3 pods, seed, run V1, then run V2 while killing a worker pod and the leader pod; compare checksums.
-# Env: MATERIALS (default 600), STORE_PROFILE (e.g. redis-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
+# Env: MATERIALS (default 600), STORE_PROFILE (default: none = Redis store; e.g. mysql-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"

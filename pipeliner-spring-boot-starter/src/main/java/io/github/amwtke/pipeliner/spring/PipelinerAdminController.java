@@ -151,6 +151,7 @@ public class PipelinerAdminController {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("podId", engine.podId());
         m.put("isLeader", engine.isLeader());
+        m.put("liveInstances", engine.liveInstances());   // pipelines instantiated on this pod right now
         return m;
     }
 

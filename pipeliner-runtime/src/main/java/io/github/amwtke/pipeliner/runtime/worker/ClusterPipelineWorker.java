@@ -15,6 +15,7 @@ import io.github.amwtke.pipeliner.core.plan.PlanChannel;
 import io.github.amwtke.pipeliner.core.plan.PlanPipeline;
 import io.github.amwtke.pipeliner.core.store.RoundRecord;
 import io.github.amwtke.pipeliner.runtime.Services;
+import io.github.amwtke.pipeliner.runtime.instance.PipelineInstance;
 import io.github.amwtke.pipeliner.runtime.process.ChunkProcessor;
 import io.github.amwtke.pipeliner.runtime.process.ChunkResult;
 import io.github.amwtke.pipeliner.runtime.process.Events;
@@ -33,28 +34,37 @@ public final class ClusterPipelineWorker implements Runnable {
     private final String consumer;
     private final ClaimRenewer renewer;
     private final PlanPipeline pp;
-    private final ChunkProcessor processor;
+    private final ExecutionPlan plan;
+    private final Map<String, String> params;
+    private ChunkProcessor processor;
+    private PipelineInstance.Lease lease;
     private final List<String> inputs = new ArrayList<>();
     private final Map<String, String> streamToEdge = new HashMap<>();
     private final String splitQueue;
+    private final int attempt;
+    private final long roundSeq;
     private volatile boolean stopRequested;
     private volatile boolean killed;
     private Thread thread;
 
-    public ClusterPipelineWorker(Services s, ExecutionPlan plan, RoundRecord round, String pipelineId, String consumer, ClaimRenewer renewer) {
+    /** Works on attempt {@code attempt} of the run: its streams, DLQ and pipeline instance. */
+    public ClusterPipelineWorker(Services s, ExecutionPlan plan, RoundRecord round, String pipelineId, int attempt, String consumer, ClaimRenewer renewer) {
+        this.attempt = attempt;
+        this.roundSeq = round.getSeq();
         this.s = s;
         this.cfg = s.cfg;
         this.roundId = round.getRoundId();
         this.consumer = consumer;
         this.renewer = renewer;
         this.pp = plan.pipeline(pipelineId);
-        this.processor = new ChunkProcessor(s, plan, roundId, round.getParams(), pipelineId);
-        this.splitQueue = pp.isSource() ? Keys.splitQueue(roundId, pipelineId) : null;
+        this.plan = plan;
+        this.params = round.getParams();
+        this.splitQueue = pp.isSource() ? Keys.splitQueue(roundId, pipelineId, attempt) : null;
         if (pp.isSource()) {
             inputs.add(splitQueue);
         } else {
             for (String edgeId : pp.getInputEdgeIds()) {
-                String key = Keys.channel(roundId, edgeId);
+                String key = Keys.channel(roundId, edgeId, attempt);
                 inputs.add(key);
                 streamToEdge.put(key, edgeId);
             }
@@ -79,6 +89,8 @@ public final class ClusterPipelineWorker implements Runnable {
 
     public boolean stopRequested() { return stopRequested; }
 
+    public int attempt() { return attempt; }
+
     public boolean alive() { return thread != null && thread.isAlive(); }
 
     @Override public void run() {
@@ -86,6 +98,7 @@ public final class ClusterPipelineWorker implements Runnable {
         try {
             while (!stopRequested) {
                 try {
+                    if (!ensureInstance()) continue;
                     if (s.plane.isPaused(roundId) || (pp.isSource() && s.plane.globalThrottle())) {
                         Thread.sleep(500);
                         continue;
@@ -122,7 +135,23 @@ public final class ClusterPipelineWorker implements Runnable {
                 }
             }
         } finally {
+            if (lease != null) lease.release();   // last thread of the pipeline on this pod closes the instance
             s.plane.releaseThreadResources();
+        }
+    }
+
+    /** Takes the pipeline instance (created and opened by the first thread). An open() failure is logged and retried later. */
+    private boolean ensureInstance() throws InterruptedException {
+        if (lease != null) return true;
+        try {
+            lease = s.instances.acquire(plan, roundId, params, pp.getPipelineId(), attempt);
+            processor = new ChunkProcessor(s, plan, roundId, params, pp.getPipelineId(), lease, attempt, roundSeq);
+            return true;
+        } catch (Throwable t) {
+            if (killed || stopRequested) return false;
+            log.warn("worker {}: cannot open pipeline {} of round {}: {}", consumer, pp.getPipelineId(), roundId, Events.describe(t));
+            Thread.sleep(cfg.getRetryBackoffMillis() * 2);
+            return false;
         }
     }
 
@@ -171,13 +200,13 @@ public final class ClusterPipelineWorker implements Runnable {
         List<OutputChunk> outputs = new ArrayList<>();
         List<String> outKeys = new ArrayList<>();
         for (ChunkResult.EdgeChunk ec : res.outputs) {
-            String key = Keys.channel(roundId, ec.channel.getEdgeId());
+            String key = Keys.channel(roundId, ec.channel.getEdgeId(), attempt);
             outputs.add(new OutputChunk(key, ChunkCodec.encodeChunk(ec.chunk)));
             if (!outKeys.contains(key)) outKeys.add(key);
         }
         CommitRequest req = CommitRequest.builder().roundId(roundId).inputStreamKey(entry.getStreamKey()).inputEntryId(entry.getEntryId())
                 .highWatermark(cfg.getHighWatermark()).outputs(outputs)
-                .event(Events.done(roundId, pp.getRunId(), pp.getPipelineId(), in.getChunkId(), inputEdge, consumer, res, 0)).build();
+                .event(Events.done(roundId, pp.getRunId(), pp.getPipelineId(), in.getChunkId(), inputEdge, consumer, res, attempt)).build();
         while (true) {
             CommitResult r = s.plane.commit(req);
             if (r == CommitResult.OK) {
@@ -209,10 +238,10 @@ public final class ClusterPipelineWorker implements Runnable {
         String chunkId = entry.getEntryId();
         try { chunkId = pp.isSource() ? ChunkCodec.decodeSplit(entry.getFields().get("s")).getSplitId() : ChunkCodec.decodeChunk(entry.getFields().get("c")).getChunkId(); }
         catch (RuntimeException ignored) { /* keep entry id */ }
-        s.plane.deadLetter(DeadLetterRequest.builder().roundId(roundId).pipelineId(pp.getPipelineId())
+        s.plane.deadLetter(DeadLetterRequest.builder().roundId(roundId).pipelineId(pp.getPipelineId()).attempt(attempt)
                 .inputStreamKey(entry.getStreamKey()).inputEntryId(entry.getEntryId())
                 .inputFields(new HashMap<>(entry.getFields())).error(error)
-                .event(Events.dead(roundId, pp.getRunId(), pp.getPipelineId(), chunkId, inputEdge, consumer, error)).build());
+                .event(Events.dead(roundId, pp.getRunId(), pp.getPipelineId(), chunkId, inputEdge, consumer, error, attempt)).build());
         s.metrics.deadLetter(roundId, pp.getPipelineId());
         log.error("chunk {} of {} dead-lettered: {}", chunkId, pp.getPipelineId(), error);
     }

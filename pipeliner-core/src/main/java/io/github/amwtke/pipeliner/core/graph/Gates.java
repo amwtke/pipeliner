@@ -18,7 +18,7 @@ public final class Gates {
     /** Signals arrive via engine.signalGate. */
     public static GateDef external(GateCondition doneWhen) { return new GateDef(GateType.EXTERNAL, doneWhen); }
 
-    /** Opens when signals().size() &gt;= doneChunkCount(pipelineId). */
+    /** Opens when the signals of the current attempt (key without "@" or ending "@attempt", see ChunkIds.batchId) &gt;= doneChunkCount(pipelineId). */
     public static GateDef externalCountOf(String pipelineId) { return new GateDef(GateType.EXTERNAL, new CountOf(pipelineId)); }
 
     public static GateDef externalCount(int expected) { return new GateDef(GateType.EXTERNAL, new Count(expected)); }
@@ -35,7 +35,10 @@ public final class Gates {
         private final String pipelineId;
         CountOf(String pipelineId) { this.pipelineId = pipelineId; }
         @Override public GateDecision evaluate(GateContext ctx) {
-            return ctx.signals().size() >= ctx.doneChunkCount(pipelineId) ? GateDecision.OPEN : GateDecision.WAIT;
+            String suffix = "@" + ctx.runAttemptOf(pipelineId);
+            long n = 0;
+            for (String k : ctx.signals().keySet()) if (k.indexOf('@') < 0 || k.endsWith(suffix)) n++;   // signals of older attempts do not count
+            return n >= ctx.doneChunkCount(pipelineId) ? GateDecision.OPEN : GateDecision.WAIT;
         }
     }
 

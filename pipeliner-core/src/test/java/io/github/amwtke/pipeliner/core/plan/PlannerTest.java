@@ -3,6 +3,7 @@ package io.github.amwtke.pipeliner.core.plan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -262,5 +263,50 @@ class PlannerTest {
         PipelineGraph ck = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).chunkKey("k")).build();
         PipelineGraph ck2 = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).chunkKey("j")).build();
         assertNotEquals(ck.plan().getHash(), ck2.plan().getHash());
+    }
+
+    // ------------------------------------------------------------- type-based (lazy) runners
+
+    /** Hash of netDemand() computed before the lazy-runner change: instance-based graphs must keep hashing exactly the same. */
+    static final String PRE_LAZY_NET_DEMAND_HASH = "0249bb16b5784b9a5aa7af3e8be98b1f";
+
+    @Test void instanceBasedHashIsUnchanged() {
+        assertEquals(PRE_LAZY_NET_DEMAND_HASH, netDemand().plan().getHash());
+    }
+
+    @Test void typeBasedRunnerHashesLikeItsInstanceForm() {
+        String inst = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(new Batch())).build().plan().getHash();
+        String type = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(Batch.class)).build().plan().getHash();
+        String perThread = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(Batch.class).runnerPerThread()).build().plan().getHash();
+        String row = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).row(RowR.class)).build().plan().getHash();
+        assertEquals(inst, type);
+        assertNotEquals(type, perThread, "perThread is part of the hash");
+        assertNotEquals(type, row, "runner class/kind is part of the hash");
+    }
+
+    @Test void builderKeepsRunnerTypeAndHelpers() {
+        PipelineGraph g = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(Batch.class).runnerPerThread())
+                .pipeline("b", p -> p.source(new Src(null)).row(new RowR())).pipeline("c", p -> p.source(new Src(null))).build();
+        io.github.amwtke.pipeliner.core.graph.PipelineSpec a = g.getPipelines().get("a"), b = g.getPipelines().get("b"), c = g.getPipelines().get("c");
+        assertEquals(Batch.class, a.getBatchRunnerType());
+        assertNull(a.getBatchRunner());
+        assertTrue(a.isPerThread() && a.lazyRunner());
+        assertEquals(Batch.class.getName(), a.runnerClassName());
+        assertEquals("batch", a.runnerKind());
+        assertEquals(RowR.class.getName(), b.runnerClassName());
+        assertFalse(b.lazyRunner());
+        assertNull(c.runnerClassName());
+        assertFalse(c.hasRunner());
+        g.plan();
+    }
+
+    @Test void atMostOneRunner() {
+        assertMsg(PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(Batch.class).row(RowR.class)).build(), "more than one runner");
+        assertMsg(PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(new Batch()).batch(Batch.class)).build(), "more than one runner");
+        assertMsg(PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).row(new RowR()).batch(new Batch())).build(), "more than one runner");
+    }
+
+    @Test void perThreadNeedsTypeBasedRunner() {
+        assertMsg(PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(new Batch()).runnerPerThread()).build(), "runnerPerThread");
     }
 }

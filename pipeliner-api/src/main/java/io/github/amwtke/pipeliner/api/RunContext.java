@@ -16,4 +16,8 @@ public interface RunContext {
     List<Row> lookup(String datasource, String sql, Map<String, ?> namedParams);
     /** True if gate gateId was opened by OPEN_WITH_FALLBACK timeout policy. */
     boolean gateFallback(String gateId);
+    /** Run attempt of the run this chunk belongs to. */
+    default int attempt() { return 0; }
+    /** roundSeq * 1000 + attempt, see {@link SinkContext#writeVersion()}. */
+    default long writeVersion() { return 0L; }
 }

@@ -10,5 +10,6 @@ class ChunkIdsTest {
         assertEquals("S0012>2.0", ChunkIds.child("S0012", 2, 0));
         assertEquals("S0012>2.0>5.1", ChunkIds.child(ChunkIds.child("S0012", 2, 0), 5, 1));
         assertEquals("S0001#out", ChunkIds.sinkChunk("S0001", "out"));
+        assertEquals("S0001@3", ChunkIds.batchId("S0001", 3));
     }
 }

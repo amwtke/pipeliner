@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class Seeder {
     private static final List<String> MYSQL_TABLES = Arrays.asList("ex_material", "ex_inventory", "ex_in_transit", "ex_safety_stock",
-            "ex_bom", "ex_site_capacity", "ex_nd1_big", "ex_nd_final", "ex_publish_log");
+            "ex_bom", "ex_site_capacity", "ex_nd1_big", "ex_nd_final", "ex_publish_log", "ex_fault");
     private static final String[] MYSQL_DDL = {
         "create table ex_material(material_id varchar(16) primary key, group_id varchar(16) not null, kind varchar(8) not null, eol_month int not null)",
         "create table ex_inventory(material_id varchar(16), node varchar(8), qty decimal(18,4) not null, primary key(material_id,node))",
@@ -26,18 +26,19 @@ public class Seeder {
         "create table ex_safety_stock(material_id varchar(16), node varchar(8), qty decimal(18,4) not null, primary key(material_id,node))",
         "create table ex_bom(big_id varchar(16), fine_id varchar(16), usage_qty decimal(18,4) not null, recovery_rate decimal(18,4) not null, primary key(big_id,fine_id))",
         "create table ex_site_capacity(site varchar(16), month int, capacity decimal(18,4) not null, primary key(site,month))",
-        "create table ex_nd1_big(plan_version varchar(64), material_id varchar(16), node varchar(8), month int, gd decimal(18,4) not null, nd1 decimal(18,4) not null, primary key(plan_version,material_id,node,month))",
-        "create table ex_nd_final(plan_version varchar(64), material_id varchar(16), node varchar(8), month int, kind varchar(8) not null, qty decimal(18,4) not null, primary key(plan_version,material_id,node,month))",
-        "create table ex_publish_log(plan_version varchar(64), kind varchar(8), materials bigint not null, total_qty decimal(18,4) not null, primary key(plan_version,kind))"
+        "create table ex_nd1_big(plan_version varchar(64), material_id varchar(16), node varchar(8), month int, gd decimal(18,4) not null, nd1 decimal(18,4) not null, pg_version bigint not null default 0, primary key(plan_version,material_id,node,month))",
+        "create table ex_nd_final(plan_version varchar(64), material_id varchar(16), node varchar(8), month int, kind varchar(8) not null, qty decimal(18,4) not null, pg_version bigint not null default 0, primary key(plan_version,material_id,node,month))",
+        "create table ex_publish_log(plan_version varchar(64), kind varchar(8), materials bigint not null, total_qty decimal(18,4) not null, pg_version bigint not null default 0, primary key(plan_version,kind))",
+        "create table ex_fault(pipeline varchar(32) primary key, modv int not null)"
     };
-    private static final String RMT = " ENGINE = ReplacingMergeTree ORDER BY (plan_version, material_id, node, month)";
+    private static final String RMT = " ENGINE = ReplacingMergeTree(pg_version) ORDER BY (plan_version, material_id, node, month)";
     private static final Map<String, String> CH_TABLES = new LinkedHashMap<>();
     static {
-        CH_TABLES.put("ex_algo_gd", "(plan_version String, material_id String, group_id String, kind String, node String, month Int32, qty Decimal(18,4))");
-        CH_TABLES.put("ex_fine_gd", "(plan_version String, material_id String, node String, month Int32, qty Decimal(18,4))");
-        CH_TABLES.put("ex_grade_result", "(plan_version String, material_id String, site String, node String, month Int32, gd Decimal(18,4), nd1 Decimal(18,4), core Decimal(18,4), refurbishable Decimal(18,4), scrap Decimal(18,4))");
-        CH_TABLES.put("ex_refurb_plan", "(plan_version String, material_id String, site String, node String, month Int32, refurb_in Decimal(18,4), out_month Int32, refurb_out Decimal(18,4))");
-        CH_TABLES.put("ex_scrap", "(plan_version String, material_id String, node String, month Int32, scrap Decimal(18,4))");
+        CH_TABLES.put("ex_algo_gd", "(plan_version String, material_id String, group_id String, kind String, node String, month Int32, qty Decimal(18,4), pg_version UInt64)");
+        CH_TABLES.put("ex_fine_gd", "(plan_version String, material_id String, node String, month Int32, qty Decimal(18,4), pg_version UInt64)");
+        CH_TABLES.put("ex_grade_result", "(plan_version String, material_id String, site String, node String, month Int32, gd Decimal(18,4), nd1 Decimal(18,4), core Decimal(18,4), refurbishable Decimal(18,4), scrap Decimal(18,4), pg_version UInt64)");
+        CH_TABLES.put("ex_refurb_plan", "(plan_version String, material_id String, site String, node String, month Int32, refurb_in Decimal(18,4), out_month Int32, refurb_out Decimal(18,4), pg_version UInt64)");
+        CH_TABLES.put("ex_scrap", "(plan_version String, material_id String, node String, month Int32, scrap Decimal(18,4), pg_version UInt64)");
     }
 
     private final DataSourceRegistry dataSources;

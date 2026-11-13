@@ -179,7 +179,7 @@ abstract class AbstractControlPlaneStoreContractTest {
         for (int t = 0; t < 4; t++) {
             fs.add(ex.submit(() -> {
                 go.await();
-                if (store.casGateStatus(rid, "gate1", GateStatus.CLOSED, GateStatus.OPEN, "t", null, 1)) wins.incrementAndGet();
+                if (store.casGateStatus(rid, "gate1", GateStatus.CLOSED, GateStatus.OPEN, "t", null, 2000)) wins.incrementAndGet();
                 return null;
             }));
         }
@@ -469,6 +469,76 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals(1L, store.loadRound(rid).getChunkCounts().get("p1").get(ChunkStatus.DONE));
         assertNull(store.loadRoundState("missing-" + tag));
     }
+
+    @Test
+    void resetRunsIsAtomicAndClearsGateSignals() {
+        String rid = mk("resetruns");
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 5));
+        for (String r : new String[]{"run1", "run2"}) {
+            assertTrue(store.casRunStatus(rid, r, RunStatus.PENDING, RunStatus.RUNNING, null, 5));
+            assertTrue(store.casRunStatus(rid, r, RunStatus.RUNNING, RunStatus.SUCCEEDED, null, 5));
+        }
+        for (String p : new String[]{"p1", "p2", "p3"}) {
+            assertTrue(store.casPipelineStatus(rid, p, PipelineStatus.PENDING, PipelineStatus.RUNNING, null, 5));
+            store.setPipelineEnumDone(rid, p, true, 5);
+            assertTrue(store.casPipelineStatus(rid, p, PipelineStatus.RUNNING, PipelineStatus.SUCCEEDED, null, 5));
+        }
+        store.updateRunAssignment(rid, "run2", "w1", 2, 5);
+        store.armGate(rid, "gate1", 111L, 999L, 5);
+        assertTrue(store.casGateStatus(rid, "gate1", GateStatus.CLOSED, GateStatus.OPEN, "ext", m2("k", "v"), 5));
+        store.markGateAlerted(rid, "gate1");
+        store.saveGateSignal(rid, "gate1", "S0000@1", "a");
+        store.saveGateSignal(rid, "gate1", "S0001@1", "b");
+        store.applyChunkEvents(rid, Arrays.asList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("e1", 10)),
+                ev(rid, "DONE", "p3", "S0000", "run2", "split", 7, m("sink:out", 7))), "1-0", 5);
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.FAILED, "x", 5));
+
+        // fenced: nothing at all is applied (one atomic unit)
+        assertThrows(StaleEpochException.class, () -> store.resetRuns(rid, Arrays.asList("run1", "run2"), Collections.singletonList("gate1"), 4));
+        assertEquals(RoundStatus.FAILED, store.loadRoundRecord(rid).getStatus());
+        assertEquals(2, store.loadGateSignals(rid, "gate1").size());
+        assertEquals(1, store.countChunks(rid, "p1", ChunkStatus.DONE));
+        assertThrows(StaleEpochException.class, () -> store.resetRuns("missing-" + tag, Collections.singletonList("run1"), Collections.<String>emptyList(), 9));
+
+        store.resetRuns(rid, Collections.singletonList("run2"), Collections.singletonList("gate1"), 6);
+        RoundView v = store.loadRound(rid);
+        assertEquals(RoundStatus.RUNNING, v.getRound().getStatus(), "a terminal round is revived");
+        assertNull(v.getRound().getFinishedAt());
+        assertNull(v.getRound().getError());
+        assertEquals(6, v.getRound().getMasterEpoch());
+        assertTrue(store.findActiveRounds().contains(rid));
+        for (RunRecord r : v.getRuns()) {
+            if (r.getRunId().equals("run2")) {
+                assertEquals(RunStatus.PENDING, r.getStatus());
+                assertEquals(3, r.getAttempt(), "attempt 2 + 1");
+                assertNull(r.getAssignee());
+                assertNull(r.getFinishedAt());
+            } else {
+                assertEquals(RunStatus.SUCCEEDED, r.getStatus(), "run1 untouched");
+                assertEquals(0, r.getAttempt());
+            }
+        }
+        for (PipelineRecord p : v.getPipelines()) {
+            if (p.getRunId().equals("run2")) { assertEquals(PipelineStatus.PENDING, p.getStatus()); assertFalse(p.isEnumDone()); }
+            else { assertEquals(PipelineStatus.SUCCEEDED, p.getStatus()); assertTrue(p.isEnumDone()); }
+        }
+        GateRecord g = v.getGates().get(0);
+        assertEquals(GateStatus.CLOSED, g.getStatus());
+        assertNull(g.getArmedAt());
+        assertNull(g.getDeadlineAt());
+        assertNull(g.getOpenedBy());
+        assertNull(g.getOpenedAt());
+        assertTrue(g.getContext() == null || g.getContext().isEmpty());
+        assertFalse(g.isAlerted());
+        assertTrue(store.loadGateSignals(rid, "gate1").isEmpty(), "signals of the old attempt are gone");
+        assertEquals(1, store.countChunks(rid, "p1", ChunkStatus.DONE), "run1's chunk records survive");
+        assertEquals(0, store.countChunks(rid, "p3", null));
+        // a later signal of the new attempt is kept
+        store.saveGateSignal(rid, "gate1", "S0000@3", "c");
+        assertEquals(1, store.loadGateSignals(rid, "gate1").size());
+    }
+
+    private static Map<String, String> m2(String k, String v) { Map<String, String> r = new HashMap<>(); r.put(k, v); return r; }
 
     @Test
     void perfApplyTenBatchesOf500() {

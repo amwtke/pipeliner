@@ -79,6 +79,9 @@ for i in $(seq 1 30); do
 done
 clickhouse-client --user "${PG_USER}" --password "${PG_PASS}" -q "CREATE DATABASE IF NOT EXISTS ${PG_DB}"
 
+# Low-resource tuning (ClickHouse memory/caches/system logs, MySQL performance_schema/binlog)
+bash "$(dirname "$0")/tune-lowres.sh"
+
 echo "redis:      $(redis-cli -p 6380 ping)"
 echo "mysql:      $(mysql -u${PG_USER} -p${PG_PASS} -N -e 'select version()' 2>/dev/null)"
 echo "clickhouse: $(clickhouse-client --user ${PG_USER} --password ${PG_PASS} -q 'select version()')"

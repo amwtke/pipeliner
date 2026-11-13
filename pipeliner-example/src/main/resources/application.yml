@@ -18,14 +18,8 @@ pipeliner:
   redis:
     uri: redis://127.0.0.1:6380/0
   store:
-    type: mysql
-    datasource: pgstore
+    type: redis   # default; mysql: --spring.profiles.active=mysql-store
   datasources:
-    pgstore:
-      url: jdbc:mysql://127.0.0.1:3306/pipeliner?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC
-      username: pipeliner
-      password: pipeliner
-      driver-class-name: com.mysql.cj.jdbc.Driver
     mysql:
       url: jdbc:mysql://127.0.0.1:3306/pipeliner_demo?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC
       username: pipeliner

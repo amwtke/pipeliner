@@ -24,7 +24,7 @@ import lombok.extern.slf4j.Slf4j;
 public class MySqlControlPlaneStore implements ControlPlaneStore {
     private static final String TBL = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
     private static final String R_COLS = "round_id,graph_name,biz_key,plan_hash,plan_json,params_json,status,master_epoch,journal_offset,"
-            + "created_at,started_at,finished_at,error,incomplete";
+            + "created_at,started_at,finished_at,error,incomplete,seq";
 
     private final DataSource ds;
 
@@ -121,7 +121,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             "CREATE TABLE IF NOT EXISTS pg_round (round_id VARCHAR(64) NOT NULL, graph_name VARCHAR(128) NOT NULL, biz_key VARCHAR(190) NOT NULL,"
                 + " plan_hash VARCHAR(64), plan_json MEDIUMTEXT, params_json TEXT, status VARCHAR(16) NOT NULL, master_epoch BIGINT NOT NULL DEFAULT 0,"
                 + " journal_offset VARCHAR(64) NOT NULL DEFAULT '0-0', created_at BIGINT, started_at BIGINT, finished_at BIGINT, error TEXT,"
-                + " incomplete TINYINT(1) NOT NULL DEFAULT 0, PRIMARY KEY (round_id), UNIQUE KEY uk_biz (graph_name, biz_key), KEY idx_status (status))" + TBL,
+                + " incomplete TINYINT(1) NOT NULL DEFAULT 0, seq BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (round_id), UNIQUE KEY uk_biz (graph_name, biz_key), KEY idx_status (status))" + TBL,
             "CREATE TABLE IF NOT EXISTS pg_run (round_id VARCHAR(64) NOT NULL, run_id VARCHAR(64) NOT NULL, stage INT NOT NULL DEFAULT 0,"
                 + " mode VARCHAR(16), status VARCHAR(16) NOT NULL, attempt INT NOT NULL DEFAULT 0, assignee VARCHAR(128), master_epoch BIGINT NOT NULL DEFAULT 0,"
                 + " started_at BIGINT, finished_at BIGINT, error TEXT, PRIMARY KEY (round_id, run_id))" + TBL,
@@ -140,6 +140,11 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         };
         try (Connection c = ds.getConnection(); Statement st = c.createStatement()) {
             for (String s : ddl) st.execute(s);
+            try {   // tables created before the round sequence existed
+                st.execute("ALTER TABLE pg_round ADD COLUMN seq BIGINT NOT NULL DEFAULT 0");
+            } catch (SQLException e) {
+                if (e.getErrorCode() != 1060) throw e;   // 1060: duplicate column
+            }
         } catch (SQLException e) {
             throw new IllegalStateException("init failed: " + e.getMessage(), e);
         }
@@ -152,7 +157,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 .planHash(rs.getString("plan_hash")).planJson(rs.getString("plan_json")).params(strMap(rs.getString("params_json")))
                 .status(RoundStatus.valueOf(rs.getString("status"))).masterEpoch(rs.getLong("master_epoch"))
                 .journalOffset(rs.getString("journal_offset")).createdAt(lng(rs, "created_at")).startedAt(lng(rs, "started_at"))
-                .finishedAt(lng(rs, "finished_at")).error(rs.getString("error")).incomplete(rs.getBoolean("incomplete")).build();
+                .finishedAt(lng(rs, "finished_at")).error(rs.getString("error")).incomplete(rs.getBoolean("incomplete")).seq(rs.getLong("seq")).build();
     }
 
     private static RunRecord mapRun(ResultSet rs) throws SQLException {
@@ -194,10 +199,10 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         if (r.getStatus() == null) r.setStatus(RoundStatus.CREATED);
         try {
             tx(c -> {
-                exec(c, "INSERT INTO pg_round (" + R_COLS + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r.getRoundId(), r.getGraphName(), r.getBizKey(),
+                exec(c, "INSERT INTO pg_round (" + R_COLS + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r.getRoundId(), r.getGraphName(), r.getBizKey(),
                         r.getPlanHash(), r.getPlanJson(), json(r.getParams()), r.getStatus().name(), r.getMasterEpoch(),
                         r.getJournalOffset() == null ? "0-0" : r.getJournalOffset(), r.getCreatedAt(), r.getStartedAt(), r.getFinishedAt(), r.getError(),
-                        r.isIncomplete());
+                        r.isIncomplete(), r.getSeq());
                 for (RunRecord u : runs == null ? Collections.<RunRecord>emptyList() : runs)
                     exec(c, "INSERT INTO pg_run (round_id,run_id,stage,mode,status,attempt,assignee,master_epoch,started_at,finished_at,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             r.getRoundId(), u.getRunId(), u.getStage(), u.getMode() == null ? null : u.getMode().name(),
@@ -449,16 +454,26 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override
-    public void resetRun(String roundId, String runId, long epoch) {
-        tx(c -> {
-            int n = exec(c, "UPDATE pg_run SET status='PENDING', attempt=attempt+1, assignee=NULL, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? "
-                    + "WHERE round_id=? AND run_id=? AND master_epoch<=?" + FENCE, epoch, roundId, runId, epoch, roundId, epoch);
-            if (n == 0) return null; // fenced or unknown run
-            exec(c, "UPDATE pg_pipeline SET status='PENDING', enum_done=0, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? WHERE round_id=? AND run_id=?",
-                    epoch, roundId, runId);
-            exec(c, "DELETE FROM pg_chunk WHERE round_id=? AND run_id=?", roundId, runId);
-            return null;
+    public void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch) {
+        boolean ok = tx(c -> {
+            // fence first (row lock on the round serialises against fenceRound and every other master write)
+            if (exec(c, "UPDATE pg_round SET master_epoch=? WHERE round_id=? AND master_epoch<=?", epoch, roundId, epoch) == 0) return false;
+            for (String runId : runIds) {
+                if (exec(c, "UPDATE pg_run SET status='PENDING', attempt=attempt+1, assignee=NULL, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? "
+                        + "WHERE round_id=? AND run_id=? AND master_epoch<=?", epoch, roundId, runId, epoch) == 0) return false;   // run written by a newer epoch: rolls back
+                exec(c, "UPDATE pg_pipeline SET status='PENDING', enum_done=0, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? WHERE round_id=? AND run_id=?",
+                        epoch, roundId, runId);
+                exec(c, "DELETE FROM pg_chunk WHERE round_id=? AND run_id=?", roundId, runId);
+            }
+            for (String gateId : gateIds) {
+                exec(c, "UPDATE pg_gate SET status='CLOSED', armed_at=NULL, deadline_at=NULL, opened_by=NULL, opened_at=NULL, context_json=NULL, alerted=0, master_epoch=? "
+                        + "WHERE round_id=? AND gate_id=?", epoch, roundId, gateId);
+                exec(c, "DELETE FROM pg_gate_signal WHERE round_id=? AND gate_id=?", roundId, gateId);
+            }
+            exec(c, "UPDATE pg_round SET status='RUNNING', finished_at=NULL, error=NULL WHERE round_id=? AND status IN ('FAILED','SUCCEEDED')", roundId);
+            return true;
         });
+        if (!ok) throw new StaleEpochException("resetRuns for round " + roundId + " fenced or missing (epoch " + epoch + ")");
     }
 
     @Override

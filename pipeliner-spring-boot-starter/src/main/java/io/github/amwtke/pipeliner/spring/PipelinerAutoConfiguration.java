@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.spring;
 
+import io.github.amwtke.pipeliner.api.ComponentFactory;
 import io.github.amwtke.pipeliner.api.DataSourceRegistry;
 import io.github.amwtke.pipeliner.core.dataplane.DataPlane;
 import io.github.amwtke.pipeliner.core.engine.PipelinerEngine;
@@ -17,6 +18,7 @@ import java.util.Map;
 import javax.sql.DataSource;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.AutowireCapableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -79,11 +81,17 @@ public class PipelinerAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean(ComponentFactory.class)
+    public ComponentFactory pipelinerComponentFactory(AutowireCapableBeanFactory beans) {
+        return new SpringComponentFactory(beans);
+    }
+
+    @Bean
     @ConditionalOnMissingBean(PipelinerEngine.class)
     public PipelinerEngine pipelinerEngine(RuntimeConfig cfg, ControlPlaneStore store, DataPlane plane,
                                            DataSourceRegistry registry, PipelinerMetrics metrics,
-                                           ObjectProvider<PipelineGraph> graphs) {
-        DefaultPipelinerEngine engine = new DefaultPipelinerEngine(cfg, store, plane, registry, metrics);
+                                           ComponentFactory factory, ObjectProvider<PipelineGraph> graphs) {
+        DefaultPipelinerEngine engine = new DefaultPipelinerEngine(cfg, store, plane, registry, metrics, factory);
         graphs.orderedStream().forEach(engine::registerGraph);
         return engine;
     }

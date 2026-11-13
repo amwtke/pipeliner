@@ -101,4 +101,27 @@ class GraphYamlTest {
         String yaml = "graph: g\npipelines:\n  - {id: a, source: nope}\n";
         assertThrows(PipelinerException.class, () -> GraphYaml.load(new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)), resolver()));
     }
+
+    private static PipelineGraph load(String yaml) {
+        return GraphYaml.load(new ByteArrayInputStream(yaml.getBytes(StandardCharsets.UTF_8)), resolver());
+    }
+
+    @Test void runnerClassIsLazy() {
+        String cls = Run.class.getName();
+        PipelineGraph g = load("graph: g\npipelines:\n"
+                + "  - {id: a, source: src, runner: {type: batch, class: '" + cls + "'}}\n"
+                + "  - {id: b, source: src, runner: {type: batch, class: '" + cls + "', perThread: true}}\n");
+        assertEquals(Run.class, g.getPipelines().get("a").getBatchRunnerType());
+        assertEquals(false, g.getPipelines().get("a").isPerThread());
+        assertEquals(true, g.getPipelines().get("b").isPerThread());
+        PipelineGraph java = PipelineGraph.builder("g").pipeline("a", p -> p.source(SRC).batch(Run.class))
+                .pipeline("b", p -> p.source(SRC).batch(Run.class).runnerPerThread()).build();
+        assertEquals(java.plan().getHash(), g.plan().getHash());
+    }
+
+    @Test void runnerClassErrors() {
+        assertThrows(PipelinerException.class, () -> load("graph: g\npipelines:\n  - {id: a, source: src, runner: {type: batch, class: no.such.Clazz}}\n"));
+        assertThrows(PipelinerException.class, () -> load("graph: g\npipelines:\n  - {id: a, source: src, runner: {type: row, class: '" + Run.class.getName() + "'}}\n"));
+        assertThrows(PipelinerException.class, () -> load("graph: g\npipelines:\n  - {id: a, source: src, runner: {type: batch, bean: run, perThread: true}}\n"));
+    }
 }

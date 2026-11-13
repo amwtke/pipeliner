@@ -48,7 +48,7 @@ class ResilienceTest {
             String round = crashedAfterRunRunning(h, m, "lt");
             assertTrue(h.store.casPipelineStatus(round, "a", PipelineStatus.PENDING, PipelineStatus.RUNNING, null, 0));
             assertTrue(h.store.updateRunAssignment(round, "R1", "ghost", 1, 0));
-            h.plane.assignLocalRun(round, "R1", "ghost", 1);
+            h.plane.assignLocalRun(round, "R1", "ghost", 1, 0);
             h.plane.heartbeat("ghost", Collections.singletonMap("graph.lt", "test-lt"));
             h.plane.appendJournal(round, Events.localRun(true, round, "R1", "a", "ghost", 1, null));
             h.plane.appendJournal(round, ChunkEvent.builder().type("DONE").roundId(round).runId("R1").pipelineId("a").chunkId("S0000")
@@ -150,7 +150,7 @@ class ResilienceTest {
         try (Harness h = new Harness(g, Collections.<String, ExecMode>emptyMap())) {
             DefaultPipelinerEngine m = h.pod(cfg("m").workerEnabled(false).build(), true);
             String round = m.submit("md", "k", null);
-            String queue = Keys.splitQueue(round, "p");
+            String queue = Keys.splitQueue(round, "p", 0);
             assertTrue(waitFor(() -> h.plane.streamLength(queue) == 4, 5000));
             h.plane.read("ghost#0", Collections.singletonList(queue), 1, 0);          // delivery 1, consumer dies mid-chunk ...
             for (int i = 1; i <= 3; i++) h.plane.autoClaim("ghost#" + i, queue, 0, 1);   // ... and so do three more claimers

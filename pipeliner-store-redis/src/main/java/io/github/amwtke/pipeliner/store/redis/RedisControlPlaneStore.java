@@ -114,6 +114,61 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "end\n"
             + "return 1\n";
 
+    /**
+     * KEYS[1]=round hash; ARGV[1]=epoch, ARGV[2]=nRuns, run ids..., nGates, gate ids.... Atomic rerun reset (see ControlPlaneStore.resetRuns).
+     * Returns 1 ok, 0 fenced, -1 round missing.
+     */
+    private static final String RESET_RUNS =
+            "local rk=KEYS[1]\n"
+            + "local pre=string.sub(rk,1,#rk-5)\n"
+            + "local cur=redis.call('HGET',rk,'epoch')\n"
+            + "if not cur then return -1 end\n"
+            + "if tonumber(cur)>tonumber(ARGV[1]) then return 0 end\n"
+            + "local nr=tonumber(ARGV[2])\n"
+            + "for i=1,nr do\n"
+            + "  local re=redis.call('HGET',pre..'run:'..ARGV[2+i],'epoch')\n"
+            + "  if re and tonumber(re)>tonumber(ARGV[1]) then return 0 end\n"
+            + "end\n"
+            + "redis.call('HSET',rk,'epoch',ARGV[1])\n"
+            + "local ep=ARGV[1]\n"
+            + "local runs={}\n"
+            + "for i=1,nr do\n"
+            + "  local id=ARGV[2+i]\n"
+            + "  runs[id]=true\n"
+            + "  local k=pre..'run:'..id\n"
+            + "  if redis.call('EXISTS',k)==1 then\n"
+            + "    redis.call('HSET',k,'status','PENDING','epoch',ep)\n"
+            + "    redis.call('HINCRBY',k,'attempt',1)\n"
+            + "    redis.call('HDEL',k,'assignee','startedAt','finishedAt','error')\n"
+            + "  end\n"
+            + "end\n"
+            + "for _,pid in ipairs(redis.call('SMEMBERS',pre..'pls')) do\n"
+            + "  local pk=pre..'pl:'..pid\n"
+            + "  if runs[redis.call('HGET',pk,'runId')] then\n"
+            + "    redis.call('HSET',pk,'status','PENDING','enumDone','0','epoch',ep)\n"
+            + "    redis.call('HDEL',pk,'startedAt','finishedAt','error')\n"
+            + "    redis.call('DEL',pre..'chunk:'..pid,pre..'cnt:'..pid)\n"
+            + "    redis.call('SREM',pre..'cpls',pid)\n"
+            + "  end\n"
+            + "end\n"
+            + "local ng=tonumber(ARGV[3+nr])\n"
+            + "for i=1,ng do\n"
+            + "  local id=ARGV[3+nr+i]\n"
+            + "  local k=pre..'gate:'..id\n"
+            + "  if redis.call('EXISTS',k)==1 then\n"
+            + "    redis.call('HSET',k,'status','CLOSED','alerted','0','epoch',ep)\n"
+            + "    redis.call('HDEL',k,'armedAt','deadlineAt','openedBy','openedAt','context')\n"
+            + "  end\n"
+            + "  redis.call('DEL',pre..'signal:'..id)\n"
+            + "end\n"
+            + "local st=redis.call('HGET',rk,'status')\n"
+            + "if st=='FAILED' or st=='SUCCEEDED' then\n"
+            + "  redis.call('HSET',rk,'status','RUNNING')\n"
+            + "  redis.call('HDEL',rk,'finishedAt','error')\n"
+            + "  redis.call('SADD','pg:store:active',string.sub(pre,5,#pre-2))\n"
+            + "end\n"
+            + "return 1\n";
+
     private final RedisClient client;
     private volatile StatefulRedisConnection<String, String> conn;
 
@@ -198,7 +253,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
         put(f, r.getStatus().name(), "status"); put(f, r.getMasterEpoch(), "epoch");
         put(f, r.getJournalOffset() == null ? "0-0" : r.getJournalOffset(), "journalOffset");
         put(f, r.getCreatedAt(), "createdAt"); put(f, r.getStartedAt(), "startedAt"); put(f, r.getFinishedAt(), "finishedAt");
-        put(f, r.getError(), "error"); putBool(f, r.isIncomplete(), "incomplete");
+        put(f, r.getError(), "error"); putBool(f, r.isIncomplete(), "incomplete"); put(f, r.getSeq(), "seq");
         return f;
     }
 
@@ -208,7 +263,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
         return RoundRecord.builder().roundId(h.get("roundId")).graphName(h.get("graphName")).bizKey(h.get("bizKey")).planHash(h.get("planHash"))
                 .planJson(h.get("planJson")).params(params == null ? null : ChunkCodec.toStringMap(params)).status(RoundStatus.valueOf(h.get("status")))
                 .masterEpoch(lng0(h, "epoch")).journalOffset(h.get("journalOffset")).createdAt(lng(h, "createdAt")).startedAt(lng(h, "startedAt"))
-                .finishedAt(lng(h, "finishedAt")).error(h.get("error")).incomplete(bool(h, "incomplete")).build();
+                .finishedAt(lng(h, "finishedAt")).error(h.get("error")).incomplete(bool(h, "incomplete")).seq(lng0(h, "seq")).build();
     }
 
     private static RunRecord toRun(String rid, String id, Map<String, String> h) {
@@ -520,17 +575,15 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override
-    public void resetRun(String roundId, String runId, long epoch) {
-        RedisCommands<String, String> c = r();
-        if (!mutate(roundId, k(roundId, "run:" + runId), new Ops(null, epoch).set("status", RunStatus.PENDING).incr("attempt", 1).del("assignee")
-                .del("startedAt").del("finishedAt").del("error"))) return;
-        for (String pid : c.smembers(k(roundId, "pls"))) {
-            String pk = k(roundId, "pl:" + pid);
-            if (!runId.equals(c.hget(pk, "runId"))) continue;
-            if (!mutate(roundId, pk, new Ops(null, epoch).set("status", PipelineStatus.PENDING).set("enumDone", "0").del("startedAt").del("finishedAt").del("error"))) continue;
-            c.del(k(roundId, "chunk:" + pid), k(roundId, "cnt:" + pid));
-            c.srem(k(roundId, "cpls"), pid);
-        }
+    public void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch) {
+        List<String> args = new ArrayList<>();
+        args.add(String.valueOf(epoch));
+        args.add(String.valueOf(runIds.size()));
+        args.addAll(runIds);
+        args.add(String.valueOf(gateIds.size()));
+        args.addAll(gateIds);
+        long res = evalLong(RESET_RUNS, new String[]{k(roundId, "round")}, args);
+        if (res != 1) throw new StaleEpochException("resetRuns for round " + roundId + " fenced or missing (epoch " + epoch + ")");
     }
 
     @Override
