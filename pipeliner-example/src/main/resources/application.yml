@@ -1,0 +1,48 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: pipeliner-example
+  main:
+    banner-mode: "off"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+demo:
+  core-grade-delay-ms: 0
+  algo-delay-ms: 200
+pipeliner:
+  pod-id: ${POD_ID:}
+  redis:
+    uri: redis://127.0.0.1:6380/0
+  store:
+    type: mysql
+    datasource: pgstore
+  datasources:
+    pgstore:
+      url: jdbc:mysql://127.0.0.1:3306/pipeliner?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC
+      username: pipeliner
+      password: pipeliner
+      driver-class-name: com.mysql.cj.jdbc.Driver
+    mysql:
+      url: jdbc:mysql://127.0.0.1:3306/pipeliner_demo?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC
+      username: pipeliner
+      password: pipeliner
+      driver-class-name: com.mysql.cj.jdbc.Driver
+    ch:
+      url: jdbc:clickhouse:http://127.0.0.1:8123/default?compress=0
+      username: pipeliner
+      password: pipeliner
+      driver-class-name: com.clickhouse.jdbc.ClickHouseDriver
+  runtime:
+    tick-millis: 500
+    leader-ttl-millis: 6000
+    heartbeat-millis: 2000
+    worker-dead-millis: 8000
+    claim-idle-millis: 15000
+    renew-interval-millis: 4000
+    auto-claim-interval-millis: 3000
+  admin:
+    enabled: true
