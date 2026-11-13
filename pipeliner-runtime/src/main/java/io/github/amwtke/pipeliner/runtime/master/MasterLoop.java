@@ -7,19 +7,31 @@ import io.github.amwtke.pipeliner.runtime.AdminOps;
 import io.github.amwtke.pipeliner.runtime.Services;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import io.github.amwtke.pipeliner.core.engine.MasterTickMode;
+import io.github.amwtke.pipeliner.core.engine.TickResult;
 import lombok.extern.slf4j.Slf4j;
 
-/** Leader election plus the per-tick loop over all active rounds. */
+/**
+ * Leader election plus the per-tick pass over all active rounds. One pass is {@link #tick()}; in LOCAL mode the private "pg-master" thread
+ * calls it every tickMillis, in EXTERNAL mode no thread exists and the caller (engine.tick(), e.g. an xxl-job handler) drives it.
+ * The worker agent is NOT affected by the mode: pod liveness/heartbeats must not depend on an external scheduler.
+ */
 @Slf4j
 public final class MasterLoop implements Runnable {
     private final Services s;
     private final MasterContext ctx;
     private final RoundMaster master;
+    private final RetentionJanitor janitor;
     private volatile boolean stopped;
     private volatile boolean leader;
     private volatile long lastRenew;
     private long lastActiveSync;
     private Thread thread;
+    private final ReentrantLock tickLock = new ReentrantLock();
+    private int roundsTicked;
+    private int commandsExecuted;
     private static final long ACTIVE_SYNC_MILLIS = 30000;
     private static final int COMMANDS_PER_TICK = 20;
 
@@ -27,9 +39,18 @@ public final class MasterLoop implements Runnable {
         this.s = s;
         this.ctx = new MasterContext(s);
         this.master = new RoundMaster(ctx);
+        this.janitor = new RetentionJanitor(s, () -> leader);
     }
 
     public synchronized void start() {
+        if (s.cfg.getMasterTickMode() == MasterTickMode.EXTERNAL) {
+            long ttl = s.cfg.getLeaderTtlMillis(), iv = s.cfg.getExternalTickIntervalMillis();
+            if (ttl < 3 * iv)
+                log.warn("master-tick-mode=external but leaderTtlMillis ({}) < 3 x externalTickIntervalMillis ({}): the lease may expire between "
+                        + "triggers and leadership will flap; use leaderTtlMillis >= {}", ttl, iv, 3 * iv);
+            log.info("{} master is driven externally (no pg-master thread); call engine.tick() / POST /pg/master/tick every ~{} ms", s.podId(), iv);
+            return;
+        }
         thread = new Thread(this, "pg-master");
         thread.setDaemon(true);
         thread.start();
@@ -46,22 +67,52 @@ public final class MasterLoop implements Runnable {
             t.interrupt();
             try { t.join(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
-        if (leader && release) {
-            try { s.plane.releaseLeadership(s.podId()); } catch (RuntimeException e) { log.warn("release leadership failed: {}", e.toString()); }
+        boolean locked = false;
+        try { locked = tickLock.tryLock(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }   // wait out an external tick
+        try {
+            if (leader && release) {
+                try { s.plane.releaseLeadership(s.podId()); } catch (RuntimeException e) { log.warn("release leadership failed: {}", e.toString()); }
+            }
+            if (leader) s.metrics.leaderLost(s.podId());
+            leader = false;
+        } finally {
+            if (locked) tickLock.unlock();
         }
-        leader = false;
+    }
+
+    /**
+     * One master pass; idempotent and safe to call from any thread. Overlapping calls on this pod return skipped "tick in progress". A pod that
+     * does not hold the lease after the acquire attempt returns skipped "not leader". Runtime failures propagate (the LOCAL loop logs them).
+     */
+    public TickResult tick() {
+        long t0 = System.currentTimeMillis();
+        if (stopped) return TickResult.skipped("master stopped", false, ctx.epoch(), 0);
+        if (!tickLock.tryLock()) return TickResult.skipped(TickResult.IN_PROGRESS, leader, ctx.epoch(), 0);
+        try {
+            roundsTicked = 0;
+            commandsExecuted = 0;
+            try {
+                if (!renew()) return TickResult.skipped(TickResult.NOT_LEADER, false, ctx.epoch(), System.currentTimeMillis() - t0);
+                tickAll();
+            } catch (StaleEpochException e) {
+                stepDown("fenced: " + e.getMessage());
+                return TickResult.skipped("deposed", false, ctx.epoch(), System.currentTimeMillis() - t0);
+            }
+            long took = System.currentTimeMillis() - t0;
+            if (leader) s.metrics.masterTick(took);
+            return new TickResult(leader, ctx.epoch(), roundsTicked, commandsExecuted, took, false, null);
+        } finally {
+            tickLock.unlock();
+        }
     }
 
     @Override public void run() {
         while (!stopped) {
             try {
-                if (renew()) tickAll();
+                tick();
                 Thread.sleep(s.cfg.getTickMillis());
             } catch (InterruptedException e) {
                 return;
-            } catch (StaleEpochException e) {
-                stepDown("fenced: " + e.getMessage());
-                try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
             } catch (RuntimeException e) {
                 log.warn("master tick failed: {}", e.toString());
                 try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
@@ -93,6 +144,7 @@ public final class MasterLoop implements Runnable {
     private void stepDown(String why) {
         if (leader) log.warn("{} steps down: {}", s.podId(), why);
         leader = false;
+        s.metrics.leaderLost(s.podId());
     }
 
     /** Makes sure the tick keeps the lease: renews, and aborts (false) if deposed. */
@@ -103,10 +155,13 @@ public final class MasterLoop implements Runnable {
     private void tickAll() {
         syncActiveRounds();
         executeCommands();
-        for (String roundId : s.plane.activeRounds()) {
+        java.util.Set<String> active = s.plane.activeRounds();
+        s.metrics.activeRounds(active.size());
+        for (String roundId : active) {
             if (stopped || !leader || !keepLease()) return;
             try {
                 master.tick(roundId);
+                roundsTicked++;
             } catch (StaleEpochException e) {
                 throw e;
             } catch (RuntimeException e) {
@@ -118,6 +173,7 @@ public final class MasterLoop implements Runnable {
             }
         }
         master.memoryThrottle();
+        janitor.runIfDue(System.currentTimeMillis());
     }
 
     /** The active set lives in Redis only: re-add every non-terminal round of the store on gaining leadership and every 30 s. */
@@ -154,6 +210,7 @@ public final class MasterLoop implements Runnable {
                 result.put("ok", "false");
                 result.put("error", e.getMessage() == null ? e.toString() : e.getMessage());
             }
+            commandsExecuted++;
             if (id != null) s.plane.putCommandResult(id, ChunkCodec.toJson(result));
             if (deposed) throw new StaleEpochException("deposed by admin command");
         }

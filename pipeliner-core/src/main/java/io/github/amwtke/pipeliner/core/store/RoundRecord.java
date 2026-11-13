@@ -29,4 +29,6 @@ public class RoundRecord {
     private boolean incomplete;
     /** Globally monotonic submit sequence (DataPlane.nextRoundSeq); the base of sink write versions. */
     private long seq;
+    /** Chunk records were compacted away (see ControlPlaneStore.compactRound); per-pipeline summaries remain. */
+    private boolean compacted;
 }

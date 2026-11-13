@@ -45,7 +45,7 @@ SCAN = [("fenced", "fenced"), ("steps down", "steps down"), ("CONFLICT", "commit
 # ---------------------------------------------------------------- helpers
 def post_json(port, path, body, timeout=40):
     req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method="POST", data=json.dumps(body).encode(),
-                                 headers={"content-type": "application/json"})
+                                 headers=dict(C.AUTH, **{"content-type": "application/json"}))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode())

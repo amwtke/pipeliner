@@ -11,6 +11,7 @@ REPO="$(cd "$ROOT/.." && pwd)"
 export PODS="${PODS:-4}" ROUNDS="${ROUNDS:-6}" MATERIALS="${MATERIALS:-600}" STORE_PROFILE="${STORE_PROFILE:-}"
 export SEED="${SEED:-$(( $(date +%s) % 100000 ))}"
 export OUT="${OUT:-$ROOT/chaos-out/admin-$(date +%Y%m%d-%H%M%S)-${STORE_PROFILE:-redis}}"
+export PG_ADMIN_TOKEN="${PG_ADMIN_TOKEN:-dev-admin-token-change-me}"   # sent on every /pg call; pods read it via application.yml
 mkdir -p "$OUT/pods"
 if [ -z "${SKIP_BUILD:-}" ]; then
   echo "== building example (framework jars are taken from ~/.m2, not rebuilt)"

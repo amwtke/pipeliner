@@ -96,6 +96,12 @@ public interface DataPlane extends AutoCloseable {
     /** DEL of keys that all belong to the round. Fenced. */
     void deleteKeys(String roundId, Collection<String> keys, long epoch);
     long usedMemoryBytes();
+    /** Removes worker heartbeat entries older than maxAgeMillis; returns how many. */
+    int pruneWorkers(long maxAgeMillis);
+    /** XPENDING summary plus the oldest pending entry of the group on the stream; {@link PendingSummary#none()} when empty, missing stream or group. */
+    PendingSummary pendingSummary(String streamKey);
+    /** Deletes the remaining data plane keys (channels, split queues, DLQs, ...) of rounds that no longer exist in the control plane; returns the key count. */
+    int purgeRoundData(Collection<String> roundIds);
     /** Closes this thread's dedicated connection, if any. */
     void releaseThreadResources();
     @Override void close();

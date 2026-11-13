@@ -15,7 +15,8 @@ import org.springframework.context.annotation.Configuration;
 public class PipelinerAdminConfiguration {
     @Bean
     @ConditionalOnMissingBean
-    public PipelinerAdminController pipelinerAdminController(PipelinerEngine engine, RuntimeConfig cfg) {
-        return new PipelinerAdminController(engine, cfg);
+    public PipelinerAdminController pipelinerAdminController(PipelinerEngine engine, RuntimeConfig cfg,
+            io.github.amwtke.pipeliner.core.store.ControlPlaneStore store, io.github.amwtke.pipeliner.core.dataplane.DataPlane plane) {
+        return new PipelinerAdminController(engine, cfg, store, plane);
     }
 }

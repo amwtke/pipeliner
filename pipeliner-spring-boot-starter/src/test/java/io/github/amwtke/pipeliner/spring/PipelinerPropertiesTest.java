@@ -46,10 +46,42 @@ class PipelinerPropertiesTest {
     }
 
     @Test
+    void bindsMasterTickMode() {
+        runner.withPropertyValues("pipeliner.runtime.master-tick-mode=external", "pipeliner.runtime.external-tick-interval-millis=1500").run(ctx -> {
+            RuntimeConfig c = ctx.getBean(PipelinerProperties.class).toRuntimeConfig();
+            assertEquals(io.github.amwtke.pipeliner.core.engine.MasterTickMode.EXTERNAL, c.getMasterTickMode());
+            assertEquals(1500, c.getExternalTickIntervalMillis());
+        });
+        runner.run(ctx -> assertEquals(io.github.amwtke.pipeliner.core.engine.MasterTickMode.LOCAL,
+                ctx.getBean(PipelinerProperties.class).toRuntimeConfig().getMasterTickMode()));
+    }
+
+    @Test
     void blankPodIdGetsHostnameSuffix() {
         runner.withPropertyValues("pipeliner.pod-id=").run(ctx -> {
             String id = ctx.getBean(PipelinerProperties.class).toRuntimeConfig().getPodId();
             assertTrue(id.matches(".+-[0-9a-f]{4}"), id);
+        });
+    }
+
+    @Test
+    void retentionDefaultsAndOverrides() {
+        runner.run(ctx -> {
+            RuntimeConfig c = ctx.getBean(PipelinerProperties.class).toRuntimeConfig();
+            assertTrue(c.isRetentionEnabled());
+            assertEquals(3L * 24 * 3600 * 1000, c.getChunkRetentionMillis());
+            assertEquals(30L * 24 * 3600 * 1000, c.getRoundRetentionMillis());
+            assertEquals(10L * 60 * 1000, c.getRetentionIntervalMillis());
+            assertEquals(100, c.getRetentionBatch());
+        });
+        runner.withPropertyValues("pipeliner.retention.enabled=false", "pipeliner.retention.chunk-days=0", "pipeliner.retention.round-days=7",
+                "pipeliner.retention.interval-minutes=0", "pipeliner.retention.batch=5").run(ctx -> {
+            RuntimeConfig c = ctx.getBean(PipelinerProperties.class).toRuntimeConfig();
+            assertFalse(c.isRetentionEnabled());
+            assertEquals(0, c.getChunkRetentionMillis());
+            assertEquals(7L * 24 * 3600 * 1000, c.getRoundRetentionMillis());
+            assertEquals(0, c.getRetentionIntervalMillis());
+            assertEquals(5, c.getRetentionBatch());
         });
     }
 }

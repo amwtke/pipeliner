@@ -154,6 +154,7 @@ final class CompletionChecker {
         if (target == null) return false;
         if (!c.s.store.casRoundStatus(roundId, RoundStatus.RUNNING, target, error, c.epoch())) return false;
         log.info("round {} {} {}", roundId, target, error == null ? "" : error);
+        c.s.metrics.roundFinished(d.round().getGraphName(), roundId, target.name());
         cleanup(d, target == RoundStatus.SUCCEEDED);
         return true;
     }

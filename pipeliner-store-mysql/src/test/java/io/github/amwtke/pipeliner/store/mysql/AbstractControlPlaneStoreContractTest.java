@@ -124,6 +124,35 @@ abstract class AbstractControlPlaneStoreContractTest {
     }
 
     @Test
+    void listRecentRoundsActiveFirstThenNewest() {
+        String g = "g-list-" + tag, other = "g-other-" + tag;
+        String[] ids = new String[5];
+        for (int i = 0; i < 5; i++) {
+            ids[i] = rid("list" + i);
+            RoundRecord rr = newRound(ids[i], "biz-list" + i);
+            rr.setGraphName(i == 4 ? other : g);
+            rr.setCreatedAt(100_000L + i * 10);   // list0 oldest
+            store.createRound(rr, Collections.singletonList(run(ids[i], "run1", 0)), Collections.<GateRecord>emptyList(),
+                    Collections.singletonList(pl(ids[i], "p1", "run1")));
+        }
+        // list0 stays active (oldest); list1..3 finish; list4 is another graph
+        for (int i = 1; i < 4; i++) {
+            assertTrue(store.casRoundStatus(ids[i], RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+            assertTrue(store.casRoundStatus(ids[i], RoundStatus.RUNNING, RoundStatus.SUCCEEDED, null, 1));
+        }
+        List<RoundRecord> l = store.listRecentRounds(g, 10);
+        assertEquals(Arrays.asList(ids[0], ids[3], ids[2], ids[1]), l.stream().map(RoundRecord::getRoundId).collect(java.util.stream.Collectors.toList()),
+                "active first, then newest created first, other graph excluded");
+        assertEquals(g, l.get(0).getGraphName());
+        assertEquals(RoundStatus.CREATED, l.get(0).getStatus());
+        assertEquals(RoundStatus.SUCCEEDED, l.get(1).getStatus());
+        assertEquals(Arrays.asList(ids[0], ids[3]), store.listRecentRounds(g, 2).stream().map(RoundRecord::getRoundId).collect(java.util.stream.Collectors.toList()));
+        assertEquals(1, store.listRecentRounds(other, 5).size());
+        assertTrue(store.listRecentRounds(null, 1000).stream().anyMatch(r -> r.getRoundId().equals(ids[4])), "no graph filter spans graphs");
+        assertTrue(store.listRecentRounds(g, 0).isEmpty());
+    }
+
+    @Test
     void casRoundWithEpochFencing() {
         String rid = mk("cas");
         assertFalse(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.PAUSED, null, 5), "wrong expect");
@@ -553,5 +582,146 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals(5000, store.countChunks(rid, "p1", null));
         assertEquals(4900, store.countChunks(rid, "p1", ChunkStatus.DONE));
         assertTrue(ms < 10_000, "took " + ms + "ms");
+    }
+
+    // ------------------------------------------------------------------ retention
+
+    private static final long FUTURE = System.currentTimeMillis() + 3_600_000L;
+
+    private String finished(String n, RoundStatus end) {
+        String rid = mk(n);
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, end, end == RoundStatus.FAILED ? "x" : null, 1));
+        return rid;
+    }
+
+    private void fill(String rid) {
+        store.savePendingChunks(rid, Arrays.asList(pending(rid, "p1", "c1", "run1"), pending(rid, "p1", "c2", "run1"), pending(rid, "p1", "c3", "run1"),
+                pending(rid, "p2", "c1", "run1")));
+        store.applyChunkEvents(rid, Arrays.asList(
+                ev(rid, "DONE", "p1", "c1", "run1", "split", 10, m("e1", 7, "sink:out", 3)),
+                ev(rid, "DONE", "p1", "c2", "run1", "split", 5, m("e1", 3)),
+                ev(rid, "DEAD", "p1", "c3", "run1", "split", 0, null)), "5-0", 1);
+        store.saveGateSignal(rid, "gate1", "k1", "payload");
+    }
+
+    @Test
+    void compactKeepsSummariesAndViewCounts() {
+        String rid = mk("compact");
+        fill(rid);
+        assertEquals(0, store.compactRound(rid, FUTURE), "a non-terminal round is never compacted");
+        assertEquals(4, store.countChunks(rid, null, null));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.SUCCEEDED, null, 1));
+        RoundView before = store.loadRound(rid);
+        assertEquals(0, store.compactRound(rid, 1L), "finishedAt is not older than the cutoff");
+        assertFalse(store.findTerminalRounds(1L, 1000).contains(rid));
+        assertTrue(store.findTerminalRounds(FUTURE, 1000).contains(rid));
+
+        assertEquals(4, store.compactRound(rid, FUTURE));
+        assertEquals(0, store.compactRound(rid, FUTURE), "already compacted");
+        assertFalse(store.findTerminalRounds(FUTURE, 1000).contains(rid));
+        assertEquals(0, store.countChunks(rid, null, null));
+        assertTrue(store.queryChunks(ChunkQuery.builder().roundId(rid).limit(100).build()).isEmpty());
+        RoundView after = store.loadRound(rid);
+        assertTrue(after.getRound().isCompacted());
+        assertEquals(RoundStatus.SUCCEEDED, after.getRound().getStatus());
+        assertEquals(before.getChunkCounts(), after.getChunkCounts());
+        assertEquals(before.getRowsIn(), after.getRowsIn());
+        assertEquals(before.getRowsOut(), after.getRowsOut());
+        assertEquals(Long.valueOf(2), after.getChunkCounts().get("p1").get(ChunkStatus.DONE));
+        assertEquals(Long.valueOf(1), after.getChunkCounts().get("p1").get(ChunkStatus.DEAD));
+        assertEquals(Long.valueOf(15), after.getRowsIn().get("p1"));
+        assertEquals(Long.valueOf(13), after.getRowsOut().get("p1"));
+        assertEquals(Long.valueOf(1), after.getChunkCounts().get("p2").get(ChunkStatus.PENDING));
+        for (PipelineRecord p : after.getPipelines()) if (p.getPipelineId().equals("p1")) assertNotNull(p.getSummaryCounts());
+        assertEquals(1, store.loadGateSignals(rid, "gate1").size(), "compaction keeps gate signals");
+    }
+
+    @Test
+    void rerunAfterCompactionDropsStaleSummaries() {
+        String rid = finished("recompact", RoundStatus.FAILED);
+        fill(rid);
+        assertEquals(4, store.compactRound(rid, FUTURE));
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.singletonList("gate1"), 2);
+        RoundView v = store.loadRound(rid);
+        assertEquals(RoundStatus.RUNNING, v.getRound().getStatus());
+        assertFalse(v.getRound().isCompacted());
+        assertTrue(v.getChunkCounts().isEmpty());
+        assertEquals(0, store.compactRound(rid, FUTURE), "running again");
+    }
+
+    @Test
+    void purgeDeletesEverythingAndTheBizKeyCanBeResubmitted() {
+        String rid = finished("purge", RoundStatus.SUCCEEDED);
+        fill(rid);
+        String other = finished("purge-compacted", RoundStatus.CANCELLED);
+        fill(other);
+        store.compactRound(other, FUTURE);
+        String keep = mk("purge-keep");
+        List<String> purged = store.purgeRounds(FUTURE, 1000);
+        assertTrue(purged.contains(rid));
+        assertTrue(purged.contains(other));
+        assertFalse(purged.contains(keep));
+        for (String id : Arrays.asList(rid, other)) {
+            assertNull(store.loadRoundRecord(id));
+            assertNull(store.loadRound(id));
+            assertNull(store.loadRoundState(id));
+            assertTrue(store.queryChunks(ChunkQuery.builder().roundId(id).limit(100).build()).isEmpty());
+            assertTrue(store.loadGateSignals(id, "gate1").isEmpty());
+            assertEquals(0, store.countChunks(id, null, null));
+            assertFalse(store.findActiveRounds().contains(id));
+        }
+        assertNull(store.findRoundByBizKey("g-" + tag, "biz-purge"));
+        assertNotNull(store.loadRoundRecord(keep));
+        assertFalse(store.purgeRounds(FUTURE, 1000).contains(rid), "purge is idempotent");
+        String again = rid("purge-again");
+        RoundRecord created = store.createRound(newRound(again, "biz-purge"), Collections.singletonList(run(again, "run1", 0)),
+                Collections.<GateRecord>emptyList(), Collections.<PipelineRecord>emptyList());
+        assertEquals(again, created.getRoundId());
+    }
+
+    @Test
+    void purgeRefusesNonTerminalAndTooRecentRounds() {
+        String created = mk("purge-created");
+        String running = mk("purge-running");
+        assertTrue(store.casRoundStatus(running, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        String paused = mk("purge-paused");
+        assertTrue(store.casRoundStatus(paused, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRoundStatus(paused, RoundStatus.RUNNING, RoundStatus.PAUSED, null, 1));
+        String recent = finished("purge-recent", RoundStatus.SUCCEEDED);
+        List<String> purged = store.purgeRounds(FUTURE, 1000);
+        for (String id : Arrays.asList(created, running, paused)) { assertFalse(purged.contains(id)); assertNotNull(store.loadRoundRecord(id)); }
+        assertTrue(purged.contains(recent));
+        String young = finished("purge-young", RoundStatus.FAILED);
+        assertFalse(store.purgeRounds(1L, 1000).contains(young));
+        assertNotNull(store.loadRoundRecord(young));
+        assertEquals(0, store.purgeRounds(FUTURE, 0).size());
+    }
+
+    @Test
+    void roundFlippedBackToRunningBetweenFindAndPurgeIsNotPurged() {
+        String rid = finished("purge-flip", RoundStatus.FAILED);
+        fill(rid);
+        assertTrue(store.findTerminalRounds(FUTURE, 1000).contains(rid));
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.singletonList("gate1"), 2);   // what rerunFrom/retryRun do
+        assertEquals(RoundStatus.RUNNING, store.loadRoundRecord(rid).getStatus());
+        assertFalse(store.purgeRounds(FUTURE, 1000).contains(rid));
+        assertEquals(0, store.compactRound(rid, FUTURE));
+        assertNotNull(store.loadRound(rid));
+        assertNotNull(store.findRoundByBizKey("g-" + tag, "biz-purge-flip"));
+        // and it can finish and be purged later
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.SUCCEEDED, null, 2));
+        assertTrue(store.purgeRounds(FUTURE, 1000).contains(rid));
+    }
+
+    @Test
+    void retentionBatchesAreBoundedAndOldestFirst() {
+        List<String> ids = new ArrayList<>();
+        for (int i = 0; i < 3; i++) { ids.add(finished("batch" + i, RoundStatus.SUCCEEDED)); try { Thread.sleep(3); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
+        List<String> found = store.findTerminalRounds(FUTURE, 1000);
+        assertTrue(found.indexOf(ids.get(0)) < found.indexOf(ids.get(1)) && found.indexOf(ids.get(1)) < found.indexOf(ids.get(2)));
+        assertEquals(1, store.findTerminalRounds(FUTURE, 1).size());
+        assertTrue(store.purgeRounds(FUTURE, 1).size() <= 1);
     }
 }

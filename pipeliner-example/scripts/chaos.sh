@@ -10,6 +10,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$ROOT/.." && pwd)"
+export PG_ADMIN_TOKEN="${PG_ADMIN_TOKEN:-dev-admin-token-change-me}"   # sent on every /pg call; pods read it via application.yml
 export PODS="${PODS:-4}" ROUNDS="${ROUNDS:-6}" MATERIALS="${MATERIALS:-600}" STORE_PROFILE="${STORE_PROFILE:-}"
 export SEED="${SEED:-$(( $(date +%s) % 100000 ))}"
 export OUT="${OUT:-$ROOT/chaos-out/$(date +%Y%m%d-%H%M%S)-${STORE_PROFILE:-redis}}"

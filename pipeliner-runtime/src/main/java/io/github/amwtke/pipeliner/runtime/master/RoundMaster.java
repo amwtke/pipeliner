@@ -17,6 +17,7 @@ final class RoundMaster {
     private final RunStarter starter;
     private final CompletionChecker completion;
     private final BackpressureMonitor backpressure;
+    private final StalledChunkMonitor stalled;
     private final Set<String> warned = new HashSet<>();
 
     RoundMaster(MasterContext c) {
@@ -26,13 +27,14 @@ final class RoundMaster {
         this.starter = new RunStarter(c);
         this.completion = new CompletionChecker(c, drainer);
         this.backpressure = new BackpressureMonitor(c);
+        this.stalled = new StalledChunkMonitor(c);
     }
 
     void memoryThrottle() { backpressure.memoryThrottle(); }
 
     void tick(String roundId) {
         RoundRecord rr = c.s.store.loadRoundRecord(roundId);
-        if (rr == null || rr.getStatus().terminal()) { c.s.plane.removeActiveRound(roundId, c.epoch()); return; }
+        if (rr == null || rr.getStatus().terminal()) { c.s.plane.removeActiveRound(roundId, c.epoch()); stalled.forget(roundId); return; }
         ExecutionPlan plan = c.s.registry.find(rr.getGraphName());
         if (plan == null || !plan.getHash().equals(rr.getPlanHash())) {
             if (warned.add(roundId)) log.warn("round {}: graph '{}' not registered here or plan hash differs; master skips it", roundId, rr.getGraphName());
@@ -63,7 +65,8 @@ final class RoundMaster {
         d = refresh(d);
         starter.watchdog(d);
         d = refresh(d);
-        if (!completion.finishRound(d)) backpressure.monitor(d);
+        if (completion.finishRound(d)) stalled.forget(roundId);
+        else { backpressure.monitor(d); stalled.sample(d); }
     }
 
     /** Reloads the state only if the previous phase wrote something. */

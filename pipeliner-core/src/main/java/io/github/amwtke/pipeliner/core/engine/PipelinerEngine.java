@@ -36,6 +36,13 @@ public interface PipelinerEngine {
     RoundStatus awaitRound(String roundId, long timeoutMillis) throws InterruptedException;
     /** Pipelines currently instantiated (runner/source/sink resolved and opened) on this pod. */
     List<LiveInstance> liveInstances();
+    /**
+     * One idempotent master pass: renews/acquires the leader lease (new epoch on (re)gain), executes queued admin commands and ticks every
+     * active round. Driven by the pod's own thread in LOCAL mode, by the caller in EXTERNAL mode (any pod may be called; only the lease holder
+     * advances, the others return skipped "not leader"). Overlapping calls on one pod return skipped "tick in progress"; with the master
+     * disabled it returns skipped "master disabled". Admin commands wait for the next tick, so their latency is up to one trigger interval.
+     */
+    TickResult tick();
     boolean isLeader();
     String podId();
     void start();

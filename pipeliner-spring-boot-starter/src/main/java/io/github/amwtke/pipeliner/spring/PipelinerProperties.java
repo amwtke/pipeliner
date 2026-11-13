@@ -24,6 +24,7 @@ public class PipelinerProperties {
     private RuntimeConfig runtime = new RuntimeConfig();
     private PlanOptions plan = new PlanOptions();
     private Admin admin = new Admin();
+    private Retention retention = new Retention();
 
     /** Redis connection settings. */
     @Data
@@ -50,9 +51,30 @@ public class PipelinerProperties {
         private int maximumPoolSize = 10;
     }
 
+    /** Control-plane data retention (leader only). */
+    @Data
+    public static class Retention {
+        private boolean enabled = true;
+        /** Terminal rounds older than this lose their chunk records (per-pipeline summaries stay). */
+        private long chunkDays = 3;
+        /** Terminal rounds older than this are deleted completely. */
+        private long roundDays = 30;
+        /** Minimum time between two retention passes. */
+        private long intervalMinutes = 10;
+        /** Rounds compacted and purged per pass. */
+        private int batch = 100;
+    }
+
     /** Admin REST switch. */
     @Data
     public static class Admin {
+        private boolean enabled = true;
+        private Ui ui = new Ui();
+    }
+
+    /** Built-in web UI served at /pg-ui/ (404 when disabled). */
+    @Data
+    public static class Ui {
         private boolean enabled = true;
     }
 
@@ -63,6 +85,11 @@ public class PipelinerProperties {
         cfg.setMasterEnabled(masterEnabled);
         cfg.setWorkerEnabled(workerEnabled);
         cfg.setPlanOptions(plan);
+        cfg.setRetentionEnabled(retention.isEnabled());
+        cfg.setChunkRetentionMillis(java.util.concurrent.TimeUnit.DAYS.toMillis(retention.getChunkDays()));
+        cfg.setRoundRetentionMillis(java.util.concurrent.TimeUnit.DAYS.toMillis(retention.getRoundDays()));
+        cfg.setRetentionIntervalMillis(java.util.concurrent.TimeUnit.MINUTES.toMillis(retention.getIntervalMinutes()));
+        cfg.setRetentionBatch(retention.getBatch());
         return cfg;
     }
 

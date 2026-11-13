@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeliner 控制台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">Pipeliner</div>
+  <label class="fld">图 <select id="graphSel"></select></label>
+  <label class="fld">轮次 <select id="roundSel"></select></label>
+  <label class="fld chk"><input type="checkbox" id="autoChk" checked> 自动刷新 (2s)</label>
+  <button id="refreshBtn" class="btn" title="立即刷新">刷新</button>
+  <span class="spacer"></span>
+  <label class="fld">Token <input type="password" id="tokenInp" placeholder="操作需要 Admin token" autocomplete="off" spellcheck="false"></label>
+  <button id="themeBtn" class="btn" title="切换主题：自动 / 浅色 / 深色">主题</button>
+  <span id="updated" class="muted"></span>
+</header>
+<div id="banner" class="banner" hidden></div>
+<section id="summary"></section>
+<main id="main">
+  <div id="canvasWrap">
+    <svg id="canvas" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline 拓扑"></svg>
+    <div id="zoomCtl">
+      <button class="btn" id="zoomIn" title="放大">+</button>
+      <button class="btn" id="zoomOut" title="缩小">−</button>
+      <button class="btn" id="zoomFit" title="适应窗口">适应</button>
+    </div>
+    <div id="legend"></div>
+    <div id="emptyMsg" class="empty" hidden></div>
+  </div>
+  <aside id="side"></aside>
+</main>
+<div id="toast" hidden></div>
+<div id="modal" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

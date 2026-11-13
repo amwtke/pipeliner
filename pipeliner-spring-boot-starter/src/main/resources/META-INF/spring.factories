@@ -1,2 +1,4 @@
 org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
-io.github.amwtke.pipeliner.spring.PipelinerAutoConfiguration
+io.github.amwtke.pipeliner.spring.PipelinerAutoConfiguration,\
+io.github.amwtke.pipeliner.spring.security.PipelinerSecurityAutoConfiguration,\
+io.github.amwtke.pipeliner.spring.PipelinerUiAutoConfiguration

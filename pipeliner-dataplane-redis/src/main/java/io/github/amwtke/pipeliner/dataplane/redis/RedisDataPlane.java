@@ -12,6 +12,7 @@ import io.lettuce.core.api.sync.RedisCommands;
 import io.lettuce.core.codec.StringCodec;
 import io.lettuce.core.models.stream.ClaimedMessages;
 import io.lettuce.core.models.stream.PendingMessage;
+import io.lettuce.core.models.stream.PendingMessages;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -388,6 +389,49 @@ public class RedisDataPlane implements DataPlane {
             if (line.startsWith("used_memory:")) return Long.parseLong(line.substring("used_memory:".length()).trim());
         }
         return 0L;
+    }
+
+    @Override public int pruneWorkers(long maxAgeMillis) {
+        double max = (double) (System.currentTimeMillis() - maxAgeMillis);
+        Long n = cmd.zremrangebyscore(Keys.workers(), Range.from(Range.Boundary.unbounded(), Range.Boundary.excluding(max)));
+        return n == null ? 0 : n.intValue();
+    }
+
+    @Override public PendingSummary pendingSummary(String streamKey) {
+        try {
+            PendingMessages pm = cmd.xpending(streamKey, Keys.GROUP);
+            if (pm == null || pm.getCount() == 0) return PendingSummary.none();
+            List<PendingMessage> oldest = cmd.xpending(streamKey, Keys.GROUP, Range.create("-", "+"), Limit.from(1));
+            if (oldest.isEmpty()) return PendingSummary.none();
+            PendingMessage m = oldest.get(0);
+            return new PendingSummary(pm.getCount(), m.getId(), m.getMsSinceLastDelivery(), m.getConsumer(), m.getRedeliveryCount());
+        } catch (io.lettuce.core.RedisCommandExecutionException e) {
+            if (e.getMessage() != null && e.getMessage().startsWith("NOGROUP")) return PendingSummary.none();   // stream/group not created (yet)
+            throw e;
+        }
+    }
+
+    @Override public int purgeRoundData(Collection<String> roundIds) {
+        if (roundIds == null || roundIds.isEmpty()) return 0;
+        Set<String> ids = new HashSet<>(roundIds);
+        int deleted = 0;
+        List<String> batch = new ArrayList<>();
+        ScanArgs args = ScanArgs.Builder.matches("pg:{*").limit(1000);
+        KeyScanCursor<String> cur = cmd.scan(args);
+        while (true) {
+            for (String key : cur.getKeys()) {
+                int close = key.indexOf('}');
+                if (close > 4 && ids.contains(key.substring(4, close))) batch.add(key);
+            }
+            if (batch.size() >= 200 || (cur.isFinished() && !batch.isEmpty())) {
+                Long n = cmd.unlink(batch.toArray(new String[0]));
+                deleted += n == null ? 0 : n.intValue();
+                batch.clear();
+            }
+            if (cur.isFinished()) break;
+            cur = cmd.scan(cur, args);
+        }
+        return deleted;
     }
 
     @Override public void releaseThreadResources() {

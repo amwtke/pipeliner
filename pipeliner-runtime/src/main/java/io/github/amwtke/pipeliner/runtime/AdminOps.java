@@ -93,6 +93,7 @@ public final class AdminOps {
             }
         s.plane.deleteKeys(roundId, keys, epoch());
         s.plane.removeActiveRound(roundId, epoch());
+        s.metrics.roundFinished(rr.getGraphName(), roundId, RoundStatus.CANCELLED.name());
     }
 
     void openGate(String roundId, String gateId, String operator) {

@@ -85,6 +85,7 @@ final class GateEvaluator {
                 ctx.put("fallback", "true");
                 if (c.s.store.casGateStatus(roundId, g.getGateId(), GateStatus.CLOSED, GateStatus.OPEN, "timeout", ctx, c.epoch())) {
                     d.touch();
+                    c.s.metrics.gateTimeout(d.round().getGraphName(), g.getGateId(), "OPEN_WITH_FALLBACK");
                     log.warn("gate {}/{} timed out; opened with fallback", roundId, g.getGateId());
                 }
                 break;
@@ -92,12 +93,13 @@ final class GateEvaluator {
                 if (!g.isAlerted()) {
                     log.error("ALERT: gate {}/{} exceeded its timeout and keeps waiting", roundId, g.getGateId());
                     c.s.store.markGateAlerted(roundId, g.getGateId());
+                    c.s.metrics.gateTimeout(d.round().getGraphName(), g.getGateId(), "ALERT_AND_WAIT");
                     g.setAlerted(true);
                 }
                 break;
             default:
                 if (c.s.store.casGateStatus(roundId, g.getGateId(), GateStatus.CLOSED, GateStatus.TIMEOUT, "timeout", new HashMap<String, String>(), c.epoch()))
-                { failBeforeRuns(roundId, pg, "gate " + pg.getGateId() + " timed out"); d.touch(); }
+                { failBeforeRuns(roundId, pg, "gate " + pg.getGateId() + " timed out"); d.touch(); c.s.metrics.gateTimeout(d.round().getGraphName(), g.getGateId(), "FAIL"); }
         }
     }
 

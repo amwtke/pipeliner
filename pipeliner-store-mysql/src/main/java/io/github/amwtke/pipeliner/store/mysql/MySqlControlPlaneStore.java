@@ -24,7 +24,7 @@ import lombok.extern.slf4j.Slf4j;
 public class MySqlControlPlaneStore implements ControlPlaneStore {
     private static final String TBL = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
     private static final String R_COLS = "round_id,graph_name,biz_key,plan_hash,plan_json,params_json,status,master_epoch,journal_offset,"
-            + "created_at,started_at,finished_at,error,incomplete,seq";
+            + "created_at,started_at,finished_at,error,incomplete,seq,compacted";
 
     private final DataSource ds;
 
@@ -140,13 +140,25 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         };
         try (Connection c = ds.getConnection(); Statement st = c.createStatement()) {
             for (String s : ddl) st.execute(s);
-            try {   // tables created before the round sequence existed
-                st.execute("ALTER TABLE pg_round ADD COLUMN seq BIGINT NOT NULL DEFAULT 0");
-            } catch (SQLException e) {
-                if (e.getErrorCode() != 1060) throw e;   // 1060: duplicate column
-            }
+            // tables created before a column/index existed; 1060 duplicate column, 1061 duplicate key name
+            alter(st, "ALTER TABLE pg_round ADD COLUMN seq BIGINT NOT NULL DEFAULT 0");
+            alter(st, "ALTER TABLE pg_round ADD COLUMN compacted TINYINT(1) NOT NULL DEFAULT 0");
+            alter(st, "ALTER TABLE pg_round ADD KEY idx_status_finished (status, finished_at)");
+            alter(st, "ALTER TABLE pg_round ADD KEY idx_graph_created (graph_name, created_at)");
+            alter(st, "ALTER TABLE pg_round ADD KEY idx_created (created_at)");
+            alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_counts TEXT");
+            alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_in BIGINT");
+            alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_out BIGINT");
         } catch (SQLException e) {
             throw new IllegalStateException("init failed: " + e.getMessage(), e);
+        }
+    }
+
+    private static void alter(Statement st, String sql) throws SQLException {
+        try {
+            st.execute(sql);
+        } catch (SQLException e) {
+            if (e.getErrorCode() != 1060 && e.getErrorCode() != 1061) throw e;
         }
     }
 
@@ -157,7 +169,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 .planHash(rs.getString("plan_hash")).planJson(rs.getString("plan_json")).params(strMap(rs.getString("params_json")))
                 .status(RoundStatus.valueOf(rs.getString("status"))).masterEpoch(rs.getLong("master_epoch"))
                 .journalOffset(rs.getString("journal_offset")).createdAt(lng(rs, "created_at")).startedAt(lng(rs, "started_at"))
-                .finishedAt(lng(rs, "finished_at")).error(rs.getString("error")).incomplete(rs.getBoolean("incomplete")).seq(rs.getLong("seq")).build();
+                .finishedAt(lng(rs, "finished_at")).error(rs.getString("error")).incomplete(rs.getBoolean("incomplete")).seq(rs.getLong("seq")).compacted(rs.getBoolean("compacted")).build();
     }
 
     private static RunRecord mapRun(ResultSet rs) throws SQLException {
@@ -179,7 +191,8 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     private static PipelineRecord mapPipeline(ResultSet rs) throws SQLException {
         return PipelineRecord.builder().roundId(rs.getString("round_id")).pipelineId(rs.getString("pipeline_id")).runId(rs.getString("run_id"))
                 .status(PipelineStatus.valueOf(rs.getString("status"))).parallelism(rs.getInt("parallelism")).enumDone(rs.getBoolean("enum_done"))
-                .masterEpoch(rs.getLong("master_epoch")).startedAt(lng(rs, "started_at")).finishedAt(lng(rs, "finished_at")).error(rs.getString("error")).build();
+                .masterEpoch(rs.getLong("master_epoch")).startedAt(lng(rs, "started_at")).finishedAt(lng(rs, "finished_at")).error(rs.getString("error")).summaryCounts(longMap(rs.getString("sum_counts")))
+                .summaryRowsIn(lng(rs, "sum_rows_in")).summaryRowsOut(lng(rs, "sum_rows_out")).build();
     }
 
     private static ChunkRecord mapChunk(ResultSet rs) throws SQLException {
@@ -199,10 +212,10 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         if (r.getStatus() == null) r.setStatus(RoundStatus.CREATED);
         try {
             tx(c -> {
-                exec(c, "INSERT INTO pg_round (" + R_COLS + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r.getRoundId(), r.getGraphName(), r.getBizKey(),
+                exec(c, "INSERT INTO pg_round (" + R_COLS + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r.getRoundId(), r.getGraphName(), r.getBizKey(),
                         r.getPlanHash(), r.getPlanJson(), json(r.getParams()), r.getStatus().name(), r.getMasterEpoch(),
                         r.getJournalOffset() == null ? "0-0" : r.getJournalOffset(), r.getCreatedAt(), r.getStartedAt(), r.getFinishedAt(), r.getError(),
-                        r.isIncomplete(), r.getSeq());
+                        r.isIncomplete(), r.getSeq(), r.isCompacted());
                 for (RunRecord u : runs == null ? Collections.<RunRecord>emptyList() : runs)
                     exec(c, "INSERT INTO pg_run (round_id,run_id,stage,mode,status,attempt,assignee,master_epoch,started_at,finished_at,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             r.getRoundId(), u.getRunId(), u.getStage(), u.getMode() == null ? null : u.getMode().name(),
@@ -265,6 +278,15 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             rowsIn.put((String) row[0], (Long) row[1]);
             rowsOut.put((String) row[0], (Long) row[2]);
         }
+        for (PipelineRecord p : pls) {   // compacted pipelines: chunk rows are gone, the summary stays
+            if (p.getSummaryCounts() == null || counts.containsKey(p.getPipelineId())) continue;
+            Map<ChunkStatus, Long> m = new EnumMap<>(ChunkStatus.class);
+            for (Map.Entry<String, Long> e : p.getSummaryCounts().entrySet()) if (e.getValue() > 0) m.put(ChunkStatus.valueOf(e.getKey()), e.getValue());
+            if (m.isEmpty()) continue;
+            counts.put(p.getPipelineId(), m);
+            if (p.getSummaryRowsIn() != null) rowsIn.put(p.getPipelineId(), p.getSummaryRowsIn());
+            if (p.getSummaryRowsOut() != null) rowsOut.put(p.getPipelineId(), p.getSummaryRowsOut());
+        }
         return RoundView.builder().round(round).runs(runs).gates(gates).pipelines(pls).chunkCounts(counts).rowsIn(rowsIn).rowsOut(rowsOut).build();
     }
 
@@ -287,6 +309,33 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     @Override
     public List<String> findActiveRounds() {
         return query("SELECT round_id FROM pg_round WHERE status IN ('CREATED','RUNNING','PAUSED') ORDER BY created_at, round_id", rs -> rs.getString(1));
+    }
+
+    private static final String R_COLS_LIGHT = "round_id,graph_name,biz_key,plan_hash,NULL AS plan_json,params_json,status,master_epoch,journal_offset,"
+            + "created_at,started_at,finished_at,error,incomplete,seq,compacted";
+
+    @Override
+    public List<RoundRecord> listRecentRounds(String graphName, int limit) {
+        List<RoundRecord> out = new ArrayList<>();
+        if (limit <= 0) return out;
+        boolean all = graphName == null || graphName.trim().isEmpty();
+        String g = all ? "" : " AND graph_name=?";
+        Object[] ga = all ? new Object[0] : new Object[]{graphName};
+        // active first (idx_status), then the newest of the rest (idx_graph_created / idx_created)
+        List<RoundRecord> active = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE status IN ('CREATED','RUNNING','PAUSED')" + g
+                + " ORDER BY created_at DESC, round_id DESC LIMIT ?", MySqlControlPlaneStore::mapRound, append(ga, limit));
+        out.addAll(active);
+        if (out.size() >= limit) return out;
+        List<RoundRecord> rest = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE status NOT IN ('CREATED','RUNNING','PAUSED')" + g
+                + " ORDER BY created_at DESC, round_id DESC LIMIT ?", MySqlControlPlaneStore::mapRound, append(ga, limit - out.size()));
+        out.addAll(rest);
+        return out;
+    }
+
+    private static Object[] append(Object[] a, Object x) {
+        Object[] r = java.util.Arrays.copyOf(a, a.length + 1);
+        r[a.length] = x;
+        return r;
     }
 
     /** Round-level epoch fence appended to every master UPDATE of a non-round table; the share lock serialises against fenceRound. */
@@ -461,7 +510,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             for (String runId : runIds) {
                 if (exec(c, "UPDATE pg_run SET status='PENDING', attempt=attempt+1, assignee=NULL, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? "
                         + "WHERE round_id=? AND run_id=? AND master_epoch<=?", epoch, roundId, runId, epoch) == 0) return false;   // run written by a newer epoch: rolls back
-                exec(c, "UPDATE pg_pipeline SET status='PENDING', enum_done=0, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? WHERE round_id=? AND run_id=?",
+                exec(c, "UPDATE pg_pipeline SET status='PENDING', enum_done=0, started_at=NULL, finished_at=NULL, error=NULL, sum_counts=NULL, sum_rows_in=NULL, sum_rows_out=NULL, master_epoch=? WHERE round_id=? AND run_id=?",
                         epoch, roundId, runId);
                 exec(c, "DELETE FROM pg_chunk WHERE round_id=? AND run_id=?", roundId, runId);
             }
@@ -470,7 +519,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                         + "WHERE round_id=? AND gate_id=?", epoch, roundId, gateId);
                 exec(c, "DELETE FROM pg_gate_signal WHERE round_id=? AND gate_id=?", roundId, gateId);
             }
-            exec(c, "UPDATE pg_round SET status='RUNNING', finished_at=NULL, error=NULL WHERE round_id=? AND status IN ('FAILED','SUCCEEDED')", roundId);
+            exec(c, "UPDATE pg_round SET status='RUNNING', finished_at=NULL, error=NULL, compacted=0 WHERE round_id=? AND status IN ('FAILED','SUCCEEDED')", roundId);
             return true;
         });
         if (!ok) throw new StaleEpochException("resetRuns for round " + roundId + " fenced or missing (epoch " + epoch + ")");
@@ -517,5 +566,79 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 + "AND input_edge IS NOT NULL AND input_edge<>'split' GROUP BY input_edge", rs -> new Object[]{rs.getString(1), rs.getLong(2)}, roundId, runId))
             out.put((String) r[0], (Long) r[1]);
         return out;
+    }
+
+    // ---------------------------------------------------------------- retention
+
+    private static boolean terminalName(String st) { return RoundStatus.valueOf(st).terminal(); }
+
+    /** Locks the round row; returns {status, finishedAt, compacted} or null when missing. */
+    private static Object[] lockRound(Connection c, String roundId) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("SELECT status, finished_at, compacted FROM pg_round WHERE round_id=? FOR UPDATE")) {
+            ps.setString(1, roundId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                long fin = rs.getLong(2);
+                return new Object[]{rs.getString(1), rs.wasNull() ? null : fin, rs.getBoolean(3)};
+            }
+        }
+    }
+
+    @Override
+    public int compactRound(String roundId, long finishedBeforeMillis) {
+        return tx(c -> {
+            Object[] r = lockRound(c, roundId);
+            if (r == null || !terminalName((String) r[0]) || r[1] == null || (Long) r[1] >= finishedBeforeMillis || (Boolean) r[2]) return 0;
+            Map<String, Map<String, Long>> counts = new LinkedHashMap<>();
+            Map<String, long[]> rows = new LinkedHashMap<>();
+            try (PreparedStatement ps = c.prepareStatement("SELECT pipeline_id, status, COUNT(*), COALESCE(SUM(CASE WHEN status='DONE' THEN rows_in END),0), "
+                    + "COALESCE(SUM(CASE WHEN status='DONE' THEN rows_out_total END),0) FROM pg_chunk WHERE round_id=? GROUP BY pipeline_id, status")) {
+                ps.setString(1, roundId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        counts.computeIfAbsent(rs.getString(1), k -> new LinkedHashMap<String, Long>()).put(rs.getString(2), rs.getLong(3));
+                        if ("DONE".equals(rs.getString(2))) {   // row sums only exist for pipelines with DONE chunks (like the live view)
+                            long[] t = rows.computeIfAbsent(rs.getString(1), k -> new long[2]);
+                            t[0] += rs.getLong(4);
+                            t[1] += rs.getLong(5);
+                        }
+                    }
+                }
+            }
+            for (Map.Entry<String, Map<String, Long>> e : counts.entrySet()) {
+                long[] t = rows.get(e.getKey());
+                exec(c, "UPDATE pg_pipeline SET sum_counts=?, sum_rows_in=?, sum_rows_out=? WHERE round_id=? AND pipeline_id=?",
+                        json(e.getValue()), t == null ? null : t[0], t == null ? null : t[1], roundId, e.getKey());
+            }
+            int removed = exec(c, "DELETE FROM pg_chunk WHERE round_id=?", roundId);
+            exec(c, "UPDATE pg_round SET compacted=1 WHERE round_id=?", roundId);
+            return removed;
+        });
+    }
+
+    @Override
+    public List<String> purgeRounds(long finishedBeforeMillis, int max) {
+        List<String> purged = new ArrayList<>();
+        if (max <= 0) return purged;
+        List<String> candidates = query("SELECT round_id FROM pg_round WHERE status IN ('SUCCEEDED','FAILED','CANCELLED') AND finished_at < ? "
+                + "ORDER BY finished_at, round_id LIMIT ?", rs -> rs.getString(1), finishedBeforeMillis, max);
+        for (String rid : candidates) {
+            boolean done = tx(c -> {
+                Object[] r = lockRound(c, rid);   // re-check under the row lock: a rerun may have flipped the round back to RUNNING
+                if (r == null || !terminalName((String) r[0]) || r[1] == null || (Long) r[1] >= finishedBeforeMillis) return false;
+                for (String t : new String[]{"pg_chunk", "pg_gate_signal", "pg_gate", "pg_pipeline", "pg_run"}) exec(c, "DELETE FROM " + t + " WHERE round_id=?", rid);
+                exec(c, "DELETE FROM pg_round WHERE round_id=?", rid);
+                return true;
+            });
+            if (done) purged.add(rid);
+        }
+        return purged;
+    }
+
+    @Override
+    public List<String> findTerminalRounds(long finishedBeforeMillis, int max) {
+        if (max <= 0) return new ArrayList<>();
+        return query("SELECT round_id FROM pg_round WHERE status IN ('SUCCEEDED','FAILED','CANCELLED') AND finished_at < ? AND compacted=0 "
+                + "ORDER BY finished_at, round_id LIMIT ?", rs -> rs.getString(1), finishedBeforeMillis, max);
     }
 }

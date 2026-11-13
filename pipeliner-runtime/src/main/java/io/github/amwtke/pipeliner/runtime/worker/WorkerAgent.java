@@ -81,16 +81,38 @@ public final class WorkerAgent implements Runnable {
         }
     }
 
+    /** Heartbeat field holding this pod's live pipeline instances: {@code [[round,pipeline,attempt,threads],...]} (capped). */
+    public static final String LIVE_FIELD = "live";
+    private static final int MAX_LIVE = 200;
+
+    static String liveJson(List<io.github.amwtke.pipeliner.core.engine.LiveInstance> live) {
+        StringBuilder sb = new StringBuilder("[");
+        int n = 0;
+        for (io.github.amwtke.pipeliner.core.engine.LiveInstance li : live) {
+            if (n++ >= MAX_LIVE) break;
+            if (n > 1) sb.append(',');
+            sb.append("[\"").append(esc(li.getRoundId())).append("\",\"").append(esc(li.getPipelineId())).append("\",")
+                    .append(li.getAttempt()).append(',').append(li.getThreads()).append(']');
+        }
+        return sb.append(']').toString();
+    }
+
+    private static String esc(String v) {
+        return v == null ? "" : v.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
     private synchronized void tick() {
         long now = System.currentTimeMillis();
         if (now - lastHeartbeat >= s.cfg.getHeartbeatMillis()) {
             Map<String, String> info = new HashMap<>();
             info.put("startedAt", String.valueOf(now));
+            info.put(LIVE_FIELD, liveJson(s.instances.snapshot()));
             for (String g : s.registry.names()) info.put("graph." + g, s.registry.require(g).getHash());   // plans this pod can execute
             s.plane.heartbeat(s.podId(), info);
             lastHeartbeat = now;
         }
         Set<String> active = s.plane.activeRounds();
+        s.metrics.liveInstances(s.podId(), s.instances.snapshot().size());
         for (String roundId : active) {
             try { reconcileRound(roundId); }
             catch (RuntimeException e) { log.warn("reconcile of round {} failed: {}", roundId, e.toString()); }

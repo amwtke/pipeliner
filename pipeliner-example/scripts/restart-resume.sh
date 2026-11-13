@@ -22,7 +22,8 @@ d=json.load(sys.stdin)
 for k in sys.argv[1].split('.'):
     d = d.get(k) if isinstance(d, dict) else None
 print('' if d is None else (json.dumps(d) if isinstance(d,(dict,list)) else d))" "$1"; }
-api() { curl -s -m 30 "$@"; }
+export PG_ADMIN_TOKEN="${PG_ADMIN_TOKEN:-dev-admin-token-change-me}"   # pods read it too (application.yml)
+api() { curl -s -m 30 -H "Authorization: Bearer $PG_ADMIN_TOKEN" "$@"; }
 port_of() { for i in 0 1; do [ "${PODS[$i]}" = "$1" ] && echo "${PORTS[$i]}"; done; }
 start_pod() { "$HERE/run-pod.sh" "$1" "$(port_of "$1")" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "${EXTRA[@]}"; }
 wait_up() { for _ in $(seq 1 120); do [ "$(api -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/pg/cluster")" = 200 ] && return 0; sleep 1; done; return 1; }

@@ -19,12 +19,14 @@ final class BackpressureMonitor {
     private final MasterContext c;
     private final Map<String, Long> lastScale = new HashMap<>();
     private boolean throttled;
+    private long lastMemSample;
 
     BackpressureMonitor(MasterContext c) { this.c = c; }
 
     void monitor(RoundData d) {
         RuntimeConfig cfg = c.s.cfg;
         String roundId = d.roundId();
+        c.s.metrics.highWatermark(cfg.getHighWatermark());
         for (PlanRun pr : d.plan.getRuns()) {
             if (pr.getMode() != ExecMode.CLUSTER || d.run(pr.getRunId()).getStatus() != RunStatus.RUNNING) continue;
             int attempt = d.run(pr.getRunId()).getAttempt();
@@ -60,8 +62,14 @@ final class BackpressureMonitor {
     /** Once per tick: global throttle of source pipelines by Redis memory. */
     void memoryThrottle() {
         long limit = c.s.cfg.getRedisMemoryLimitBytes();
+        long now = System.currentTimeMillis();
+        long used = -1;
+        if (limit > 0 || now - lastMemSample >= 10_000) {
+            used = c.s.plane.usedMemoryBytes();
+            lastMemSample = now;
+            c.s.metrics.redisUsedMemory(used);
+        }
         if (limit <= 0) return;
-        long used = c.s.plane.usedMemoryBytes();
         // the flag carries a TTL that is refreshed every tick while over the limit: a lost/deposed master cannot leave it set forever
         long ttl = Math.max(3 * c.s.cfg.getTickMillis(), 5000L);
         if (!throttled && used >= limit) { throttled = true; log.warn("redis memory {} >= {}: throttling sources", used, limit); }

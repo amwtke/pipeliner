@@ -22,4 +22,8 @@ public class PipelineRecord {
     private Long startedAt;
     private Long finishedAt;
     private String error;
+    /** Set by compaction only: chunk status name to count, and DONE row sums (null when not compacted). */
+    private java.util.Map<String, Long> summaryCounts;
+    private Long summaryRowsIn;
+    private Long summaryRowsOut;
 }

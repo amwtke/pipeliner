@@ -67,8 +67,12 @@ LIVENESS_PREFIXES = ("rounds did not all reach SUCCEEDED", "retry was needed")
 
 
 # ---------------------------------------------------------------- http / redis
+AUTH = {"Authorization": "Bearer " + os.environ.setdefault("PG_ADMIN_TOKEN", "dev-admin-token-change-me")}
+
+
 def http(port, method, path, timeout=10):
-    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method=method, data=b"" if method == "POST" else None)
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method=method, data=b"" if method == "POST" else None,
+                                 headers=AUTH)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read().decode()

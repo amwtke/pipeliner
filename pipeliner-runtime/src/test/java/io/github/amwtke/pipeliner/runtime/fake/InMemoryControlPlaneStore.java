@@ -58,6 +58,14 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
                 if (c.getRowsOut() != null) for (Long v : c.getRowsOut().values()) out.merge(c.getPipelineId(), v, Long::sum);
             }
         }
+        for (PipelineRecord p : pipes.get(roundId).values()) {   // compacted pipelines keep their summary
+            if (p.getSummaryCounts() == null || counts.containsKey(p.getPipelineId())) continue;
+            Map<ChunkStatus, Long> m = new EnumMap<>(ChunkStatus.class);
+            for (Map.Entry<String, Long> e : p.getSummaryCounts().entrySet()) m.put(ChunkStatus.valueOf(e.getKey()), e.getValue());
+            counts.put(p.getPipelineId(), m);
+            if (p.getSummaryRowsIn() != null) in.put(p.getPipelineId(), p.getSummaryRowsIn());
+            if (p.getSummaryRowsOut() != null) out.put(p.getPipelineId(), p.getSummaryRowsOut());
+        }
         return RoundView.builder().round(copy(rr)).runs(copyAll(runs.get(roundId).values())).gates(copyAll(gates.get(roundId).values()))
                 .pipelines(copyAll(pipes.get(roundId).values())).chunkCounts(counts).rowsIn(in).rowsOut(out).build();
     }
@@ -90,6 +98,17 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         List<String> l = new ArrayList<>();
         for (RoundRecord r : rounds.values()) if (!r.getStatus().terminal()) l.add(r.getRoundId());
         return l;
+    }
+
+    @Override public synchronized List<RoundRecord> listRecentRounds(String graphName, int limit) {
+        List<RoundRecord> all = new ArrayList<>();
+        for (RoundRecord r : rounds.values()) if (graphName == null || graphName.isEmpty() || graphName.equals(r.getGraphName())) all.add(r);
+        all.sort((a, b) -> {
+            if (a.getStatus().terminal() != b.getStatus().terminal()) return a.getStatus().terminal() ? 1 : -1;
+            long x = a.getCreatedAt() == null ? 0 : a.getCreatedAt(), y = b.getCreatedAt() == null ? 0 : b.getCreatedAt();
+            return x != y ? Long.compare(y, x) : b.getRoundId().compareTo(a.getRoundId());
+        });
+        return new ArrayList<>(all.subList(0, Math.min(Math.max(limit, 0), all.size())));
     }
 
     @Override public synchronized boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch) {
@@ -333,4 +352,55 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         }
         return m;
     }
+
+    // retention (simple, synchronized: atomic like the real stores)
+    /** Test knob: number of calls per method, to assert bounded work. */
+    public final java.util.concurrent.atomic.AtomicInteger purgeCalls = new java.util.concurrent.atomic.AtomicInteger();
+    public final java.util.concurrent.atomic.AtomicInteger compactCalls = new java.util.concurrent.atomic.AtomicInteger();
+    public final java.util.concurrent.atomic.AtomicInteger findCalls = new java.util.concurrent.atomic.AtomicInteger();
+
+    private boolean eligible(RoundRecord r, long cutoff) { return r != null && r.getStatus().terminal() && r.getFinishedAt() != null && r.getFinishedAt() < cutoff; }
+
+    @Override public synchronized int compactRound(String roundId, long cutoff) {
+        compactCalls.incrementAndGet();
+        RoundRecord r = rounds.get(roundId);
+        if (!eligible(r, cutoff) || r.isCompacted()) return 0;
+        RoundView v = loadRound(roundId);
+        for (PipelineRecord p : pipes.get(roundId).values()) {
+            Map<ChunkStatus, Long> m = v.getChunkCounts().get(p.getPipelineId());
+            if (m == null) continue;
+            Map<String, Long> sc = new LinkedHashMap<>();
+            for (Map.Entry<ChunkStatus, Long> e : m.entrySet()) sc.put(e.getKey().name(), e.getValue());
+            p.setSummaryCounts(sc);
+            p.setSummaryRowsIn(v.getRowsIn().get(p.getPipelineId()));
+            p.setSummaryRowsOut(v.getRowsOut().get(p.getPipelineId()));
+        }
+        int n = chunks.get(roundId).size();
+        chunks.get(roundId).clear();
+        r.setCompacted(true);
+        return n;
+    }
+
+    @Override public synchronized List<String> purgeRounds(long cutoff, int max) {
+        purgeCalls.incrementAndGet();
+        List<String> out = new ArrayList<>();
+        for (RoundRecord r : new ArrayList<>(rounds.values())) {
+            if (out.size() >= max) break;
+            if (!eligible(r, cutoff)) continue;
+            String id = r.getRoundId();
+            rounds.remove(id); runs.remove(id); gates.remove(id); pipes.remove(id); chunks.remove(id); signals.remove(id);
+            out.add(id);
+        }
+        return out;
+    }
+
+    @Override public synchronized List<String> findTerminalRounds(long cutoff, int max) {
+        findCalls.incrementAndGet();
+        List<String> out = new ArrayList<>();
+        for (RoundRecord r : rounds.values()) if (out.size() < max && eligible(r, cutoff) && !r.isCompacted()) out.add(r.getRoundId());
+        return out;
+    }
+
+    /** Test helper: number of rounds held. */
+    public synchronized int roundCount() { return rounds.size(); }
 }

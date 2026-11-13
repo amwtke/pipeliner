@@ -313,6 +313,45 @@ public class InMemoryDataPlane implements DataPlane {
     }
 
     @Override public long usedMemoryBytes() { return usedMemory; }
+
+    /** Test knob: workers pruned so far. */
+    public final AtomicLong pruned = new AtomicLong();
+    public final List<String> purgedRoundData = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    @Override public synchronized int pruneWorkers(long maxAgeMillis) {
+        long now = System.currentTimeMillis();
+        int n = 0;
+        for (Iterator<Map.Entry<String, Long>> it = workers.entrySet().iterator(); it.hasNext(); )
+            if (now - it.next().getValue() > maxAgeMillis) { it.remove(); n++; }
+        pruned.addAndGet(n);
+        return n;
+    }
+
+    @Override public synchronized PendingSummary pendingSummary(String key) {
+        Stream s = streams.get(key);
+        if (s == null || s.pending.isEmpty()) return PendingSummary.none();
+        long id = Collections.min(s.pending.keySet());
+        Pending p = s.pending.get(id);
+        return new PendingSummary(s.pending.size(), idStr(id), System.currentTimeMillis() - p.since, p.consumer, p.deliveries);
+    }
+
+    /** Test helper: makes a pending entry look idle for the given time. */
+    public synchronized void ageAllPending(String key, long millis) {
+        Stream s = streams.get(key);
+        if (s != null) for (Pending p : s.pending.values()) p.since -= millis;
+    }
+
+    @Override public synchronized int purgeRoundData(Collection<String> roundIds) {
+        int n = 0;
+        for (String r : roundIds) {
+            purgedRoundData.add(r);
+            for (Iterator<String> it = streams.keySet().iterator(); it.hasNext(); ) if (roundOf(it.next()).equals(r)) { it.remove(); n++; }
+        }
+        return n;
+    }
+
+    /** Test helper: backdates a worker heartbeat. */
+    public synchronized void putWorker(String pod, long lastBeat) { workers.put(pod, lastBeat); }
     @Override public void releaseThreadResources() {}
     @Override public void close() {}
 }

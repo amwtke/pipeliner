@@ -30,6 +30,9 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     private static final String ROUNDS = "pg:store:rounds";
     private static final String BIZ = "pg:store:biz";
     private static final String ACTIVE = "pg:store:active";
+    /** Retention indexes (score = finishedAt, member = roundId): all terminal rounds / terminal rounds not yet compacted. Candidates only: the scripts re-check the round. */
+    private static final String FINISHED = "pg:store:finished";
+    private static final String UNCOMPACTED = "pg:store:uncompacted";
 
     /** KEYS[1]=hash, KEYS[2]=round hash (round-level epoch fence); ARGV[1]=expected status or ''; ARGV[2]=epoch or -1 (no fence); then (op,field,value) triples: S set, N set-if-absent, D delete, I incr. */
     private static final String MUTATE =
@@ -146,7 +149,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "  local pk=pre..'pl:'..pid\n"
             + "  if runs[redis.call('HGET',pk,'runId')] then\n"
             + "    redis.call('HSET',pk,'status','PENDING','enumDone','0','epoch',ep)\n"
-            + "    redis.call('HDEL',pk,'startedAt','finishedAt','error')\n"
+            + "    redis.call('HDEL',pk,'startedAt','finishedAt','error','sumCounts','sumIn','sumOut')\n"
             + "    redis.call('DEL',pre..'chunk:'..pid,pre..'cnt:'..pid)\n"
             + "    redis.call('SREM',pre..'cpls',pid)\n"
             + "  end\n"
@@ -164,9 +167,82 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "local st=redis.call('HGET',rk,'status')\n"
             + "if st=='FAILED' or st=='SUCCEEDED' then\n"
             + "  redis.call('HSET',rk,'status','RUNNING')\n"
-            + "  redis.call('HDEL',rk,'finishedAt','error')\n"
+            + "  redis.call('HDEL',rk,'finishedAt','error','compacted')\n"
             + "  redis.call('SADD','pg:store:active',string.sub(pre,5,#pre-2))\n"
+            + "  redis.call('ZREM','pg:store:finished',string.sub(pre,5,#pre-2))\n"
+            + "  redis.call('ZREM','pg:store:uncompacted',string.sub(pre,5,#pre-2))\n"
             + "end\n"
+            + "return 1\n";
+
+    /**
+     * KEYS[1]=round hash; ARGV[1]=cutoff. Compaction (see ControlPlaneStore.compactRound): returns the number of removed chunk records,
+     * -1 round missing, -2 not terminal / not old enough, -3 already compacted.
+     */
+    private static final String COMPACT =
+            "local rk=KEYS[1]\n"
+            + "local pre=string.sub(rk,1,#rk-5)\n"
+            + "local rid=string.sub(pre,5,#pre-2)\n"
+            + "local st=redis.call('HGET',rk,'status')\n"
+            + "if not st then return -1 end\n"
+            + "if st~='SUCCEEDED' and st~='FAILED' and st~='CANCELLED' then redis.call('ZREM','pg:store:uncompacted',rid); return -2 end\n"
+            + "if redis.call('HGET',rk,'compacted')=='1' then redis.call('ZREM','pg:store:uncompacted',rid); return -3 end\n"
+            + "local fin=tonumber(redis.call('HGET',rk,'finishedAt') or '')\n"
+            + "if (not fin) or fin>=tonumber(ARGV[1]) then return -2 end\n"
+            + "local removed=0\n"
+            + "for _,pid in ipairs(redis.call('SMEMBERS',pre..'cpls')) do\n"
+            + "  local ck,nk,pk=pre..'chunk:'..pid,pre..'cnt:'..pid,pre..'pl:'..pid\n"
+            + "  local h=redis.call('HGETALL',nk)\n"
+            + "  local counts,ins,outs={},nil,nil\n"
+            + "  for i=1,#h,2 do\n"
+            + "    if h[i]=='_in' then ins=h[i+1] elseif h[i]=='_out' then outs=h[i+1]\n"
+            + "    elseif tonumber(h[i+1])>0 then counts[h[i]]=tonumber(h[i+1]) end\n"
+            + "  end\n"
+            + "  removed=removed+redis.call('HLEN',ck)\n"
+            + "  if redis.call('EXISTS',pk)==1 then\n"
+            + "    local js='{'\n"
+            + "    for f,v in pairs(counts) do if #js>1 then js=js..',' end js=js..'\"'..f..'\":'..string.format('%d',v) end\n"
+            + "    redis.call('HSET',pk,'sumCounts',js..'}')\n"
+            + "    if ins then redis.call('HSET',pk,'sumIn',ins) end\n"
+            + "    if outs then redis.call('HSET',pk,'sumOut',outs) end\n"
+            + "  end\n"
+            + "  redis.call('UNLINK',ck,nk)\n"
+            + "end\n"
+            + "redis.call('UNLINK',pre..'cpls')\n"
+            + "redis.call('HSET',rk,'compacted','1')\n"
+            + "redis.call('ZREM','pg:store:uncompacted',rid)\n"
+            + "return removed\n";
+
+    /**
+     * KEYS[1]=round hash; ARGV[1]=cutoff. Atomic status check + delete of every key of the round (see ControlPlaneStore.purgeRounds).
+     * Returns 1 purged, 0 not eligible (stale index entries are dropped), -1 missing.
+     */
+    private static final String PURGE =
+            "local rk=KEYS[1]\n"
+            + "local pre=string.sub(rk,1,#rk-5)\n"
+            + "local rid=string.sub(pre,5,#pre-2)\n"
+            + "local st=redis.call('HGET',rk,'status')\n"
+            + "if not st then redis.call('ZREM','pg:store:finished',rid); redis.call('ZREM','pg:store:uncompacted',rid); return -1 end\n"
+            + "if st~='SUCCEEDED' and st~='FAILED' and st~='CANCELLED' then redis.call('ZREM','pg:store:finished',rid); redis.call('ZREM','pg:store:uncompacted',rid); return 0 end\n"
+            + "local fin=tonumber(redis.call('HGET',rk,'finishedAt') or '')\n"
+            + "if (not fin) or fin>=tonumber(ARGV[1]) then return 0 end\n"
+            + "local del={rk}\n"
+            + "local function add(k) del[#del+1]=k end\n"
+            + "for _,id in ipairs(redis.call('SMEMBERS',pre..'runs')) do add(pre..'run:'..id) end\n"
+            + "for _,id in ipairs(redis.call('SMEMBERS',pre..'gates')) do add(pre..'gate:'..id); add(pre..'signal:'..id) end\n"
+            + "local seen={}\n"
+            + "for _,set in ipairs({'pls','cpls'}) do\n"
+            + "  for _,id in ipairs(redis.call('SMEMBERS',pre..set)) do\n"
+            + "    if not seen[id] then seen[id]=true; add(pre..'pl:'..id); add(pre..'chunk:'..id); add(pre..'cnt:'..id) end\n"
+            + "  end\n"
+            + "end\n"
+            + "for _,suf in ipairs({'runs','gates','pls','cpls','desired','assign','paused','fence','journal'}) do add(pre..suf) end\n"
+            + "local biz=(redis.call('HGET',rk,'graphName') or '')..'|'..(redis.call('HGET',rk,'bizKey') or '')\n"
+            + "if redis.call('HGET','pg:store:biz',biz)==rid then redis.call('HDEL','pg:store:biz',biz) end\n"
+            + "redis.call('ZREM','pg:store:rounds',rid)\n"
+            + "redis.call('ZREM','pg:store:finished',rid)\n"
+            + "redis.call('ZREM','pg:store:uncompacted',rid)\n"
+            + "redis.call('SREM','pg:store:active',rid)\n"
+            + "for i=1,#del,500 do redis.call('UNLINK',unpack(del,i,math.min(i+499,#del))) end\n"
             + "return 1\n";
 
     private final RedisClient client;
@@ -186,7 +262,23 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override
-    public void init() { r().ping(); }
+    public void init() {
+        RedisCommands<String, String> c = r();
+        c.ping();
+        // retention indexes: backfill terminal rounds created before they existed (idempotent, ZADD NX)
+        long total = c.zcard(ROUNDS);
+        for (long from = 0; from < total; from += 1000) {
+            for (String rid : c.zrange(ROUNDS, from, from + 999)) {
+                List<io.lettuce.core.KeyValue<String, String>> v = c.hmget(k(rid, "round"), "status", "finishedAt", "createdAt", "compacted");
+                String st = v.get(0).hasValue() ? v.get(0).getValue() : null;
+                if (st == null || !RoundStatus.valueOf(st).terminal()) continue;
+                String fin = v.get(1).hasValue() ? v.get(1).getValue() : (v.get(2).hasValue() ? v.get(2).getValue() : "0");
+                c.zadd(FINISHED, io.lettuce.core.ZAddArgs.Builder.nx(), Double.parseDouble(fin), rid);
+                if (!(v.get(3).hasValue() && "1".equals(v.get(3).getValue())))
+                    c.zadd(UNCOMPACTED, io.lettuce.core.ZAddArgs.Builder.nx(), Double.parseDouble(fin), rid);
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- keys & helpers
 
@@ -263,7 +355,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
         return RoundRecord.builder().roundId(h.get("roundId")).graphName(h.get("graphName")).bizKey(h.get("bizKey")).planHash(h.get("planHash"))
                 .planJson(h.get("planJson")).params(params == null ? null : ChunkCodec.toStringMap(params)).status(RoundStatus.valueOf(h.get("status")))
                 .masterEpoch(lng0(h, "epoch")).journalOffset(h.get("journalOffset")).createdAt(lng(h, "createdAt")).startedAt(lng(h, "startedAt"))
-                .finishedAt(lng(h, "finishedAt")).error(h.get("error")).incomplete(bool(h, "incomplete")).seq(lng0(h, "seq")).build();
+                .finishedAt(lng(h, "finishedAt")).error(h.get("error")).incomplete(bool(h, "incomplete")).seq(lng0(h, "seq")).compacted(bool(h, "compacted")).build();
     }
 
     private static RunRecord toRun(String rid, String id, Map<String, String> h) {
@@ -287,7 +379,17 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     private static PipelineRecord toPipeline(String rid, String id, Map<String, String> h) {
         return PipelineRecord.builder().roundId(rid).pipelineId(id).runId(h.get("runId")).status(PipelineStatus.valueOf(h.get("status")))
                 .parallelism(int0(h, "parallelism")).enumDone(bool(h, "enumDone")).masterEpoch(lng0(h, "epoch")).startedAt(lng(h, "startedAt"))
-                .finishedAt(lng(h, "finishedAt")).error(h.get("error")).build();
+                .finishedAt(lng(h, "finishedAt")).error(h.get("error")).summaryCounts(summaryCounts(h.get("sumCounts")))
+                .summaryRowsIn(h.containsKey("sumIn") ? Long.valueOf(Math.round(Double.parseDouble(h.get("sumIn")))) : null)
+                .summaryRowsOut(h.containsKey("sumOut") ? Long.valueOf(Math.round(Double.parseDouble(h.get("sumOut")))) : null).build();
+    }
+
+    private static Map<String, Long> summaryCounts(String js) {
+        if (js == null) return null;
+        Map<?, ?> raw = ChunkCodec.fromJson(js, Map.class);
+        Map<String, Long> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : raw.entrySet()) out.put(String.valueOf(e.getKey()), ((Number) e.getValue()).longValue());
+        return out;
     }
 
     @Override
@@ -403,6 +505,15 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
                 rowsOut.put(pid, Math.round(Double.parseDouble(h.getOrDefault("_out", "0"))));
             }
         }
+        for (PipelineRecord p : pls) {   // compacted pipelines: chunk records are gone, the summary stays
+            if (p.getSummaryCounts() == null || counts.containsKey(p.getPipelineId())) continue;
+            Map<ChunkStatus, Long> m = new EnumMap<>(ChunkStatus.class);
+            for (Map.Entry<String, Long> e : p.getSummaryCounts().entrySet()) if (e.getValue() > 0) m.put(ChunkStatus.valueOf(e.getKey()), e.getValue());
+            if (m.isEmpty()) continue;
+            counts.put(p.getPipelineId(), m);
+            if (p.getSummaryRowsIn() != null) rowsIn.put(p.getPipelineId(), p.getSummaryRowsIn());
+            if (p.getSummaryRowsOut() != null) rowsOut.put(p.getPipelineId(), p.getSummaryRowsOut());
+        }
         return RoundView.builder().round(round).runs(runs).gates(gates).pipelines(pls).chunkCounts(counts).rowsIn(rowsIn).rowsOut(rowsOut).build();
     }
 
@@ -423,6 +534,57 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
         return out;
     }
 
+    @Override
+    public List<RoundRecord> listRecentRounds(String graphName, int limit) {
+        List<RoundRecord> out = new ArrayList<>();
+        if (limit <= 0) return out;
+        boolean all = graphName == null || graphName.trim().isEmpty();
+        RedisCommands<String, String> c = r();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        List<RoundRecord> active = new ArrayList<>();
+        for (String rid : findActiveRounds()) {
+            RoundRecord rr = loadLight(c, rid);
+            if (rr != null && (all || graphName.equals(rr.getGraphName()))) { active.add(rr); seen.add(rid); }
+        }
+        active.sort(recentFirst());
+        for (RoundRecord rr : active) { if (out.size() >= limit) return out; out.add(rr); }
+        // newest first from the created-at sorted index; bounded scan when filtering by graph
+        long scanned = 0;
+        final int batch = 100;
+        final long maxScan = all ? limit + seen.size() + batch : 5000;
+        for (long from = 0; out.size() < limit && scanned < maxScan; from += batch) {
+            List<String> ids = c.zrevrange(ROUNDS, from, from + batch - 1);
+            if (ids.isEmpty()) break;
+            for (String rid : ids) {
+                scanned++;
+                if (seen.contains(rid)) continue;
+                RoundRecord rr = loadLight(c, rid);
+                if (rr == null || !(all || graphName.equals(rr.getGraphName()))) continue;
+                out.add(rr);
+                if (out.size() >= limit) break;
+            }
+        }
+        return out;
+    }
+
+    private static Comparator<RoundRecord> recentFirst() {
+        return (a, b) -> {
+            long x = a.getCreatedAt() == null ? 0 : a.getCreatedAt(), y = b.getCreatedAt() == null ? 0 : b.getCreatedAt();
+            return x != y ? Long.compare(y, x) : b.getRoundId().compareTo(a.getRoundId());
+        };
+    }
+
+    /** Round hash without the (large) plan json. */
+    private RoundRecord loadLight(RedisCommands<String, String> c, String rid) {
+        List<io.lettuce.core.KeyValue<String, String>> v = c.hmget(k(rid, "round"), "roundId", "graphName", "bizKey", "planHash", "params",
+                "status", "epoch", "createdAt", "startedAt", "finishedAt", "error", "incomplete", "seq", "compacted");
+        Map<String, String> h = new LinkedHashMap<>();
+        String[] names = {"roundId", "graphName", "bizKey", "planHash", "params", "status", "epoch", "createdAt", "startedAt", "finishedAt", "error", "incomplete", "seq", "compacted"};
+        for (int i = 0; i < names.length; i++) if (v.get(i).hasValue()) h.put(names[i], v.get(i).getValue());
+        if (!h.containsKey("status")) return null;
+        return toRound(h);
+    }
+
     private static boolean isRunTerminal(RunStatus s) { return s == RunStatus.SUCCEEDED || s == RunStatus.FAILED; }
 
     private static boolean isPlTerminal(PipelineStatus s) { return s == PipelineStatus.SUCCEEDED || s == PipelineStatus.FAILED; }
@@ -438,7 +600,20 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     @Override
     public boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch) {
         boolean ok = mutate(roundId, k(roundId, "round"), statusOps(expect.name(), target.name(), error, epoch, target == RoundStatus.RUNNING, target.terminal()));
-        if (ok) { if (target.terminal()) r().srem(ACTIVE, roundId); else r().sadd(ACTIVE, roundId); }
+        if (ok) {
+            RedisCommands<String, String> c = r();
+            if (target.terminal()) {
+                c.srem(ACTIVE, roundId);
+                String fin = c.hget(k(roundId, "round"), "finishedAt");
+                double score = fin == null ? (double) System.currentTimeMillis() : Double.parseDouble(fin);
+                c.zadd(FINISHED, score, roundId);
+                c.zadd(UNCOMPACTED, score, roundId);
+            } else {
+                c.sadd(ACTIVE, roundId);
+                c.zrem(FINISHED, roundId);
+                c.zrem(UNCOMPACTED, roundId);
+            }
+        }
         return ok;
     }
 
@@ -627,6 +802,46 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
         for (ChunkRecord c : allChunks(roundId, null)) {
             if (c.getStatus() != ChunkStatus.DONE || !runId.equals(c.getRunId()) || c.getInputEdge() == null || "split".equals(c.getInputEdge())) continue;
             out.merge(c.getInputEdge(), c.getRowsIn() == null ? 0L : c.getRowsIn(), Long::sum);
+        }
+        return out;
+    }
+
+    // ---------------------------------------------------------------- retention
+
+    @Override
+    public int compactRound(String roundId, long finishedBeforeMillis) {
+        long n = evalLong(COMPACT, new String[]{k(roundId, "round")}, Collections.singletonList(String.valueOf(finishedBeforeMillis)));
+        return n < 0 ? 0 : (int) n;
+    }
+
+    @Override
+    public List<String> purgeRounds(long finishedBeforeMillis, int max) {
+        List<String> purged = new ArrayList<>();
+        if (max <= 0) return purged;
+        RedisCommands<String, String> c = r();
+        io.lettuce.core.Range<Double> range = io.lettuce.core.Range.from(io.lettuce.core.Range.Boundary.unbounded(),
+                io.lettuce.core.Range.Boundary.excluding((double) finishedBeforeMillis));
+        // stale index entries are dropped by the script, so ask for a few more candidates than needed
+        for (String rid : c.zrangebyscore(FINISHED, range, io.lettuce.core.Limit.create(0, max * 2))) {
+            if (purged.size() >= max) break;
+            if (evalLong(PURGE, new String[]{k(rid, "round")}, Collections.singletonList(String.valueOf(finishedBeforeMillis))) == 1) purged.add(rid);
+        }
+        return purged;
+    }
+
+    @Override
+    public List<String> findTerminalRounds(long finishedBeforeMillis, int max) {
+        List<String> out = new ArrayList<>();
+        if (max <= 0) return out;
+        RedisCommands<String, String> c = r();
+        io.lettuce.core.Range<Double> range = io.lettuce.core.Range.from(io.lettuce.core.Range.Boundary.unbounded(),
+                io.lettuce.core.Range.Boundary.excluding((double) finishedBeforeMillis));
+        for (String rid : c.zrangebyscore(UNCOMPACTED, range, io.lettuce.core.Limit.create(0, max * 2))) {
+            if (out.size() >= max) break;
+            List<io.lettuce.core.KeyValue<String, String>> v = c.hmget(k(rid, "round"), "status", "compacted");
+            String st = v.get(0).hasValue() ? v.get(0).getValue() : null;
+            boolean ok = st != null && RoundStatus.valueOf(st).terminal() && !(v.get(1).hasValue() && "1".equals(v.get(1).getValue()));
+            if (ok) out.add(rid); else c.zrem(UNCOMPACTED, rid);
         }
         return out;
     }

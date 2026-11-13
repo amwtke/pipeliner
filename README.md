@@ -203,6 +203,7 @@ runner 有两种声明方式：
 | `pipeliner.runtime.renew-interval-millis` | `20000` | chunk 续租间隔 |
 | `pipeliner.runtime.auto-claim-interval-millis` | `10000` | autoclaim 扫描间隔 |
 | `pipeliner.runtime.high-watermark` / `low-watermark` | `64` / `32` | 通道水位，达到高水位上游提交返回 BUSY |
+| `pipeliner.runtime.master-tick-mode` · `external-tick-interval-millis` | `local` · `2000` | master 推进由本地线程或外部触发，见「外部触发 master 推进」 |
 | `pipeliner.runtime.max-attempts` | `3` | chunk 最大重试次数 |
 | `pipeliner.runtime.max-deliveries` | `5` | autoclaim 投递超过此值直接进死信 |
 | `pipeliner.runtime.autoscale` | `true` | 按积压自动扩并行度 |
@@ -236,10 +237,92 @@ runner 有两种声明方式：
 | POST | `/pg/runs/{roundId}/{runId}/rerun` | 从该 run 起重跑 |
 | POST | `/pg/runs/{roundId}/{runId}/skip` | 跳过死信 |
 | POST | `/pg/gates/{roundId}/{gateId}/signal` | 向 external 闸门发信号，body：`{"key","payload"}` |
-| POST | `/pg/gates/{roundId}/{gateId}/open` | 打开闸门，参数 `operator`（默认 `admin`） |
+| POST | `/pg/gates/{roundId}/{gateId}/open` | 打开闸门；操作人取自认证身份（token 名），仅在认证关闭时才使用参数 `operator`（默认 `admin`） |
+| GET | `/pg/graphs/{name}/plan.json` | 结构化执行计划（runs / pipelines / channels / gates），供界面使用 |
+| GET | `/pg/rounds?graph=&limit=20` | 最近的 round：活跃的在前，其余按创建时间倒序 |
+| GET | `/pg/cluster/workers` | 所有存活 pod：leader 标记、心跳年龄、各自持有的 pipeline 实例（来自心跳里的 `live` 字段） |
+| POST | `/pg/master/tick` | 执行一次 master 推进（外部触发，ADMIN token），返回 `TickResult`，见「外部触发 master 推进」 |
 | GET | `/pg/cluster` | 当前 pod 的 `podId`、`isLeader`、`liveInstances`（本 pod 上已实例化的 pipeline） |
 
+### 可视化界面
+
+每个 pod 都在 `http://<pod>:<port>/pg-ui/` 提供内置界面（纯静态页面，无构建、无外部依赖，内网可用；不经过 `/pg/*` 的认证过滤器）。
+
+- 展示：选定图的拓扑（stage 列 → run 框 → pipeline 节点，stream 边标通道长度、达到高水位变红，闸门为菱形，自动 barrier 标 `barrier:<dataset>`），以及所选 round 的实时状态：round 摘要（状态、当前阶段、用时、incomplete/compacted）、各 run / pipeline / 闸门状态、source 的 `done/total splits`、行数、DLQ、各 pod 持有的线程数。不选 round 时只显示拓扑。支持拖动平移、滚轮缩放、“适应”。
+- 点击 pipeline / run / 闸门打开侧栏：详情、失败 chunk，以及 重试 / 从此处重跑 / 跳过死信 / 打开闸门、暂停 / 恢复 / 取消（执行前有确认框，失败时显示服务端返回的错误）。
+- 自动刷新：所选 round 活跃时每 2 秒轮询一次。深链：`/pg-ui/?graph=<图>&round=<roundId>`，可加 `&theme=dark|light`。
+- Token：右上角输入框（只存 `sessionStorage`），每个 `/pg` 请求都以 `Authorization: Bearer` 发送。读取默认免 token；所有操作按钮需要 `ADMIN` token；服务端配了 `read-requires-token` 时读取也需要，界面会明确提示 401 / 403。
+- 关闭：`pipeliner.admin.ui.enabled=false`（默认 `true`），此时 `/pg-ui/**` 返回 404。
+- 注意：pod 持有的实例来自心跳（`heartbeat-millis`，默认 5 秒），略有延迟。
+
+### 认证与授权
+
+`/pg/*` 由一个 servlet 过滤器保护（`io.github.amwtke.pipeliner.spring.security`，不依赖 Spring Security），默认开启。
+
+- **角色**：`ADMIN` 可调用所有接口；`VIEWER` 只能读。
+- **规则**：`GET`/`HEAD` 默认免 token；所有变更方法（POST/PUT/PATCH/DELETE）仅 `ADMIN`。`read-requires-token: true` 时读也需要 `VIEWER` 或 `ADMIN`。
+- **失败响应**：缺失/未知 token → `401` + `WWW-Authenticate: Bearer`，body `{"error": "..."}`；`VIEWER` 做变更 → `403`。
+- **安全默认**：开启但未配置任何 token 时，启动 WARN，所有变更接口返回 `403`（只读仍可用）。token 短于 16 字符会 WARN（仍可用）。token 用常量时间比较。
+- **传递方式**：`Authorization: Bearer <token>`，或 `X-PG-Token: <token>`（`header` 可改默认的 `Authorization` 头名）。
+
+```yaml
+pipeliner:
+  admin:
+    security:
+      enabled: true            # 默认 true；false 则完全不注册过滤器（此时 open 的 operator 取自参数）
+      read-requires-token: false
+      header: Authorization
+      tokens:
+        - {name: ops,    token: "${PG_ADMIN_TOKEN}",  role: ADMIN}
+        - {name: viewer, token: "${PG_VIEWER_TOKEN}", role: VIEWER}
+```
+
+```bash
+curl -H "Authorization: Bearer $PG_ADMIN_TOKEN" -X POST localhost:8080/pg/rounds/$RID/pause
+curl -H "X-PG-Token: $PG_ADMIN_TOKEN" -H 'content-type: application/json' \
+     -d '{"graph":"net-demand","bizKey":"b1"}' localhost:8080/pg/rounds
+```
+
+**审计日志**：每次变更调用写一行 INFO，logger `pipeliner.audit`：
+`principal=ops method=POST path=/pg/rounds/r1/pause round=r1 run/gate=- status=200`（不会记录 token）。
+
+**注意**：示例应用的 dev token（`dev-admin-token-change-me`）仅供本地，务必用 `PG_ADMIN_TOKEN`/`PG_VIEWER_TOKEN` 覆盖；e2e/chaos 脚本读取 `PG_ADMIN_TOKEN` 并在每次调用里带上。示例的 `/demo/*` 接口仅用于演示，**不经过**此过滤器、无认证。Actuator 端点同样不在保护范围内，请用 `management.server.port` 单独监听内网端口或由平台层保护。
+
 示例应用另有 `POST /demo/seed`、`POST /demo/rounds?planVersion=`、`GET /demo/checksum?planVersion=`。
+
+## 外部触发 master 推进（xxl-job 等）
+
+master 的一次推进（续租/抢主、执行管理命令、推进所有活跃 round、保留清理、内存限流）是一个显式、幂等的操作：`PipelinerEngine.tick()`，返回 `TickResult`（`leader`、`epoch`、`roundsTicked`、`commandsExecuted`、`durationMillis`、`skipped`、`skipReason`）。默认（`LOCAL`）由每个 pod 内部的 `pg-master` 线程每 `tick-millis` 调用一次；也可以改为 `EXTERNAL`，由外部调度器驱动，此时 pod 不启动 master 线程。
+
+| 属性 | 默认 | 说明 |
+|---|---|---|
+| `pipeliner.runtime.master-tick-mode` | `local` | `local` = 内部线程；`external` = 不起线程，由外部调用 `engine.tick()` |
+| `pipeliner.runtime.external-tick-interval-millis` | `2000` | 预期的外部触发间隔，仅用于校验与监控：`leader-ttl-millis < 3 ×` 该值时启动打 WARN（租约会在两次触发之间过期，leader 抖动） |
+
+语义：
+- leader 语义不变：租约 + 每次（重新）获得 leadership 取新 epoch + round 级 fencing。非 leader 的 tick 在尝试抢租约后返回 `skipped`，`skipReason="not leader"`。同一 pod 上并发的 tick 由 `tryLock` 保护，后到者返回 `skipped "tick in progress"`；`master-enabled=false` 返回 `skipped "master disabled"`。
+- worker 心跳/agent 在任何模式下都是本地线程：pod 的存活判定不能依赖调度器。
+- 管理命令（pause/cancel/open gate 等）在下一次 tick 才执行，延迟最长约一个触发间隔（`admin-timeout-millis` 需大于它）。round 的推进粒度同样变为触发间隔：间隔越大越省资源，但闸门/run 切换越慢；建议 1–5 秒。
+
+xxl-job 处理器示例（仅示例，框架不依赖 xxl-job）：
+
+```java
+@XxlJob("pipelinerTick")
+public void pipelinerTick() { TickResult r = engine.tick(); XxlJobHelper.log(r.toString()); }
+```
+
+路由建议：任何路由策略都可用——只有持有租约的 pod 会推进，其余 pod 返回 `not leader`（无副作用）。推荐 FAILOVER 或 RANDOM，触发间隔 1–5 秒，`leader-ttl-millis` ≥ 3 × 间隔；不要用"广播"以外会长期固定到已死 pod 的策略。
+
+HTTP 替代：调度器直接请求任意存活 pod：
+
+```bash
+curl -X POST -H "Authorization: Bearer $PG_ADMIN_TOKEN" http://<pod>:8080/pg/master/tick
+# {"leader":true,"epoch":7,"roundsTicked":1,"commandsExecuted":0,"durationMillis":12,"skipped":false,"skipReason":null}
+```
+
+该接口是变更类接口，需要 ADMIN token；始终返回 200，是否推进看 `skipped`。指标：`pipeliner_master_last_tick_timestamp_seconds`（每次完成的 leader tick 更新）、`pipeliner_master_tick_duration_seconds`。告警 `PipelinerMasterNotTicking`（`deploy/prometheus/pipeliner-alerts.yml`）：有活跃 round（`pipeliner_active_rounds > 0`）而 30 秒内没有 leader tick 时触发（阈值取 max(30s, 5 × 预期间隔)，间隔 > 6 秒需调大）。
+
+e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external 模式，脚本每秒向随机存活 pod 发一次 `POST /pg/master/tick`，leader-ttl 设为 3 秒）。
 
 ## 多 pod 正确性模型（fencing / attempt / 版本化 sink）
 
@@ -257,9 +340,65 @@ runner 有两种声明方式：
 - ClickHouse 凡是参与产出结果的读取都要加 `FINAL`（`useFinal()`）。
 - 外部系统对 batch id 幂等。
 
+## 数据保留
+
+控制面数据（round / run / gate / pipeline / chunk 记录）默认存 Redis，不清理会一直增长。leader 在 master 循环里按 `interval-minutes` 周期执行一次保留任务（非 leader 不跑；每轮最多处理 `batch` 个 round，并有很短的时间预算，不拖长 tick）：
+
+| 属性 | 默认 | 说明 |
+|---|---|---|
+| `pipeliner.retention.enabled` | `true` | 总开关 |
+| `pipeliner.retention.chunk-days` | `3` | 终态 round 结束超过该天数后做**压缩** |
+| `pipeliner.retention.round-days` | `30` | 终态 round 结束超过该天数后**整体删除** |
+| `pipeliner.retention.interval-minutes` | `10` | 两次保留任务的最小间隔（0 = 每个 tick 都跑，仅用于测试） |
+| `pipeliner.retention.batch` | `100` | 每轮压缩 / 删除的 round 上限 |
+
+- **压缩**（`ControlPlaneStore.compactRound`）：只处理终态（SUCCEEDED / FAILED / CANCELLED）且 `finishedAt` 早于截止时间、尚未压缩的 round。先把每个 pipeline 的汇总（各状态 chunk 数、rowsIn、rowsOut）写到 pipeline 记录上，再删除该 round 全部 chunk 记录和计数器，并标记 round 已压缩。压缩后 `GET /pg/rounds/{id}` 的 chunk 统计仍来自汇总，`/chunks` 列表为空。
+- **删除**（`purgeRounds`）：删除 round、run、gate、signal、pipeline、chunk、计数器、bizKey 索引和排序索引，之后同一个 bizKey 可以重新提交。数据面里残留的 key（失败 round 为了 retry 保留的通道 / DLQ）和 `pg:workers` 里超过 `10 × worker-dead-millis` 的心跳成员也一并清理。
+- **与并发重跑的安全性**：终态判断与删除是同一个原子步骤——MySQL 是单事务内对 `pg_round` 行 `SELECT ... FOR UPDATE`，Redis 是单个 Lua（`UNLINK` 删除）。`rerunFrom` / `retryRun` 通过 `resetRuns` 把 round 改回 RUNNING 后，保留任务看到的就是非终态，不会删除；反过来先删除的话，重跑会得到"round 不存在"。压缩过的 round 被重跑时，被重置的 pipeline 的汇总同时清除，round 的压缩标记也清除，重新结束后会再次压缩。
+- MySQL 会在 `init()` 里幂等地加列（`pg_round.compacted`、`pg_pipeline.sum_*`）和索引 `(status, finished_at)`；Redis 会为已有的终态 round 补建 `pg:store:finished` / `pg:store:uncompacted` 索引。
+- 每轮有变更时输出一行 INFO：`retention: purged N rounds, compacted M rounds (K chunk records), pruned W stale workers`。
+
+## 监控与告警
+
+每个 pod 通过 Micrometer 暴露指标；示例应用已加入 `micrometer-registry-prometheus`，并在 `management.endpoints.web.exposure.include` 开放 `health,info,metrics,prometheus`：
+
+```bash
+curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
+```
+
+自己的应用需要依赖 `micrometer-registry-prometheus` 和 `spring-boot-starter-actuator`。基数约束：计数器 / 计时器只带 `graph`、`pipeline`（、`run`、`status`、`gate`）标签，**不带 round id**；带 `round` 标签的 gauge 在 round 结束、leader 退位、或 2 分钟没有刷新时从注册表移除。round id 到 graph 的映射在指标实现内部用有界 LRU 缓存解析。
+
+| 指标 | 类型 | 标签 | 含义 |
+|---|---|---|---|
+| `pipeliner_chunks_processed_total` | counter | graph, pipeline, run | 处理完成的 chunk 数 |
+| `pipeliner_chunk_duration_seconds` | timer | graph, pipeline, run | chunk 处理耗时 |
+| `pipeliner_rows_in_total` / `pipeliner_rows_out_total` | counter | graph, pipeline, run | 输入 / 输出行数 |
+| `pipeliner_chunk_retries_total` | counter | graph, pipeline | chunk 重试次数 |
+| `pipeliner_dead_letters_total` | counter | graph, pipeline | 进入死信的 chunk 数 |
+| `pipeliner_busy_wait_seconds_total` | counter | graph, pipeline | 上游因下游满（BUSY）等待的秒数 |
+| `pipeliner_channel_length` | gauge | graph, round, edge | 通道长度 |
+| `pipeliner_channel_high_watermark` | gauge | - | 配置的高水位 |
+| `pipeliner_gate_waiting_seconds` | gauge | graph, round, gate | 闸门已等待时长 |
+| `pipeliner_gate_timeouts_total` | counter | graph, gate, policy | 闸门超时次数 |
+| `pipeliner_leader` | gauge | pod | 1 = 该 pod 是 leader |
+| `pipeliner_leader_changes_total` | counter | - | 当选次数 |
+| `pipeliner_run_duration_seconds` | timer | graph, run, status | run 耗时 |
+| `pipeliner_rounds_finished_total` | counter | graph, status | 结束的 round 数 |
+| `pipeliner_active_rounds` | gauge | - | 活跃 round 数（leader 上报） |
+| `pipeliner_live_instances` | gauge | pod | 该 pod 上存活的 pipeline 实例数 |
+| `pipeliner_oldest_pending_seconds` | gauge | graph, round, pipeline | 输入 stream 里最老待确认 chunk 的空闲时间 |
+| `pipeliner_stalled_chunk_alerts_total` | counter | graph, pipeline | 停滞 chunk 告警次数 |
+| `pipeliner_redis_used_memory_bytes` | gauge | - | Redis used_memory（leader 约每 10 秒采样） |
+| `pipeliner_retention_purged_rounds_total` / `_compacted_rounds_total` | counter | - | 保留任务删除 / 压缩的 round 数 |
+| `pipeliner_retention_last_run_timestamp_seconds` | gauge | - | 保留任务上次运行时间 |
+
+**停滞 chunk 告警**：master 每隔几个 tick 对 RUNNING 的 CLUSTER pipeline 的输入 stream（source 为 split 队列，其余为输入通道）做一次 XPENDING（汇总 + 最老一条的扩展查询，开销很小），把最老待确认条目的空闲时间写入 `pipeliner_oldest_pending_seconds`。空闲超过 `pipeliner.runtime.stalled-chunk-alert-millis`（默认 300000）时，对每个 (round, pipeline, entry) 只输出一条 WARN（含 consumer、投递次数、待确认数），并让 `pipeliner_stalled_chunk_alerts_total` 加 1。注意：worker 正常存活时 claim 续租会不断重置空闲时间，所以这个告警抓的是"没人续租 / 没人接手"的条目（worker 卡死且续租线程也停了、没有存活 worker、autoclaim 被关闭等）；worker 线程卡在 runner 里但续租仍在运行的情况需另行通过 `pipeliner_chunk_duration_seconds` 或 run 耗时观察。
+
+**告警规则**：[deploy/prometheus/pipeliner-alerts.yml](deploy/prometheus/pipeliner-alerts.yml)（在 Prometheus 配置的 `rule_files` 里引用），包含：出现死信、round 失败、闸门等待过久 / 超时、chunk 停滞、持续背压（通道 10 分钟都在高水位）、1 分钟无 leader、多 leader、leader 频繁切换、Redis 内存过高、保留任务未运行。阈值是示例值，按环境调整。
+
 ## 验证结果（v1）
 
-- 159 个单元 / 集成测试通过。
+- 189 个单元 / 集成测试通过。
 - e2e：R2 期间 kill -9 一个 worker 和 leader，在 Redis（默认）与 MySQL（`STORE_PROFILE=mysql-store`）两种控制面上均通过，checksum 一致（600 个 material 时 BIG 19200 行 / FINE 28800 行）。
 - 全集群 kill -9 后重启，续跑到相同 checksum（`restart-resume.sh`，默认 Redis 控制面）。
 - 背压：通道长度被限制在高水位（默认 64；设为 6/3 时为 6）；core-grade 自动扩容 2→4；观察到上游 BUSY 等待。
@@ -275,4 +414,3 @@ runner 有两种声明方式：
 - 行数为 0 的 source split 不会触发外部回调（`externalCountOf` 闸门据此计数）。
 - 尚无 Kafka source、HTTP sink。
 - 未实现按 chunk 批量拉取（`pullBatch`）。
-- 未实现停滞 chunk 的 XPENDING 告警（`stalledChunkAlertMillis` 仅有配置项）。

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Env: MASTER_TICK=external (see below), TICK_INTERVAL_MS (1000), LEADER_TTL_MS (3000)
 # Usage: run-pod.sh <name> <port> [extra spring args...]
 # Starts the fat jar in the background; log: ../logs/<name>.log, pid: ../logs/<name>.pid
 set -euo pipefail
@@ -14,7 +15,12 @@ PIDFILE="$LOGS/$NAME.pid"
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   echo "pod $NAME already running (pid $(cat "$PIDFILE"))"; exit 0
 fi
+# MASTER_TICK=external: no pg-master thread; an external trigger (tick-loop.sh simulating xxl-job) must POST /pg/master/tick
+TICK_ARGS=()
+if [ "${MASTER_TICK:-local}" = external ]; then
+  TICK_ARGS=(--pipeliner.runtime.master-tick-mode=external --pipeliner.runtime.external-tick-interval-millis="${TICK_INTERVAL_MS:-1000}" --pipeliner.runtime.leader-ttl-millis="${LEADER_TTL_MS:-3000}")
+fi
 JAVA_BIN="${JAVA_HOME:+$JAVA_HOME/bin/}java"
-nohup "$JAVA_BIN" ${JAVA_OPTS:-} -jar "$JAR" --pipeliner.pod-id="$NAME" --server.port="$PORT" "$@" >> "$LOGS/$NAME.log" 2>&1 &
+nohup "$JAVA_BIN" ${JAVA_OPTS:-} -jar "$JAR" --pipeliner.pod-id="$NAME" --server.port="$PORT" ${TICK_ARGS[@]+"${TICK_ARGS[@]}"} "$@" >> "$LOGS/$NAME.log" 2>&1 &
 echo $! > "$PIDFILE"
 echo "started pod $NAME on port $PORT (pid $(cat "$PIDFILE"))"

@@ -9,7 +9,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics
+        include: health,info,metrics,prometheus
 demo:
   core-grade-delay-ms: 0
   algo-delay-ms: 200
@@ -40,3 +40,7 @@ pipeliner:
     auto-claim-interval-millis: 3000
   admin:
     enabled: true
+    security:   # /pg auth: GET open, mutations need an ADMIN token (Authorization: Bearer <token> or X-PG-Token). Override the dev tokens!
+      tokens:
+        - {name: ops, token: "${PG_ADMIN_TOKEN:dev-admin-token-change-me}", role: ADMIN}
+        - {name: viewer, token: "${PG_VIEWER_TOKEN:dev-viewer-token-change-me}", role: VIEWER}

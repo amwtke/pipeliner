@@ -112,9 +112,13 @@ class InstanceLifecycleTest {
             assertEquals(1, OPENED.get());
             assertEquals(0, CLOSED.get());
             assertEquals(1, SINK_OPENED.get());
+            // the heartbeat publishes the live instances compactly: [[round,pipeline,attempt,threads],...]
+            String expect = "[[\"" + round + "\",\"b\",0,3]]";
+            assertTrue(waitFor(() -> expect.equals(h.plane.workerInfo("pod1").get("live")), 5000), String.valueOf(h.plane.workerInfo("pod1")));
             gate.countDown();
             assertEquals(RoundStatus.SUCCEEDED, e.awaitRound(round, 10000));
             assertTrue(waitFor(() -> e.liveInstances().isEmpty(), 10000), "released after the round ended");
+            assertTrue(waitFor(() -> "[]".equals(h.plane.workerInfo("pod1").get("live")), 5000), "heartbeat drops released instances");
             assertEquals(1, CLOSED.get());
             assertEquals(1, DESTROYED.get());
             assertEquals(1, SINK_CLOSED.get());

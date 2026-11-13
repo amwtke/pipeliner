@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end: 3 pods, seed, run V1, then run V2 while killing a worker pod and the leader pod; compare checksums.
-# Env: MATERIALS (default 600), STORE_PROFILE (default: none = Redis store; e.g. mysql-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
+# Env: MASTER_TICK=external (pods run without a master thread; tick-loop.sh simulates xxl-job), MATERIALS (default 600), STORE_PROFILE (default: none = Redis store; e.g. mysql-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -21,7 +21,8 @@ d=json.load(sys.stdin)
 for k in sys.argv[1].split('.'):
     d = d.get(k) if isinstance(d, dict) else None
 print('' if d is None else (json.dumps(d) if isinstance(d,(dict,list)) else d))" "$1"; }
-api() { curl -s -m 30 "$@"; }
+export PG_ADMIN_TOKEN="${PG_ADMIN_TOKEN:-dev-admin-token-change-me}"   # pods read it too (application.yml)
+api() { curl -s -m 30 -H "Authorization: Bearer $PG_ADMIN_TOKEN" "$@"; }
 port_of() { for i in 0 1 2; do [ "${PODS[$i]}" = "$1" ] && echo "${PORTS[$i]}"; done; }
 start_pod() { "$HERE/run-pod.sh" "$1" "$(port_of "$1")" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "${EXTRA[@]}"; }
 wait_up() { for _ in $(seq 1 120); do [ "$(api -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/pg/cluster")" = 200 ] && return 0; sleep 1; done; return 1; }
@@ -37,6 +38,12 @@ echo "== starting pods"
 for p in "${PODS[@]}"; do start_pod "$p"; done
 for i in 0 1 2; do wait_up "${PORTS[$i]}" || die "pod ${PODS[$i]} did not come up (see logs)"; done
 P1=${PORTS[0]}
+
+if [ "${MASTER_TICK:-local}" = external ]; then
+  export MASTER_TICK
+  echo "== starting external tick trigger loop (every 1 s, random pod)"
+  nohup "$HERE/tick-loop.sh" "${PORTS[@]}" >/dev/null 2>&1 &
+fi
 
 echo "== seeding $MATERIALS materials"
 api -X POST "http://127.0.0.1:$P1/demo/seed?materials=$MATERIALS&seed=42" | head -c 400; echo
@@ -112,4 +119,8 @@ if ka != kb:
     print("MISMATCH\nV1:", json.dumps(ka, indent=1), "\nV2:", json.dumps(kb, indent=1)); sys.exit(1)
 print("checksums match")
 PY
+if [ "${MASTER_TICK:-local}" = external ]; then
+  TL="$ROOT/logs/tick-loop.log"
+  echo "tick-loop: total=$(wc -l < "$TL") failed(pod down)=$(grep -c FAILED "$TL") not-leader=$(grep -c 'not leader' "$TL") in-progress=$(grep -c 'tick in progress' "$TL") advanced=$(grep -c '"skipped":false' "$TL")"
+fi
 echo "E2E PASSED"

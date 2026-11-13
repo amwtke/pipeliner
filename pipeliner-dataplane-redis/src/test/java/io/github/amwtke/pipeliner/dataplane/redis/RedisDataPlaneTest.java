@@ -453,4 +453,54 @@ class RedisDataPlaneTest {
         assertEquals(n, dp.streamLength(OUT));
         assertTrue(ms < 10_000, "ms=" + ms);
     }
+
+    @Test
+    void pendingSummaryReportsOldestPendingEntry() throws Exception {
+        assertEquals(0, dp.pendingSummary(IN).getPending(), "missing stream");
+        dp.ensureGroup(R, IN, E);
+        assertEquals(0, dp.pendingSummary(IN).getPending(), "no pending entries");
+        assertNull(dp.pendingSummary(IN).getOldestEntryId());
+        String first = add(IN, "a");
+        add(IN, "b");
+        add(IN, "c");
+        dp.read("w1", Collections.singletonList(IN), 1, 0);   // a -> w1
+        Thread.sleep(150);
+        dp.read("w2", Collections.singletonList(IN), 2, 0);   // b, c -> w2
+        PendingSummary s = dp.pendingSummary(IN);
+        assertEquals(3, s.getPending());
+        assertEquals(first, s.getOldestEntryId());
+        assertEquals("w1", s.getOldestConsumer());
+        assertEquals(1, s.getOldestDeliveryCount());
+        assertTrue(s.getOldestIdleMillis() >= 100, "idle " + s.getOldestIdleMillis());
+        assertTrue(dp.renew("w1", IN, first));
+        assertTrue(dp.pendingSummary(IN).getOldestIdleMillis() < 100, "renew resets the idle clock");
+        Thread.sleep(20);
+        dp.autoClaim("w3", IN, 10, 10);
+        PendingSummary after = dp.pendingSummary(IN);
+        assertEquals("w3", after.getOldestConsumer());
+        assertEquals(2, after.getOldestDeliveryCount());
+    }
+
+    @Test
+    void pruneWorkersRemovesOnlyStaleMembers() {
+        dp.heartbeat("fresh", Collections.<String, String>emptyMap());
+        raw.sync().zadd(Keys.workers(), (double) (System.currentTimeMillis() - 3_600_000L), "ancient");
+        assertEquals(1, dp.pruneWorkers(600_000));
+        assertNotNull(raw.sync().zscore(Keys.workers(), "fresh"));
+        assertNull(raw.sync().zscore(Keys.workers(), "ancient"));
+        assertEquals(0, dp.pruneWorkers(600_000));
+    }
+
+    @Test
+    void purgeRoundDataDeletesOnlyTheGivenRounds() {
+        add(Keys.channel("gone", "e1", 0), "x");
+        add(Keys.dlq("gone", "p", 1), "x");
+        raw.sync().set(Keys.journal("gone"), "x");
+        add(Keys.channel("kept", "e1", 0), "x");
+        add(Keys.channel("gone2", "e1", 0), "x");
+        assertEquals(4, dp.purgeRoundData(Arrays.asList("gone", "gone2")));
+        assertEquals(1, raw.sync().exists(Keys.channel("kept", "e1", 0)));
+        assertEquals(0, raw.sync().exists(Keys.channel("gone", "e1", 0), Keys.dlq("gone", "p", 1), Keys.journal("gone")));
+        assertEquals(0, dp.purgeRoundData(Collections.<String>emptyList()));
+    }
 }

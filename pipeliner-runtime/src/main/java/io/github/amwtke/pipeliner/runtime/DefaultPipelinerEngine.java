@@ -65,10 +65,16 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
         this.admin = new AdminClient(s);
     }
 
-    @Override public void registerGraph(PipelineGraph graph) { s.registry.register(graph); }
+    @Override public void registerGraph(PipelineGraph graph) { announce(s.registry.register(graph)); }
+
+    private void announce(ExecutionPlan plan) {
+        List<String> gateIds = new ArrayList<>();
+        for (PlanGate g : plan.getGates()) gateIds.add(g.getGateId());
+        s.metrics.graphRegistered(plan.getGraphName(), new ArrayList<>(plan.getPipelines().keySet()), gateIds);
+    }
 
     /** Registers an already built plan (its graph must be live); mainly for tests and custom planners. */
-    public void registerPlan(ExecutionPlan plan) { s.registry.registerPlan(plan); }
+    public void registerPlan(ExecutionPlan plan) { s.registry.registerPlan(plan); announce(plan); }
 
     @Override public ExecutionPlan plan(String graphName) { return s.registry.require(graphName); }
 
@@ -154,6 +160,14 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
     }
 
     @Override public List<LiveInstance> liveInstances() { return s.instances.snapshot(); }
+
+    @Override public io.github.amwtke.pipeliner.core.engine.TickResult tick() {
+        MasterLoop m;
+        synchronized (this) { m = master; }
+        if (!cfg.isMasterEnabled()) return io.github.amwtke.pipeliner.core.engine.TickResult.skipped(io.github.amwtke.pipeliner.core.engine.TickResult.MASTER_DISABLED, false, 0, 0);
+        if (m == null) return io.github.amwtke.pipeliner.core.engine.TickResult.skipped("engine not started", false, 0, 0);
+        return m.tick();
+    }
 
     @Override public boolean isLeader() { return master != null && master.isLeader(); }
 

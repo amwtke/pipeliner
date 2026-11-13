@@ -69,9 +69,13 @@ public class PipelinerAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(PipelinerMetrics.class)
-    public PipelinerMetrics pipelinerMetrics(ObjectProvider<MeterRegistry> registry) {
+    public PipelinerMetrics pipelinerMetrics(ObjectProvider<MeterRegistry> registry, ControlPlaneStore store) {
         MeterRegistry reg = registry.getIfAvailable();
-        return reg == null ? PipelinerMetrics.NOOP : new MicrometerPipelinerMetrics(reg);
+        // round id to graph name for the graph tag: a bounded cache inside the metrics, backed by one store read per round
+        return reg == null ? PipelinerMetrics.NOOP : new MicrometerPipelinerMetrics(reg, id -> {
+            io.github.amwtke.pipeliner.core.store.RoundRecord r = store.loadRoundRecord(id);
+            return r == null ? null : r.getGraphName();
+        });
     }
 
     @Bean

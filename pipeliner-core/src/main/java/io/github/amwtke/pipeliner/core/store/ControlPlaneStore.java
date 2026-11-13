@@ -32,6 +32,12 @@ public interface ControlPlaneStore {
     /** Status in CREATED, RUNNING, PAUSED. */
     List<String> findActiveRounds();
 
+    /**
+     * Up to {@code limit} rounds for the admin UI: active ones (CREATED/RUNNING/PAUSED) first, then the rest by createdAt descending
+     * (ties by roundId descending). {@code graphName} null/blank means all graphs. Records may omit {@code planJson}.
+     */
+    List<RoundRecord> listRecentRounds(String graphName, int limit);
+
     /** Sets startedAt on -&gt;RUNNING (if null), finishedAt on terminal. */
     boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch);
 
@@ -102,4 +108,26 @@ public interface ControlPlaneStore {
 
     /** Over DONE chunks grouped by inputEdge (excluding "split"). */
     Map<String, Long> sumRowsInByEdge(String roundId, String runId);
+
+    // ---------------------------------------------------------------- retention
+
+    /**
+     * Compaction of ONE terminal (SUCCEEDED/FAILED/CANCELLED), not yet compacted round with finishedAt &lt; finishedBeforeMillis, atomically
+     * (status check and write in one transaction / script): persists per pipeline a summary (chunk counts by status, rowsIn, rowsOut) on the
+     * pipeline record, deletes every chunk record and counter of the round and marks the round compacted. {@link #loadRound} keeps returning
+     * chunkCounts/rowsIn/rowsOut for it (from the summaries). Returns the number of chunk records removed (0 when not eligible).
+     * A later {@link #resetRuns} drops the summaries of the reset pipelines and the compacted mark.
+     */
+    int compactRound(String roundId, long finishedBeforeMillis);
+
+    /**
+     * Deletes everything of up to {@code max} terminal rounds with finishedAt &lt; finishedBeforeMillis (round, runs, gates, signals, pipelines,
+     * chunks, counters, biz-key index entry, sorted indexes). Per round, the status/finishedAt check and the delete are ONE atomic step (MySQL:
+     * transaction with SELECT ... FOR UPDATE on the round row; Redis: one script), so a concurrent rerun/retry that flipped the round back to
+     * RUNNING can never lose data. Returns the purged round ids (oldest first).
+     */
+    List<String> purgeRounds(long finishedBeforeMillis, int max);
+
+    /** Ids (oldest finished first, at most {@code max}) of terminal, not yet compacted rounds with finishedAt &lt; finishedBeforeMillis. */
+    List<String> findTerminalRounds(long finishedBeforeMillis, int max);
 }
