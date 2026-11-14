@@ -195,7 +195,7 @@ final class RunStarter {
                                 .updatedAt(System.currentTimeMillis()).build());
                     }
                     for (Split s : splits) c.s.plane.enqueueSplit(roundId, p, run.getAttempt(), s, c.epoch());
-                    if (!pending.isEmpty()) c.s.store.savePendingChunks(roundId, pending);
+                    if (!pending.isEmpty()) c.s.store.savePendingChunks(roundId, pending, c.epoch());
                     c.s.store.setPipelineEnumDone(roundId, p, true, c.epoch());
                     d.touch();
                     log.info("round {} pipeline {} enumerated {} splits", roundId, p, splits.size());

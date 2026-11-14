@@ -23,6 +23,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         RoundRecord ex = findRoundByBizKey(round.getGraphName(), round.getBizKey());
         if (ex != null) return ex;
         String id = round.getRoundId();
+        if (rounds.containsKey(id)) throw new DuplicateRoundIdException(id);
         maxSeq = Math.max(maxSeq, round.getSeq());
         rounds.put(id, copy(round));
         Map<String, RunRecord> rm = new LinkedHashMap<>();
@@ -59,14 +60,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
                 if (c.getRowsOut() != null) for (Long v : c.getRowsOut().values()) out.merge(c.getPipelineId(), v, Long::sum);
             }
         }
-        for (PipelineRecord p : pipes.get(roundId).values()) {   // compacted pipelines keep their summary
-            if (p.getSummaryCounts() == null || counts.containsKey(p.getPipelineId())) continue;
-            Map<ChunkStatus, Long> m = new EnumMap<>(ChunkStatus.class);
-            for (Map.Entry<String, Long> e : p.getSummaryCounts().entrySet()) m.put(ChunkStatus.valueOf(e.getKey()), e.getValue());
-            counts.put(p.getPipelineId(), m);
-            if (p.getSummaryRowsIn() != null) in.put(p.getPipelineId(), p.getSummaryRowsIn());
-            if (p.getSummaryRowsOut() != null) out.put(p.getPipelineId(), p.getSummaryRowsOut());
-        }
+        StoreViews.mergeSummaries(new ArrayList<>(pipes.get(roundId).values()), counts, in, out);   // compacted pipelines keep their summary
         return RoundView.builder().round(copy(rr)).runs(copyAll(runs.get(roundId).values())).gates(copyAll(gates.get(roundId).values()))
                 .pipelines(copyAll(pipes.get(roundId).values())).chunkCounts(counts).rowsIn(in).rowsOut(out).build();
     }
@@ -141,9 +135,10 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         if (r == null || r.getStatus() != expect || r.getMasterEpoch() > epoch) return false;
         r.setStatus(target);
         r.setMasterEpoch(epoch);
-        r.setError(error);
         long now = System.currentTimeMillis();
-        if (target == RoundStatus.RUNNING) { if (r.getStartedAt() == null) r.setStartedAt(now); r.setFinishedAt(null); }
+        if (expect == RoundStatus.FAILED && target == RoundStatus.RUNNING) { r.setError(null); r.setFinishedAt(null); }   // revive (contract C1)
+        if (error != null) r.setError(error);
+        if (target == RoundStatus.RUNNING && r.getStartedAt() == null) r.setStartedAt(now);
         if (target.terminal()) r.setFinishedAt(now);
         return true;
     }
@@ -155,10 +150,11 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         if (r == null || r.getStatus() != expect || r.getMasterEpoch() > epoch || fenced(roundId, epoch)) return false;
         r.setStatus(target);
         r.setMasterEpoch(epoch);
-        r.setError(error);
         long now = System.currentTimeMillis();
-        if (target == RunStatus.RUNNING) r.setStartedAt(now);
-        if (target == RunStatus.SUCCEEDED || target == RunStatus.FAILED) r.setFinishedAt(now);
+        if (expect == RunStatus.FAILED && target == RunStatus.RUNNING) { r.setError(null); r.setFinishedAt(null); }
+        if (error != null) r.setError(error);
+        if (target == RunStatus.RUNNING && r.getStartedAt() == null) r.setStartedAt(now);
+        if (target.terminal()) r.setFinishedAt(now);
         return true;
     }
 
@@ -176,10 +172,11 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         if (p == null || p.getStatus() != expect || p.getMasterEpoch() > epoch || fenced(roundId, epoch)) return false;
         p.setStatus(target);
         p.setMasterEpoch(epoch);
-        p.setError(error);
         long now = System.currentTimeMillis();
+        if (expect == PipelineStatus.FAILED && target == PipelineStatus.RUNNING) { p.setError(null); p.setFinishedAt(null); }
+        if (error != null) p.setError(error);
         if (target == PipelineStatus.RUNNING && p.getStartedAt() == null) p.setStartedAt(now);
-        if (target == PipelineStatus.SUCCEEDED || target == PipelineStatus.FAILED) p.setFinishedAt(now);
+        if (target.terminal()) p.setFinishedAt(now);
         return true;
     }
 
@@ -209,8 +206,8 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         GateRecord g = gates.get(roundId).get(gateId);
         if (g == null || g.getStatus() != expect || g.getMasterEpoch() > epoch || fenced(roundId, epoch)) return false;
         g.setStatus(target);
-        g.setOpenedBy(openedBy);
-        g.setOpenedAt(System.currentTimeMillis());
+        if (openedBy != null) g.setOpenedBy(openedBy);
+        if (target != GateStatus.CLOSED) g.setOpenedAt(System.currentTimeMillis());
         if (context != null) g.setContext(new HashMap<>(context));
         g.setMasterEpoch(epoch);
         return true;
@@ -218,24 +215,11 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
 
     @Override public synchronized void markGateAlerted(String roundId, String gateId) { gates.get(roundId).get(gateId).setAlerted(true); }
 
-    @Override public synchronized void resetGate(String roundId, String gateId, long epoch) {
-        GateRecord g = gates.get(roundId).get(gateId);
-        if (fenced(roundId, epoch)) return;
-        g.setStatus(GateStatus.CLOSED);
-        g.setArmedAt(null);
-        g.setDeadlineAt(null);
-        g.setOpenedBy(null);
-        g.setOpenedAt(null);
-        g.setContext(new HashMap<String, String>());
-        g.setAlerted(false);
-        g.setMasterEpoch(Math.max(g.getMasterEpoch(), epoch));
-    }
-
     @Override public synchronized void saveGateSignal(String roundId, String gateId, String key, String payload) {
         if (key == null || key.isEmpty() || key.length() > MAX_SIGNAL_KEY_LENGTH) throw new IllegalArgumentException("signal key must be 1.." + MAX_SIGNAL_KEY_LENGTH + " characters");
         Map<String, String> m = signals.get(roundId + "|" + gateId);
         if (m == null) { m = new LinkedHashMap<>(); signals.put(roundId + "|" + gateId, m); }
-        m.put(key, payload);
+        m.putIfAbsent(key, payload);   // idempotent per key: the first payload is kept (HSETNX / INSERT IGNORE)
     }
 
     @Override public synchronized Map<String, String> loadGateSignals(String roundId, String gateId) {
@@ -243,7 +227,8 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         return m == null ? new LinkedHashMap<String, String>() : new LinkedHashMap<>(m);
     }
 
-    @Override public synchronized void savePendingChunks(String roundId, List<ChunkRecord> list) {
+    @Override public synchronized void savePendingChunks(String roundId, List<ChunkRecord> list, long epoch) {
+        if (rounds.get(roundId) == null || fenced(roundId, epoch)) return;
         for (ChunkRecord c : list) chunks.get(roundId).putIfAbsent(ck(c.getPipelineId(), c.getChunkId()), copy(c));
     }
 
@@ -254,6 +239,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
     @Override public synchronized void applyChunkEvents(String roundId, List<ChunkEvent> events, String newOffset, long epoch) {
         if (++applyCalls == failApplyOnCall) throw new IllegalStateException("injected store failure");
         RoundRecord rr = rounds.get(roundId);
+        if (rr == null) throw new StaleEpochException("round " + roundId + " missing");
         if (rr.getMasterEpoch() > epoch) throw new StaleEpochException("fenced: round " + roundId + " epoch " + rr.getMasterEpoch() + " > " + epoch);
         for (ChunkEvent e : events) {
             if (!"DONE".equals(e.getType()) && !"DEAD".equals(e.getType())) continue;
@@ -284,7 +270,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override public synchronized void markChunksSkipped(String roundId, String runId, long epoch) {
-        if (fenced(roundId, epoch)) return;
+        if (rounds.get(roundId) == null || fenced(roundId, epoch)) return;
         for (ChunkRecord c : chunks.get(roundId).values())
             if (runId.equals(c.getRunId()) && c.getStatus() == ChunkStatus.DEAD) c.setStatus(ChunkStatus.SKIPPED);
     }
@@ -297,6 +283,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
             if (r != null && r.getMasterEpoch() > epoch) throw new StaleEpochException("resetRuns fenced: run " + runId + " epoch " + r.getMasterEpoch());
         }
         rr.setMasterEpoch(epoch);
+        rr.setIncomplete(false);
         for (String runId : runIds) {
             RunRecord r = runs.get(roundId).get(runId);
             if (r == null) continue;
@@ -314,6 +301,9 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
                 p.setStartedAt(null);
                 p.setFinishedAt(null);
                 p.setError(null);
+                p.setSummaryCounts(null);
+                p.setSummaryRowsIn(null);
+                p.setSummaryRowsOut(null);
                 p.setMasterEpoch(Math.max(p.getMasterEpoch(), epoch));
             }
             chunks.get(roundId).values().removeIf(c -> runId.equals(c.getRunId()));
@@ -332,10 +322,11 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
             }
             signals.remove(roundId + "|" + gateId);
         }
-        if (rr.getStatus() == RoundStatus.FAILED || rr.getStatus() == RoundStatus.SUCCEEDED) {
+        if (rr.getStatus().revivable()) {
             rr.setStatus(RoundStatus.RUNNING);
             rr.setFinishedAt(null);
             rr.setError(null);
+            rr.setCompacted(false);
         }
     }
 
@@ -355,26 +346,29 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         return l;
     }
 
+    private Collection<ChunkRecord> chunksOf(String roundId) {
+        TreeMap<String, ChunkRecord> m = chunks.get(roundId);
+        return m == null ? Collections.<ChunkRecord>emptyList() : m.values();
+    }
+
     @Override public synchronized long countChunks(String roundId, String pipelineId, ChunkStatus status) {
-        long n = 0;
-        for (ChunkRecord c : chunks.get(roundId).values()) if (c.getPipelineId().equals(pipelineId) && c.getStatus() == status) n++;
+        long n = 0;   // a null pipelineId / status means all
+        for (ChunkRecord c : chunksOf(roundId)) if ((pipelineId == null || c.getPipelineId().equals(pipelineId)) && (status == null || c.getStatus() == status)) n++;
         return n;
     }
 
     @Override public synchronized long countSinkChunks(String roundId, String pipelineId) {
         long n = 0;
-        for (ChunkRecord c : chunks.get(roundId).values()) {
-            if (!c.getPipelineId().equals(pipelineId) || c.getStatus() != ChunkStatus.DONE || c.getRowsOut() == null) continue;
-            long sink = 0;
-            for (Map.Entry<String, Long> e : c.getRowsOut().entrySet()) if (e.getKey().startsWith("sink:")) sink += e.getValue();
-            if (sink > 0) n++;
+        for (ChunkRecord c : chunksOf(roundId)) {
+            if (!c.getPipelineId().equals(pipelineId) || c.getStatus() != ChunkStatus.DONE) continue;
+            if (StoreViews.sinkRowsOf(c.getRowsOut()) > 0) n++;
         }
         return n;
     }
 
     @Override public synchronized Map<String, Long> sumRowsOutByEdge(String roundId, String runId) {
         Map<String, Long> m = new HashMap<>();
-        for (ChunkRecord c : chunks.get(roundId).values()) {
+        for (ChunkRecord c : chunksOf(roundId)) {
             if (!runId.equals(c.getRunId()) || c.getStatus() != ChunkStatus.DONE || c.getRowsOut() == null) continue;
             for (Map.Entry<String, Long> e : c.getRowsOut().entrySet()) if (e.getKey().startsWith("e")) m.merge(e.getKey(), e.getValue(), Long::sum);
         }
@@ -383,7 +377,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
 
     @Override public synchronized Map<String, Long> sumRowsInByEdge(String roundId, String runId) {
         Map<String, Long> m = new HashMap<>();
-        for (ChunkRecord c : chunks.get(roundId).values()) {
+        for (ChunkRecord c : chunksOf(roundId)) {
             if (!runId.equals(c.getRunId()) || c.getStatus() != ChunkStatus.DONE || c.getInputEdge() == null || "split".equals(c.getInputEdge())) continue;
             m.merge(c.getInputEdge(), c.getRowsIn() == null ? 0 : c.getRowsIn(), Long::sum);
         }
@@ -425,7 +419,8 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
             if (out.size() >= max) break;
             if (!eligible(r, cutoff)) continue;
             String id = r.getRoundId();
-            rounds.remove(id); runs.remove(id); gates.remove(id); pipes.remove(id); chunks.remove(id); signals.remove(id);
+            rounds.remove(id); runs.remove(id); gates.remove(id); pipes.remove(id); chunks.remove(id);
+            signals.keySet().removeIf(sk -> sk.startsWith(id + "|"));   // keyed roundId|gateId
             out.add(id);
         }
         return out;

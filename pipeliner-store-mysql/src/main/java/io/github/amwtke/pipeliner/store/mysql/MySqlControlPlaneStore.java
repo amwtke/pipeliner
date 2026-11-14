@@ -34,6 +34,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @FunctionalInterface private interface Work<T> { T run(Connection c) throws SQLException; }
 
+    /** Runs the work in one transaction; rolls back on ANY Throwable (an Error must not be committed by the autocommit restore). */
     private <T> T tx(Work<T> w) {
         try (Connection c = ds.getConnection()) {
             boolean ac = c.getAutoCommit();
@@ -42,11 +43,31 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 T r = w.run(c);
                 c.commit();
                 return r;
-            } catch (SQLException | RuntimeException e) {
+            } catch (Throwable e) {
                 try { c.rollback(); } catch (SQLException ignore) { /* best effort */ }
                 throw e;
             } finally {
                 try { c.setAutoCommit(ac); } catch (SQLException ignore) { /* best effort */ }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("store failure: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Single-statement work on a pooled connection that may have autocommit off (a shared application DataSource): commits explicitly in
+     * that case, so a write is never silently rolled back when the connection goes back to the pool, and a read never holds a stale snapshot.
+     */
+    private <T> T withConn(Work<T> w) {
+        try (Connection c = ds.getConnection()) {
+            boolean ac = c.getAutoCommit();
+            try {
+                T r = w.run(c);
+                if (!ac) c.commit();
+                return r;
+            } catch (Throwable e) {
+                if (!ac) { try { c.rollback(); } catch (SQLException ignore) { /* best effort */ } }
+                throw e;
             }
         } catch (SQLException e) {
             throw new IllegalStateException("store failure: " + e.getMessage(), e);
@@ -64,27 +85,28 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         }
     }
 
-    private int update(String sql, Object... args) {
-        try (Connection c = ds.getConnection()) {
-            return exec(c, sql, args);
-        } catch (SQLException e) {
-            throw new IllegalStateException("store failure: " + e.getMessage(), e);
+    private int update(String sql, Object... args) { return withConn(c -> exec(c, sql, args)); }
+
+    private static boolean exists(Connection c, String sql, Object... args) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            bind(ps, args);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
         }
     }
 
     @FunctionalInterface private interface RowMap<T> { T map(ResultSet rs) throws SQLException; }
 
     private <T> List<T> query(String sql, RowMap<T> m, Object... args) {
-        try (Connection c = ds.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
-            bind(ps, args);
-            try (ResultSet rs = ps.executeQuery()) {
-                List<T> out = new ArrayList<>();
-                while (rs.next()) out.add(m.map(rs));
-                return out;
+        return withConn(c -> {
+            try (PreparedStatement ps = c.prepareStatement(sql)) {
+                bind(ps, args);
+                try (ResultSet rs = ps.executeQuery()) {
+                    List<T> out = new ArrayList<>();
+                    while (rs.next()) out.add(m.map(rs));
+                    return out;
+                }
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException("store failure: " + e.getMessage(), e);
-        }
+        });
     }
 
     private static Long lng(ResultSet rs, String col) throws SQLException {
@@ -92,55 +114,51 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         return rs.wasNull() ? null : v;
     }
 
-    private static String json(Object o) { return o == null ? null : ChunkCodec.toJson(o); }
+    private static String json(Object o) { return StoreViews.json(o); }
 
     private static Map<String, String> strMap(String j) { return j == null ? null : ChunkCodec.toStringMap(j); }
 
-    private static Map<String, Long> longMap(String j) {
-        if (j == null) return null;
-        Map<?, ?> raw = ChunkCodec.fromJson(j, Map.class);
-        Map<String, Long> out = new LinkedHashMap<>();
-        for (Map.Entry<?, ?> e : raw.entrySet()) out.put(String.valueOf(e.getKey()), ((Number) e.getValue()).longValue());
-        return out;
-    }
+    private static Map<String, Long> longMap(String j) { return StoreViews.longMap(j); }
 
     @SuppressWarnings("unchecked")
     private static List<String> strList(String j) { return j == null ? null : (List<String>) ChunkCodec.fromJson(j, List.class); }
 
-    /** Rows written to sinks: the {@code "sink:<port>"} entries of a chunk's rowsOut. */
-    private static long sinkRowsOf(Map<String, Long> m) {
-        long t = 0;
-        if (m != null) for (Map.Entry<String, Long> e : m.entrySet()) if (e.getKey().startsWith("sink:") && e.getValue() != null) t += e.getValue();
-        return t;
+    private static long sinkRowsOf(Map<String, Long> m) { return StoreViews.sinkRowsOf(m); }
+
+    private static long totalOf(Map<String, Long> m) { return StoreViews.totalOf(m); }
+
+    /** SQL IN-lists generated from the status enums (single source of truth). */
+    private static String in(List<String> names) {
+        StringBuilder sb = new StringBuilder("(");
+        for (String n : names) sb.append(sb.length() > 1 ? "," : "").append('\'').append(n).append('\'');
+        return sb.append(')').toString();
     }
 
-    private static long totalOf(Map<String, Long> m) {
-        long t = 0;
-        if (m != null) for (Long v : m.values()) if (v != null) t += v;
-        return t;
-    }
+    private static final String ACTIVE_IN = in(RoundStatus.activeNames());
+    private static final String TERMINAL_IN = in(RoundStatus.terminalNames());
+    private static final String REVIVABLE_IN = in(RoundStatus.revivableNames());
 
     // ---------------------------------------------------------------- schema
 
     @Override
     public void init() {
         String[] ddl = {
-            "CREATE TABLE IF NOT EXISTS pg_round (round_id VARCHAR(64) NOT NULL, graph_name VARCHAR(128) NOT NULL, biz_key VARCHAR(190) NOT NULL,"
+            "CREATE TABLE IF NOT EXISTS pg_round (round_id VARCHAR(96) NOT NULL, graph_name VARCHAR(128) NOT NULL, biz_key VARCHAR(190) NOT NULL,"
                 + " plan_hash VARCHAR(64), plan_json MEDIUMTEXT, params_json TEXT, status VARCHAR(16) NOT NULL, master_epoch BIGINT NOT NULL DEFAULT 0,"
                 + " journal_offset VARCHAR(64) NOT NULL DEFAULT '0-0', created_at BIGINT, started_at BIGINT, finished_at BIGINT, error TEXT,"
                 + " incomplete TINYINT(1) NOT NULL DEFAULT 0, seq BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (round_id), UNIQUE KEY uk_biz (graph_name, biz_key), KEY idx_status (status))" + TBL,
-            "CREATE TABLE IF NOT EXISTS pg_run (round_id VARCHAR(64) NOT NULL, run_id VARCHAR(64) NOT NULL, stage INT NOT NULL DEFAULT 0,"
+            "CREATE TABLE IF NOT EXISTS pg_run (round_id VARCHAR(96) NOT NULL, run_id VARCHAR(64) NOT NULL, stage INT NOT NULL DEFAULT 0,"
                 + " mode VARCHAR(16), status VARCHAR(16) NOT NULL, attempt INT NOT NULL DEFAULT 0, assignee VARCHAR(128), master_epoch BIGINT NOT NULL DEFAULT 0,"
                 + " started_at BIGINT, finished_at BIGINT, error TEXT, PRIMARY KEY (round_id, run_id))" + TBL,
-            "CREATE TABLE IF NOT EXISTS pg_gate (round_id VARCHAR(64) NOT NULL, gate_id VARCHAR(64) NOT NULL, type VARCHAR(16), before_runs TEXT,"
+            "CREATE TABLE IF NOT EXISTS pg_gate (round_id VARCHAR(96) NOT NULL, gate_id VARCHAR(128) NOT NULL, type VARCHAR(16), before_runs TEXT,"
                 + " status VARCHAR(16) NOT NULL, armed_at BIGINT, deadline_at BIGINT, opened_by VARCHAR(128), opened_at BIGINT, context_json TEXT,"
                 + " master_epoch BIGINT NOT NULL DEFAULT 0, alerted TINYINT(1) NOT NULL DEFAULT 0, PRIMARY KEY (round_id, gate_id))" + TBL,
-            "CREATE TABLE IF NOT EXISTS pg_gate_signal (round_id VARCHAR(64) NOT NULL, gate_id VARCHAR(64) NOT NULL, signal_key VARCHAR(512) NOT NULL,"
+            "CREATE TABLE IF NOT EXISTS pg_gate_signal (round_id VARCHAR(96) NOT NULL, gate_id VARCHAR(128) NOT NULL, signal_key VARCHAR(512) NOT NULL,"
                 + " payload MEDIUMTEXT, created_at BIGINT, PRIMARY KEY (round_id, gate_id, signal_key))" + TBL,
-            "CREATE TABLE IF NOT EXISTS pg_pipeline (round_id VARCHAR(64) NOT NULL, pipeline_id VARCHAR(64) NOT NULL, run_id VARCHAR(64) NOT NULL,"
+            "CREATE TABLE IF NOT EXISTS pg_pipeline (round_id VARCHAR(96) NOT NULL, pipeline_id VARCHAR(128) NOT NULL, run_id VARCHAR(64) NOT NULL,"
                 + " status VARCHAR(16) NOT NULL, parallelism INT NOT NULL DEFAULT 1, enum_done TINYINT(1) NOT NULL DEFAULT 0, master_epoch BIGINT NOT NULL DEFAULT 0,"
                 + " started_at BIGINT, finished_at BIGINT, error TEXT, PRIMARY KEY (round_id, pipeline_id), KEY idx_run (round_id, run_id))" + TBL,
-            "CREATE TABLE IF NOT EXISTS pg_chunk (round_id VARCHAR(64) NOT NULL, pipeline_id VARCHAR(64) NOT NULL, chunk_id VARCHAR(255) NOT NULL,"
+            "CREATE TABLE IF NOT EXISTS pg_chunk (round_id VARCHAR(96) NOT NULL, pipeline_id VARCHAR(128) NOT NULL, chunk_id VARCHAR(255) NOT NULL,"
                 + " run_id VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL, attempt INT NOT NULL DEFAULT 0, owner VARCHAR(128), input_edge VARCHAR(64),"
                 + " split_spec TEXT, rows_in BIGINT, rows_out_json TEXT, rows_out_total BIGINT, sink_rows BIGINT NOT NULL DEFAULT 0, cost_ms INT, error TEXT, updated_at BIGINT,"
                 + " PRIMARY KEY (round_id, pipeline_id, chunk_id), KEY idx_run_status (round_id, run_id, status))" + TBL,
@@ -159,7 +177,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             alter(st, "ALTER TABLE pg_round ADD KEY idx_seq (seq)");   // MAX(seq) = index lookup
             alter(st, "ALTER TABLE pg_chunk ADD COLUMN sink_rows BIGINT NOT NULL DEFAULT 0");   // rows written to sinks (0 for chunks stored before the column existed)
             st.execute("INSERT IGNORE INTO pg_master_epoch (id, max_epoch) VALUES (1, 0)");
-            widenSignalKey(c);
+            widenColumns(c);
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_counts TEXT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_in BIGINT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_out BIGINT");
@@ -169,19 +187,32 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     }
 
     /**
-     * pg_gate_signal.signal_key was VARCHAR(190): widens it to {@link ControlPlaneStore#MAX_SIGNAL_KEY_LENGTH} when narrower. The primary key
-     * (round_id 64 + gate_id 64 + signal_key 512 characters = 640 x 4 bytes under utf8mb4 = 2560) stays below InnoDB's 3072-byte limit.
+     * Column widths (characters) every table must have; tables created by older versions are widened in place on init. Sized for
+     * {@link ControlPlaneStore#MAX_ROUND_ID_LENGTH} (graph name + round id suffix), {@link ControlPlaneStore#MAX_GATE_ID_LENGTH} and
+     * {@link ControlPlaneStore#MAX_PIPELINE_ID_LENGTH}. Primary keys under utf8mb4 (4 bytes per character), InnoDB limit 3072 bytes:
+     * pg_gate_signal = round_id 96 + gate_id 128 + signal_key 512 = 736 characters = 2944 bytes; pg_chunk = 96 + 128 + 255 = 479 = 1916 bytes.
      */
-    private static void widenSignalKey(Connection c) throws SQLException {
-        int len = 0;
-        try (PreparedStatement ps = c.prepareStatement("SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS "
-                + "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='pg_gate_signal' AND COLUMN_NAME='signal_key'");
-             ResultSet rs = ps.executeQuery()) {
-            if (rs.next()) len = rs.getInt(1);
-        }
-        if (len > 0 && len < MAX_SIGNAL_KEY_LENGTH) {
-            try (Statement st = c.createStatement()) {
-                st.execute("ALTER TABLE pg_gate_signal MODIFY signal_key VARCHAR(" + MAX_SIGNAL_KEY_LENGTH + ") NOT NULL");
+    private static final Object[][] WIDTHS = {
+        {"pg_round", "round_id", 96}, {"pg_run", "round_id", 96}, {"pg_gate", "round_id", 96}, {"pg_gate_signal", "round_id", 96},
+        {"pg_pipeline", "round_id", 96}, {"pg_chunk", "round_id", 96},
+        {"pg_gate", "gate_id", 128}, {"pg_gate_signal", "gate_id", 128},
+        {"pg_pipeline", "pipeline_id", 128}, {"pg_chunk", "pipeline_id", 128},
+        {"pg_gate_signal", "signal_key", MAX_SIGNAL_KEY_LENGTH},
+    };
+
+    private static void widenColumns(Connection c) throws SQLException {
+        for (Object[] w : WIDTHS) {
+            String table = (String) w[0], col = (String) w[1];
+            int want = (Integer) w[2];
+            int len = 0;
+            try (PreparedStatement ps = c.prepareStatement("SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS "
+                    + "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?")) {
+                ps.setString(1, table);
+                ps.setString(2, col);
+                try (ResultSet rs = ps.executeQuery()) { if (rs.next()) len = rs.getInt(1); }
+            }
+            if (len > 0 && len < want) {
+                try (Statement st = c.createStatement()) { st.execute("ALTER TABLE " + table + " MODIFY " + col + " VARCHAR(" + want + ") NOT NULL"); }
             }
         }
     }
@@ -269,6 +300,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             if (isDuplicate(e)) {
                 RoundRecord again = findRoundByBizKey(r.getGraphName(), r.getBizKey());
                 if (again != null) return again;
+                if (loadRoundRecord(r.getRoundId()) != null) throw new DuplicateRoundIdException(r.getRoundId());   // same id, other biz key
             }
             throw e;
         }
@@ -282,20 +314,21 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public RoundRecord findRoundByBizKey(String graphName, String bizKey) {
-        List<RoundRecord> l = query("SELECT " + R_COLS + " FROM pg_round WHERE graph_name=? AND biz_key=?", MySqlControlPlaneStore::mapRound, graphName, bizKey);
+        List<RoundRecord> l = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE graph_name=? AND biz_key=?", MySqlControlPlaneStore::mapRound, graphName, bizKey);
         return l.isEmpty() ? null : l.get(0);
     }
 
     @Override
     public RoundRecord loadRoundRecord(String roundId) {
-        List<RoundRecord> l = query("SELECT " + R_COLS + " FROM pg_round WHERE round_id=?", MySqlControlPlaneStore::mapRound, roundId);
+        List<RoundRecord> l = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE round_id=?", MySqlControlPlaneStore::mapRound, roundId);
         return l.isEmpty() ? null : l.get(0);
     }
 
     @Override
     public RoundView loadRound(String roundId) {
-        RoundRecord round = loadRoundRecord(roundId);
-        if (round == null) return null;
+        List<RoundRecord> rl = query("SELECT " + R_COLS + " FROM pg_round WHERE round_id=?", MySqlControlPlaneStore::mapRound, roundId);
+        if (rl.isEmpty()) return null;
+        RoundRecord round = rl.get(0);
         List<RunRecord> runs = query("SELECT * FROM pg_run WHERE round_id=? ORDER BY stage, run_id", MySqlControlPlaneStore::mapRun, roundId);
         List<GateRecord> gates = query("SELECT * FROM pg_gate WHERE round_id=? ORDER BY gate_id", MySqlControlPlaneStore::mapGate, roundId);
         List<PipelineRecord> pls = query("SELECT * FROM pg_pipeline WHERE round_id=? ORDER BY pipeline_id", MySqlControlPlaneStore::mapPipeline, roundId);
@@ -310,15 +343,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             rowsIn.put((String) row[0], (Long) row[1]);
             rowsOut.put((String) row[0], (Long) row[2]);
         }
-        for (PipelineRecord p : pls) {   // compacted pipelines: chunk rows are gone, the summary stays
-            if (p.getSummaryCounts() == null || counts.containsKey(p.getPipelineId())) continue;
-            Map<ChunkStatus, Long> m = new EnumMap<>(ChunkStatus.class);
-            for (Map.Entry<String, Long> e : p.getSummaryCounts().entrySet()) if (e.getValue() > 0) m.put(ChunkStatus.valueOf(e.getKey()), e.getValue());
-            if (m.isEmpty()) continue;
-            counts.put(p.getPipelineId(), m);
-            if (p.getSummaryRowsIn() != null) rowsIn.put(p.getPipelineId(), p.getSummaryRowsIn());
-            if (p.getSummaryRowsOut() != null) rowsOut.put(p.getPipelineId(), p.getSummaryRowsOut());
-        }
+        StoreViews.mergeSummaries(pls, counts, rowsIn, rowsOut);   // compacted pipelines: chunk rows are gone, the summary stays
         return RoundView.builder().round(round).runs(runs).gates(gates).pipelines(pls).chunkCounts(counts).rowsIn(rowsIn).rowsOut(rowsOut).build();
     }
 
@@ -335,7 +360,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public boolean fenceRound(String roundId, long epoch) {
-        return update("UPDATE pg_round SET master_epoch=? WHERE round_id=? AND master_epoch<=?", epoch, roundId, epoch) > 0;
+        return withConn(c -> fenceUpdate(c, "UPDATE pg_round SET master_epoch=? WHERE round_id=? AND master_epoch<=?", roundId, epoch, epoch, roundId, epoch));
     }
 
     @Override
@@ -360,7 +385,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public List<String> findActiveRounds() {
-        return query("SELECT round_id FROM pg_round WHERE status IN ('CREATED','RUNNING','PAUSED') ORDER BY created_at, round_id", rs -> rs.getString(1));
+        return query("SELECT round_id FROM pg_round WHERE status IN " + ACTIVE_IN + " ORDER BY created_at, round_id", rs -> rs.getString(1));
     }
 
     private static final String R_COLS_LIGHT = "round_id,graph_name,biz_key,plan_hash,NULL AS plan_json,params_json,status,master_epoch,journal_offset,"
@@ -374,11 +399,11 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         String g = all ? "" : " AND graph_name=?";
         Object[] ga = all ? new Object[0] : new Object[]{graphName};
         // active first (idx_status), then the newest of the rest (idx_graph_created / idx_created)
-        List<RoundRecord> active = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE status IN ('CREATED','RUNNING','PAUSED')" + g
+        List<RoundRecord> active = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE status IN " + ACTIVE_IN + g
                 + " ORDER BY created_at DESC, round_id DESC LIMIT ?", MySqlControlPlaneStore::mapRound, append(ga, limit));
         out.addAll(active);
         if (out.size() >= limit) return out;
-        List<RoundRecord> rest = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE status NOT IN ('CREATED','RUNNING','PAUSED')" + g
+        List<RoundRecord> rest = query("SELECT " + R_COLS_LIGHT + " FROM pg_round WHERE status NOT IN " + ACTIVE_IN + g
                 + " ORDER BY created_at DESC, round_id DESC LIMIT ?", MySqlControlPlaneStore::mapRound, append(ga, limit - out.size()));
         out.addAll(rest);
         return out;
@@ -390,23 +415,44 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         return r;
     }
 
+    /**
+     * Runs a round-row UPDATE that bumps master_epoch and returns whether the round is NOT fenced. An update count of 0 is ambiguous (fenced,
+     * missing, or - with useAffectedRows=true - matched but unchanged because the epoch was already stored), so 0 is settled by a SELECT.
+     */
+    private static boolean fenceUpdate(Connection c, String sql, String roundId, long epoch, Object... args) throws SQLException {
+        if (exec(c, sql, args) > 0) return true;
+        return exists(c, "SELECT 1 FROM pg_round WHERE round_id=? AND master_epoch<=?", roundId, epoch);
+    }
+
     /** Round-level epoch fence appended to every master UPDATE of a non-round table; the share lock serialises against fenceRound. */
     private static final String FENCE = " AND (SELECT master_epoch FROM pg_round WHERE round_id=? LOCK IN SHARE MODE) <= ?";
 
-    /** Generic fenced status CAS; sets started/finished stamps on the given transitions. */
+    /**
+     * Generic fenced status CAS; sets started/finished stamps on the given transitions. A FAILED to RUNNING (revive) clears error and
+     * finished_at, any other transition keeps the stored error when none is given. An update count of 0 is settled by a SELECT (it may
+     * only mean "matched but unchanged" under useAffectedRows=true).
+     */
     private boolean cas(String table, String where, Object[] keys, String expect, String target, String error, long epoch, boolean toRunning, boolean terminal) {
         long now = System.currentTimeMillis();
-        StringBuilder sb = new StringBuilder("UPDATE " + table + " SET status=?, master_epoch=?, error=COALESCE(?,error)");
+        boolean revive = FAILED.equals(expect) && RUNNING.equals(target);
+        StringBuilder sb = new StringBuilder("UPDATE " + table + " SET status=?, master_epoch=?, error=" + (revive ? "?" : "COALESCE(?,error)"));
         List<Object> args = new ArrayList<>();
         args.add(target); args.add(epoch); args.add(error);
         if (toRunning) { sb.append(", started_at=COALESCE(started_at,?)"); args.add(now); }
+        if (revive) sb.append(", finished_at=NULL");
         if (terminal) { sb.append(", finished_at=?"); args.add(now); }
-        sb.append(" WHERE ").append(where).append(" AND status=? AND master_epoch<=?");
-        for (Object k : keys) args.add(k);
-        args.add(expect); args.add(epoch);
-        if (!table.equals("pg_round")) { sb.append(FENCE); args.add(keys[0]); args.add(epoch); }
-        return update(sb.toString(), args.toArray()) > 0;
+        List<Object> match = new ArrayList<>();
+        StringBuilder cond = new StringBuilder(" WHERE ").append(where).append(" AND status=? AND master_epoch<=?");
+        for (Object k : keys) match.add(k);
+        match.add(expect); match.add(epoch);
+        if (!table.equals("pg_round")) { cond.append(FENCE); match.add(keys[0]); match.add(epoch); }
+        args.addAll(match);
+        String upd = sb.append(cond).toString();
+        String sel = "SELECT 1 FROM " + table + cond;
+        return withConn(c -> exec(c, upd, args.toArray()) > 0 || exists(c, sel, match.toArray()));
     }
+
+    private static final String FAILED = RunStatus.FAILED.name(), RUNNING = RunStatus.RUNNING.name();
 
     @Override
     public boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch) {
@@ -419,19 +465,20 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     @Override
     public boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch) {
         return cas("pg_run", "round_id=? AND run_id=?", new Object[]{roundId, runId}, expect.name(), target.name(), error, epoch,
-                target == RunStatus.RUNNING, target == RunStatus.SUCCEEDED || target == RunStatus.FAILED);
+                target == RunStatus.RUNNING, target.terminal());
     }
 
     @Override
     public boolean updateRunAssignment(String roundId, String runId, String assignee, int attempt, long epoch) {
-        return update("UPDATE pg_run SET assignee=?, attempt=?, master_epoch=? WHERE round_id=? AND run_id=? AND master_epoch<=?" + FENCE,
-                assignee, attempt, epoch, roundId, runId, epoch, roundId, epoch) > 0;
+        String cond = " WHERE round_id=? AND run_id=? AND master_epoch<=?" + FENCE;
+        return withConn(c -> exec(c, "UPDATE pg_run SET assignee=?, attempt=?, master_epoch=?" + cond, assignee, attempt, epoch, roundId, runId, epoch, roundId, epoch) > 0
+                || exists(c, "SELECT 1 FROM pg_run" + cond, roundId, runId, epoch, roundId, epoch));   // 0 rows may mean unchanged (useAffectedRows)
     }
 
     @Override
     public boolean casPipelineStatus(String roundId, String pipelineId, PipelineStatus expect, PipelineStatus target, String error, long epoch) {
         return cas("pg_pipeline", "round_id=? AND pipeline_id=?", new Object[]{roundId, pipelineId}, expect.name(), target.name(), error, epoch,
-                target == PipelineStatus.RUNNING, target == PipelineStatus.SUCCEEDED || target == PipelineStatus.FAILED);
+                target == PipelineStatus.RUNNING, target.terminal());
     }
 
     @Override
@@ -456,19 +503,15 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public boolean casGateStatus(String roundId, String gateId, GateStatus expect, GateStatus target, String openedBy, Map<String, String> context, long epoch) {
-        return update("UPDATE pg_gate SET status=?, master_epoch=?, opened_by=COALESCE(?,opened_by), context_json=COALESCE(?,context_json), "
-                        + "opened_at=CASE WHEN ?='CLOSED' THEN opened_at ELSE ? END WHERE round_id=? AND gate_id=? AND status=? AND master_epoch<=?" + FENCE,
-                target.name(), epoch, openedBy, json(context), target.name(), System.currentTimeMillis(), roundId, gateId, expect.name(), epoch, roundId, epoch) > 0;
+        String cond = " WHERE round_id=? AND gate_id=? AND status=? AND master_epoch<=?" + FENCE;
+        return withConn(c -> exec(c, "UPDATE pg_gate SET status=?, master_epoch=?, opened_by=COALESCE(?,opened_by), context_json=COALESCE(?,context_json), "
+                        + "opened_at=CASE WHEN ?='CLOSED' THEN opened_at ELSE ? END" + cond,
+                target.name(), epoch, openedBy, json(context), target.name(), System.currentTimeMillis(), roundId, gateId, expect.name(), epoch, roundId, epoch) > 0
+                || exists(c, "SELECT 1 FROM pg_gate" + cond, roundId, gateId, expect.name(), epoch, roundId, epoch));
     }
 
     @Override
     public void markGateAlerted(String roundId, String gateId) { update("UPDATE pg_gate SET alerted=1 WHERE round_id=? AND gate_id=?", roundId, gateId); }
-
-    @Override
-    public void resetGate(String roundId, String gateId, long epoch) {
-        update("UPDATE pg_gate SET status='CLOSED', armed_at=NULL, deadline_at=NULL, opened_by=NULL, opened_at=NULL, context_json=NULL, alerted=0, master_epoch=? "
-                + "WHERE round_id=? AND gate_id=? AND master_epoch<=?" + FENCE, epoch, roundId, gateId, epoch, roundId, epoch);
-    }
 
     @Override
     public void saveGateSignal(String roundId, String gateId, String signalKey, String payload) {
@@ -491,9 +534,11 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     private static final String CHUNK_INS = "INSERT %s INTO pg_chunk (round_id,pipeline_id,chunk_id,run_id,status,attempt,owner,input_edge,split_spec,rows_in,rows_out_json,rows_out_total,sink_rows,cost_ms,error,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
     @Override
-    public void savePendingChunks(String roundId, List<ChunkRecord> chunks) {
+    public void savePendingChunks(String roundId, List<ChunkRecord> chunks, long epoch) {
         if (chunks == null || chunks.isEmpty()) return;
-        tx(c -> {
+        boolean ok = tx(c -> {
+            // fence: the share lock on the round row serialises against fenceRound; a deposed master inserts nothing
+            if (!exists(c, "SELECT 1 FROM pg_round WHERE round_id=? AND master_epoch<=? LOCK IN SHARE MODE", roundId, epoch)) return false;
             try (PreparedStatement ps = c.prepareStatement(String.format(CHUNK_INS, "IGNORE"))) {
                 long now = System.currentTimeMillis();
                 for (ChunkRecord k : chunks) {
@@ -504,8 +549,9 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 }
                 ps.executeBatch();
             }
-            return null;
+            return true;
         });
+        if (!ok) log.warn("savePendingChunks for round {} fenced or missing (epoch {}); nothing stored", roundId, epoch);
     }
 
     private static final String[] UPSERT_COLS = {"run_id", "attempt", "owner", "input_edge", "rows_in", "rows_out_json", "rows_out_total", "sink_rows", "cost_ms", "error", "updated_at"};
@@ -525,7 +571,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     public void applyChunkEvents(String roundId, List<ChunkEvent> events, String newJournalOffset, long epoch) {
         boolean applied = tx(c -> {
             // fence first: a stale master must not write anything
-            if (exec(c, "UPDATE pg_round SET journal_offset=?, master_epoch=? WHERE round_id=? AND master_epoch<=?", newJournalOffset, epoch, roundId, epoch) == 0) return false;
+            if (!fenceUpdate(c, "UPDATE pg_round SET journal_offset=?, master_epoch=? WHERE round_id=? AND master_epoch<=?", roundId, epoch, newJournalOffset, epoch, roundId, epoch)) return false;
             String curType = null;
             PreparedStatement ps = null;
             try {
@@ -558,12 +604,27 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch) {
-        boolean ok = tx(c -> {
+        tx(c -> {
             // fence first (row lock on the round serialises against fenceRound and every other master write)
-            if (exec(c, "UPDATE pg_round SET master_epoch=? WHERE round_id=? AND master_epoch<=?", epoch, roundId, epoch) == 0) return false;
+            if (!fenceUpdate(c, "UPDATE pg_round SET master_epoch=? WHERE round_id=? AND master_epoch<=?", roundId, epoch, epoch, roundId, epoch))
+                throw new StaleEpochException("resetRuns for round " + roundId + " fenced or missing (epoch " + epoch + ")");
+            // all-or-nothing: check every listed run before writing; a missing run is skipped (like the Redis store), a run written by a
+            // newer epoch aborts the whole reset (the exception makes tx() roll the fence bump back)
+            List<String> present = new ArrayList<>();
             for (String runId : runIds) {
-                if (exec(c, "UPDATE pg_run SET status='PENDING', attempt=attempt+1, assignee=NULL, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? "
-                        + "WHERE round_id=? AND run_id=? AND master_epoch<=?", epoch, roundId, runId, epoch) == 0) return false;   // run written by a newer epoch: rolls back
+                Long re = null;
+                try (PreparedStatement ps = c.prepareStatement("SELECT master_epoch FROM pg_run WHERE round_id=? AND run_id=? FOR UPDATE")) {
+                    ps.setString(1, roundId);
+                    ps.setString(2, runId);
+                    try (ResultSet rs = ps.executeQuery()) { if (rs.next()) re = rs.getLong(1); }
+                }
+                if (re == null) continue;
+                if (re > epoch) throw new StaleEpochException("resetRuns for round " + roundId + ": run " + runId + " was written by epoch " + re + " > " + epoch);
+                present.add(runId);
+            }
+            for (String runId : present) {
+                exec(c, "UPDATE pg_run SET status='PENDING', attempt=attempt+1, assignee=NULL, started_at=NULL, finished_at=NULL, error=NULL, master_epoch=? "
+                        + "WHERE round_id=? AND run_id=?", epoch, roundId, runId);
                 exec(c, "UPDATE pg_pipeline SET status='PENDING', enum_done=0, started_at=NULL, finished_at=NULL, error=NULL, sum_counts=NULL, sum_rows_in=NULL, sum_rows_out=NULL, master_epoch=? WHERE round_id=? AND run_id=?",
                         epoch, roundId, runId);
                 exec(c, "DELETE FROM pg_chunk WHERE round_id=? AND run_id=?", roundId, runId);
@@ -573,10 +634,10 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                         + "WHERE round_id=? AND gate_id=?", epoch, roundId, gateId);
                 exec(c, "DELETE FROM pg_gate_signal WHERE round_id=? AND gate_id=?", roundId, gateId);
             }
-            exec(c, "UPDATE pg_round SET status='RUNNING', finished_at=NULL, error=NULL, compacted=0 WHERE round_id=? AND status IN ('FAILED','SUCCEEDED')", roundId);
-            return true;
+            exec(c, "UPDATE pg_round SET incomplete=0 WHERE round_id=?", roundId);
+            exec(c, "UPDATE pg_round SET status='RUNNING', finished_at=NULL, error=NULL, compacted=0 WHERE round_id=? AND status IN " + REVIVABLE_IN, roundId);
+            return null;
         });
-        if (!ok) throw new StaleEpochException("resetRuns for round " + roundId + " fenced or missing (epoch " + epoch + ")");
     }
 
     @Override
@@ -679,7 +740,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     public List<String> purgeRounds(long finishedBeforeMillis, int max) {
         List<String> purged = new ArrayList<>();
         if (max <= 0) return purged;
-        List<String> candidates = query("SELECT round_id FROM pg_round WHERE status IN ('SUCCEEDED','FAILED','CANCELLED') AND finished_at < ? "
+        List<String> candidates = query("SELECT round_id FROM pg_round WHERE status IN " + TERMINAL_IN + " AND finished_at < ? "
                 + "ORDER BY finished_at, round_id LIMIT ?", rs -> rs.getString(1), finishedBeforeMillis, max);
         for (String rid : candidates) {
             boolean done = tx(c -> {
@@ -697,7 +758,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     @Override
     public List<String> findTerminalRounds(long finishedBeforeMillis, int max) {
         if (max <= 0) return new ArrayList<>();
-        return query("SELECT round_id FROM pg_round WHERE status IN ('SUCCEEDED','FAILED','CANCELLED') AND finished_at < ? AND compacted=0 "
+        return query("SELECT round_id FROM pg_round WHERE status IN " + TERMINAL_IN + " AND finished_at < ? AND compacted=0 "
                 + "ORDER BY finished_at, round_id LIMIT ?", rs -> rs.getString(1), finishedBeforeMillis, max);
     }
 }

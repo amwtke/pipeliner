@@ -8,6 +8,7 @@ import io.github.amwtke.pipeliner.api.SplitSource;
 import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
 import io.github.amwtke.pipeliner.core.plan.PlanOptions;
 import io.github.amwtke.pipeliner.core.plan.Planner;
+import io.github.amwtke.pipeliner.core.store.ControlPlaneStore;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -78,9 +79,14 @@ public final class PipelineGraph {
 
         /** Structural validation only (unique ids, existing references); planning validates the rest. */
         public PipelineGraph build() {
+            // identifier limits: the control plane's columns / primary keys are sized for them (ControlPlaneStore.MAX_*)
+            if (name == null || name.isEmpty() || name.length() > ControlPlaneStore.MAX_GRAPH_NAME_LENGTH)
+                throw new PipelinerException("graph name must be 1.." + ControlPlaneStore.MAX_GRAPH_NAME_LENGTH + " characters: " + name);
             Map<String, PipelineSpec> map = new LinkedHashMap<>();
             for (PipelineSpec s : specs) {
                 if (s.getId() == null || s.getId().isEmpty()) throw new PipelinerException("pipeline id must not be empty");
+                if (s.getId().length() > ControlPlaneStore.MAX_PIPELINE_ID_LENGTH)
+                    throw new PipelinerException("pipeline id must be at most " + ControlPlaneStore.MAX_PIPELINE_ID_LENGTH + " characters: " + s.getId());
                 if (map.put(s.getId(), s) != null) throw new PipelinerException("duplicate pipeline id: " + s.getId());
                 // ':' separates the parts of a batch id / signal key (ChunkIds.batchId); chunk ids embed port names
                 if (s.getId().indexOf(':') >= 0) throw new PipelinerException("pipeline id must not contain ':': " + s.getId());
@@ -102,6 +108,8 @@ public final class PipelineGraph {
             }
             Set<String> gateIds = new HashSet<>();
             for (GateSpec g : gates) {
+                if (g.getId() != null && g.getId().length() > ControlPlaneStore.MAX_GATE_ID_LENGTH)
+                    throw new PipelinerException("gate id must be at most " + ControlPlaneStore.MAX_GATE_ID_LENGTH + " characters: " + g.getId());
                 if (!gateIds.add(g.getId())) throw new PipelinerException("duplicate gate id: " + g.getId());
                 for (String p : g.getAfter()) if (!map.containsKey(p)) throw new PipelinerException("gate " + g.getId() + ": unknown after pipeline '" + p + "'");
                 for (String p : g.getBefore()) if (!map.containsKey(p)) throw new PipelinerException("gate " + g.getId() + ": unknown before pipeline '" + p + "'");

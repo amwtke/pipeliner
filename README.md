@@ -360,6 +360,7 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 - **删除**（`purgeRounds`）：删除 round、run、gate、signal、pipeline、chunk、计数器、bizKey 索引和排序索引，之后同一个 bizKey 可以重新提交。数据面里残留的 key（失败 round 为了 retry 保留的通道 / DLQ）和 `pg:workers` 里超过 `10 × worker-dead-millis` 的心跳成员也一并清理。
 - **与并发重跑的安全性**：终态判断与删除是同一个原子步骤——MySQL 是单事务内对 `pg_round` 行 `SELECT ... FOR UPDATE`，Redis 是单个 Lua（`UNLINK` 删除）。`rerunFrom` / `retryRun` 通过 `resetRuns` 把 round 改回 RUNNING 后，保留任务看到的就是非终态，不会删除；反过来先删除的话，重跑会得到"round 不存在"。压缩过的 round 被重跑时，被重置的 pipeline 的汇总同时清除，round 的压缩标记也清除，重新结束后会再次压缩。
 - MySQL 会在 `init()` 里幂等地加列（`pg_round.compacted`、`pg_pipeline.sum_*`）和索引 `(status, finished_at)`；Redis 会为已有的终态 round 补建 `pg:store:finished` / `pg:store:uncompacted` 索引。
+- **标识符长度与 round id**：round id 为 `<graph>-<yyyyMMdd-HHmmss>-<12 位 hex>`（48 位随机），图名最长 64、gate id（含自动 `barrier:<dataset>`）和 pipeline id 最长 128（`PipelineGraph.build()` / Planner 校验）。MySQL 列按此定长（`round_id` 96、`gate_id` / `pipeline_id` 128，`pg_gate_signal` 主键 736 字符 × 4 = 2944 字节 ≤ 3072），`init()` 会把旧表的窄列自动 `ALTER` 加宽。`createRound` 遇到已存在的 round id 抛 `DuplicateRoundIdException`（Redis 脚本和 MySQL 主键冲突都会检测），`submit()` 换新 id 重试。Redis 控制面的一次性回填（终态索引、按图索引 `pg:store:graph:<graph>`、chunk 索引、最大 epoch / seq）由 `pg:store:schema` 标记保证只跑一次；`init()` 由 `DefaultPipelinerEngine.start()` 调用一次。`loadRoundRecord` / `loadRoundState` 不带 `planJson`（只有 `loadRound` 带）。
 - 每轮有变更时输出一行 INFO：`retention: purged N rounds, compacted M rounds (K chunk records), pruned W stale workers`。
 
 ## 监控与告警
