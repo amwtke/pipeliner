@@ -131,7 +131,7 @@ public final class MasterLoop implements Runnable {
         }
         lastRenew = System.currentTimeMillis();
         if (!leader || s.plane.currentEpoch() != ctx.epoch()) {
-            long epoch = s.plane.nextEpoch();
+            long epoch = s.plane.nextEpoch(s.store.maxMasterEpoch());   // floor: stored round epochs survive a wiped Redis epoch counter
             ctx.epoch(epoch);
             leader = true;
             lastActiveSync = 0;   // re-register every active round (the Redis active set may have been lost)

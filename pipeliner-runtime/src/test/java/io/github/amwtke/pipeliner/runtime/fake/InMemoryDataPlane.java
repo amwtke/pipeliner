@@ -92,7 +92,12 @@ public class InMemoryDataPlane implements DataPlane {
     }
     @Override public synchronized void releaseLeadership(String podId) { if (podId.equals(leader)) leader = null; }
     @Override public synchronized String currentLeader() { return leader != null && System.currentTimeMillis() <= leaderExpiry ? leader : null; }
-    @Override public synchronized long nextEpoch() { return ++epoch; }
+    @Override public synchronized long nextEpoch(long floor) { if (epoch < floor) epoch = floor; issued.add(++epoch); return epoch; }
+    /** Simulates losing the epoch counter (Redis wiped); forgets the epochs handed out so far. */
+    public synchronized void resetEpoch() { epoch = 0; issued.clear(); }
+    /** Epochs handed out since construction / the last resetEpoch. */
+    public synchronized List<Long> issuedEpochs() { return new ArrayList<>(issued); }
+    private final List<Long> issued = new ArrayList<>();
     @Override public synchronized long currentEpoch() { return epoch; }
 
     // rounds

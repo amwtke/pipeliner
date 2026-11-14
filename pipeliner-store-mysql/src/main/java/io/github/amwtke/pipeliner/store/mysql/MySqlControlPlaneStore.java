@@ -146,6 +146,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             alter(st, "ALTER TABLE pg_round ADD KEY idx_status_finished (status, finished_at)");
             alter(st, "ALTER TABLE pg_round ADD KEY idx_graph_created (graph_name, created_at)");
             alter(st, "ALTER TABLE pg_round ADD KEY idx_created (created_at)");
+            alter(st, "ALTER TABLE pg_round ADD KEY idx_master_epoch (master_epoch)");   // MAX(master_epoch) = index lookup
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_counts TEXT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_in BIGINT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_out BIGINT");
@@ -304,6 +305,12 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     @Override
     public boolean fenceRound(String roundId, long epoch) {
         return update("UPDATE pg_round SET master_epoch=? WHERE round_id=? AND master_epoch<=?", epoch, roundId, epoch) > 0;
+    }
+
+    @Override
+    public long maxMasterEpoch() {
+        List<Long> r = query("SELECT COALESCE(MAX(master_epoch),0) FROM pg_round", rs -> rs.getLong(1));
+        return r.isEmpty() ? 0L : r.get(0);
     }
 
     @Override

@@ -254,6 +254,15 @@ class RedisDataPlaneTest {
     }
 
     @Test
+    void nextEpochRespectsFloor() {
+        assertEquals(0, dp.currentEpoch());
+        assertEquals(8, dp.nextEpoch(7), "counter below the floor is raised to it, then incremented");
+        assertEquals(9, dp.nextEpoch(3), "a lower floor changes nothing");
+        assertEquals(10, dp.nextEpoch(0));
+        assertEquals(10, dp.currentEpoch());
+    }
+
+    @Test
     void stateRoundTrips() {
         dp.addActiveRound("r1");
         dp.addActiveRound("r2");

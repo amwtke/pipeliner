@@ -486,6 +486,20 @@ abstract class AbstractControlPlaneStoreContractTest {
     }
 
     @Test
+    void maxMasterEpochTracksFencedRounds() {
+        String rid = mk("maxepoch");
+        long base = store.maxMasterEpoch();
+        long e = base + 100;
+        assertTrue(store.fenceRound(rid, e));
+        assertEquals(e, store.maxMasterEpoch());
+        assertFalse(store.fenceRound(rid, e - 1), "refused fence does not lower the maximum");
+        assertEquals(e, store.maxMasterEpoch());
+        String other = mk("maxepoch2");
+        assertTrue(store.fenceRound(other, e - 50));
+        assertEquals(e, store.maxMasterEpoch(), "a lower epoch on another round does not change the maximum");
+    }
+
+    @Test
     void loadRoundStateHasNoChunkStats() {
         String rid = mk("state");
         store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 7, m("e1", 7))), "1-0", 1);

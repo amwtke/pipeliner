@@ -2,7 +2,7 @@
 
 面向有界批量计算的分布式流水线框架：把一次计算描述成 pipeline 图，由 Redis Streams 做数据通道和背压，Redis（默认）或 MySQL 做控制面，多 pod 协同执行，任意 pod（包括 leader）被 kill -9 后可从控制面恢复并得到相同结果。
 
-设计文档：[docs/pipelinegraph-design.md](docs/pipelinegraph-design.md)（设计稿，部分细节以代码为准）。
+设计文档：[docs/pipelinegraph-design.md](docs/pipelinegraph-design.md)（描述已实现的 v1 的设计；运维以本文为准）。
 
 ## 模块一览
 
@@ -328,9 +328,11 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 
 **Attempt**：`RunRecord.attempt` 是 run 的"代"。`rerunFrom` / `retryRun`（本地 run）通过一次原子的 `store.resetRuns`（MySQL 单事务 / Redis 单个 Lua）把 run、pipeline、chunk 记录、下游闸门（含其 signal）和 round 状态一起复位，attempt+1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态为 `并行度|attempt`。Worker 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例：attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例（`open()` 会重新执行）。journal 事件带 `runAttempt`，attempt 不符的事件被 master 丢弃。数据面清理由 master 幂等重放：RunStarter 启动第 n 次 attempt 前先（带 fence）删除该 run 所有 <n 的 key；run 成功后删除当前 attempt 的 key。
 
+**Epoch 下限**：master 每次取新 epoch 用 `plane.nextEpoch(store.maxMasterEpoch())`：Lua 里若 `pg:epoch` 小于下限先置为下限再 `INCR`。`maxMasterEpoch` 在 MySQL 控制面是 `MAX(pg_round.master_epoch)`（有索引），在 Redis 控制面是 `fenceRound` 里维护的 `pg:store:maxepoch`。这样 Redis 数据丢失（`pg:epoch` 被清）后，新 epoch 仍高于存储里的 round epoch，`fenceRound` 不会被永久拒绝。
+
 **Fencing**：master 每次 tick 先 `store.fenceRound` 再 `plane.fenceRound(roundId, epoch)`（`pg:{r}:fence` 只增不减），任一返回 false 即退位。master 对数据面的所有写（期望并行度、本地 run 分配、入队 split、删 key、trim journal、paused 标志、requeue/clear DLQ、建 group、移出 active）都在 Lua 里先校验 fence ≤ epoch，否则抛 `StaleEpochException` 且不产生任何变更，所以冻结后恢复的僵尸 master 什么也改不了。管理命令也在 master tick 内用同一 epoch 执行。Worker 的 commit / deadLetter 不需要 fence（XACK 守卫保证只有持有 pending 的一方能提交）。每个 tick master 还按 round 状态校正 `paused` 标志；`pg:throttle` 带 TTL（`max(3×tick, 5s)`），超限期间每 tick 续期。
 
-**版本化 sink**：每个 round 提交时拿到全局单调的 `RoundRecord.seq`（`INCR pg:roundseq`），`SinkContext.writeVersion() = seq × 1000 + attempt`（`RunContext` 同样提供 `attempt()` / `writeVersion()`）。`JdbcSinks.xxx(...).versionColumn("pg_version")` 会在每一行写入该列：MySQL upsert 变为条件更新（`c = IF(VALUES(ver) >= ver, VALUES(c), c)`，版本列最后赋值），旧 attempt / 旧 round 的僵尸写入覆盖不了新结果；ClickHouse 需把表声明为 `ReplacingMergeTree(pg_version)`，`FINAL` 读取保留最高版本。校验和只覆盖业务列。外部系统（如算法回调）请按 batch id 幂等：`ChunkIds.batchId(chunkId, attempt)`；`Gates.externalCountOf` 只统计无 `@` 或以 `@<当前 attempt>` 结尾的 signal，`GateContext.runAttemptOf(pipelineId)` 提供当前 attempt。
+**版本化 sink**：每个 round 提交时拿到全局单调的 `RoundRecord.seq`（`INCR pg:roundseq`），`SinkContext.writeVersion() = seq × 1000 + attempt`（`RunContext` 同样提供 `attempt()` / `writeVersion()`）。`JdbcSinks.xxx(...).versionColumn("pg_version")` 会在每一行写入该列：MySQL upsert 变为条件更新（`c = IF(VALUES(ver) >= ver, VALUES(c), c)`，版本列最后赋值），旧 attempt / 旧 round 的僵尸写入覆盖不了新结果；ClickHouse 需把表声明为 `ReplacingMergeTree(pg_version)`，`FINAL` 读取保留最高版本。校验和只覆盖业务列。外部系统（如算法回调）请按 batch id 幂等，batch id 必须全局唯一：`ChunkIds.batchId(roundId, chunkId, attempt)` = `<roundId>:<chunkId>@<attempt>`。chunk id 每个 round 都按同样规则推出（`S0003`），只用 `chunkId@attempt` 的话，按 batch id 去重的外部服务会把下个月的 round 当成重复请求并返回旧结果，所以 round id 必须在 batch id 里（旧的两参数 `batchId(chunkId, attempt)` 已 `@Deprecated`，不要再用）。signal 按 round + 闸门存储；`Gates.externalCountOf` 只统计无 `@` 或以 `@<当前 attempt>` 结尾的 signal，`GateContext.runAttemptOf(pipelineId)` 提供当前 attempt。
 
 **使用方的约束（正确性依赖这些假设）**：
 - Runner 与 `enumerate` 必须确定性（同样输入、同样输出，同样的 chunk 切分）。
@@ -338,7 +340,7 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 - Runner 输出必须按 `chunkKey` 分组；同一个 key 在分组结束后再次出现会抛 `PipelinerException`（output of port X is not grouped by chunkKey）。
 - Sink 的 key 必须唯一（MySQL `upsertKeys`、ClickHouse 排序键）。
 - ClickHouse 凡是参与产出结果的读取都要加 `FINAL`（`useFinal()`）。
-- 外部系统对 batch id 幂等。
+- 外部系统对全局唯一的 batch id（`<roundId>:<chunkId>@<attempt>`）幂等。
 
 ## 数据保留
 
@@ -398,7 +400,7 @@ curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
 
 ## 验证结果（v1）
 
-- 189 个单元 / 集成测试通过。
+- 222 个单元 / 集成测试通过。
 - e2e：R2 期间 kill -9 一个 worker 和 leader，在 Redis（默认）与 MySQL（`STORE_PROFILE=mysql-store`）两种控制面上均通过，checksum 一致（600 个 material 时 BIG 19200 行 / FINE 28800 行）。
 - 全集群 kill -9 后重启，续跑到相同 checksum（`restart-resume.sh`，默认 Redis 控制面）。
 - 背压：通道长度被限制在高水位（默认 64；设为 6/3 时为 6）；core-grade 自动扩容 2→4；观察到上游 BUSY 等待。

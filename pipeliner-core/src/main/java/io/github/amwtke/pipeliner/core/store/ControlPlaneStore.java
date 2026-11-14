@@ -29,6 +29,12 @@ public interface ControlPlaneStore {
     /** Sets round.masterEpoch = epoch iff stored &lt;= epoch. False if a higher epoch holds the round (or it is missing). */
     boolean fenceRound(String roundId, long epoch);
 
+    /**
+     * Highest master epoch ever stored on any round (0 if none). Used as the floor for a new master epoch, so epochs stay above the
+     * stored round epochs even after the data plane's epoch counter was lost (Redis wiped).
+     */
+    long maxMasterEpoch();
+
     /** Status in CREATED, RUNNING, PAUSED. */
     List<String> findActiveRounds();
 

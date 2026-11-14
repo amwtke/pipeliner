@@ -40,6 +40,7 @@ public class RedisDataPlane implements DataPlane {
     private final Script deadS = new Script("dead_letter");
     private final Script requeueS = new Script("requeue_dlq");
     private final Script fenceS = new Script("fence");
+    private final Script epochS = new Script("next_epoch");
     private final Script fencedCmdS = new Script("fenced_cmd");
     private final Script ensureGroupS = new Script("ensure_group");
     private final Script clearDlqS = new Script("clear_dlq");
@@ -142,7 +143,9 @@ public class RedisDataPlane implements DataPlane {
 
     @Override public String currentLeader() { return cmd.get(Keys.leader()); }
 
-    @Override public long nextEpoch() { return cmd.incr(Keys.epoch()); }
+    @Override public long nextEpoch() { return nextEpoch(0); }
+
+    @Override public long nextEpoch(long floor) { return epochS.run(new String[] {Keys.epoch()}, String.valueOf(floor)); }
 
     @Override public long currentEpoch() {
         String v = cmd.get(Keys.epoch());

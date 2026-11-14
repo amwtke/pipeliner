@@ -10,7 +10,14 @@ public final class ChunkIds {
         return parentChunkId + ">" + edgeOrdinal + "." + seq;
     }
 
-    /** Idempotency id for external systems: the chunk id scoped by the run attempt. */
+    /**
+     * Globally unique idempotency id for external systems: {@code <roundId>:<chunkId>@<attempt>}. Chunk ids are re-derived identically
+     * in every round, so the round id is part of the id; the attempt suffix is what {@code Gates.externalCountOf} matches.
+     */
+    public static String batchId(String roundId, String chunkId, int attempt) { return roundId + ":" + chunkId + "@" + attempt; }
+
+    /** @deprecated not unique across rounds (chunk ids repeat every round); use {@link #batchId(String, String, int)}. */
+    @Deprecated
     public static String batchId(String chunkId, int attempt) { return chunkId + "@" + attempt; }
 
     /** Chunk id passed to Sink.write. */

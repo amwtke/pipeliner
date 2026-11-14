@@ -91,6 +91,12 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         return true;
     }
 
+    @Override public synchronized long maxMasterEpoch() {
+        long m = 0;
+        for (RoundRecord r : rounds.values()) m = Math.max(m, r.getMasterEpoch());
+        return m;
+    }
+
     /** Round-level fence: a write is allowed only if round.masterEpoch &lt;= epoch. */
     private boolean fenced(String roundId, long epoch) { return rounds.get(roundId).getMasterEpoch() > epoch; }
 

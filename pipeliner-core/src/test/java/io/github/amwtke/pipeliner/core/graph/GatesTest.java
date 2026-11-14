@@ -42,6 +42,16 @@ class GatesTest {
         assertEquals(GateDecision.WAIT, Gates.externalCountOf("p").getCondition().evaluate(ctx(tricky, 1, 2)));
     }
 
+    @Test void roundScopedBatchIdsCount() throws Exception {
+        Map<String, String> sig = new LinkedHashMap<>();
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0000", 2), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0001", 2), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0002", 1), "x");   // older attempt
+        assertEquals(GateDecision.WAIT, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 3, 2)));
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0002", 2), "x");
+        assertEquals(GateDecision.OPEN, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 3, 2)));
+    }
+
     @Test void unscopedSignalKeysStillCount() throws Exception {
         Map<String, String> sig = new LinkedHashMap<>();
         sig.put("legacy-key", "x");

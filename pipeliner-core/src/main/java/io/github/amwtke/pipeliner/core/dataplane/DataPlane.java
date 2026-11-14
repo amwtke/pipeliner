@@ -22,7 +22,10 @@ public interface DataPlane extends AutoCloseable {
     /** Deletes only if ours. */
     void releaseLeadership(String podId);
     String currentLeader();
-    long nextEpoch();
+    /** Same as {@code nextEpoch(0)}. */
+    default long nextEpoch() { return nextEpoch(0); }
+    /** Atomically raises the epoch counter to at least {@code floor}, then increments it: the result is always &gt; floor. */
+    long nextEpoch(long floor);
     long currentEpoch();
 
     // rounds and desired state

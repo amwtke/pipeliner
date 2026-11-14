@@ -329,11 +329,19 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "if not cur then return 0 end\n"
             + "if tonumber(cur)>tonumber(ARGV[1]) then return 0 end\n"
             + "redis.call('HSET',KEYS[1],'epoch',ARGV[1])\n"
+            + "local mx=tonumber(redis.call('GET','pg:store:maxepoch') or '0')\n"
+            + "if tonumber(ARGV[1])>mx then redis.call('SET','pg:store:maxepoch',ARGV[1]) end\n"
             + "return 1\n";
 
     @Override
     public boolean fenceRound(String roundId, long epoch) {
         return evalLong(FENCE, new String[]{k(roundId, "round")}, java.util.Collections.singletonList(String.valueOf(epoch))) == 1;
+    }
+
+    @Override
+    public long maxMasterEpoch() {
+        String v = r().get("pg:store:maxepoch");
+        return v == null ? 0L : Long.parseLong(v);
     }
 
     // ---------------------------------------------------------------- rounds

@@ -1,8 +1,16 @@
 # PipelineGraph：流式计算框架设计
 
-适用：Java 8、Spring Boot 2.6.15、Redis ≥ 6.2（Streams、`XAUTOCLAIM`）、MySQL 8、ClickHouse。
+适用：Java 8（字节码目标）、Spring Boot 2.7.18、Redis ≥ 6.2（Streams、`XAUTOCLAIM`，仅单机，不支持 Redis Cluster）、MySQL 8、ClickHouse。
 
-本文是设计稿，对应《售后预测计划净需求计算模型（参考版）》的 7 个阶段、52 个步骤。文中的 Java 接口、Lua 脚本、DDL 都是说明设计用的骨架，没有编译或联调过。
+对应《售后预测计划净需求计算模型（参考版）》的 7 个阶段、52 个步骤。
+
+## 版本说明
+
+本文描述的是**已实现的 v1**，已按代码修订；运维、配置、接口清单以 [README](../README.md) 为准，这里只讲设计。阅读时注意：
+
+- 文中的 Java 接口、Lua 脚本、DDL 是说明设计用的骨架，名字和签名与代码不完全一致（例如 puller / pusher 在代码里是 `SplitSource` / 上游通道 与 `Sink` / 输出口；实际 Builder 与 YAML 语法见 README「定义一个图」）。
+- 没有实现的内容标为"未来工作"：`KafkaPuller`、`HttpPusher`、按 chunk 批量拉取（`pullBatch`）、ClickHouse 最小批量写入。
+- 与原始设计稿相比，v1 在正确性上做了加强，集中在 8.1（epoch 与 fencing）、10.2（journal 位点）、11.1（版本化写入与外部批次号）、11.3（原子重跑）。
 
 ## 1. 先记住这八句话
 
@@ -29,7 +37,7 @@ flowchart LR
         W2[Slave pod 2]
         R[(Redis Streams<br/>数据通道 / split 队列 / journal)]
     end
-    SRC[(MySQL / ClickHouse / Kafka)]
+    SRC[(MySQL / ClickHouse)]
     SNK[(MySQL / ClickHouse)]
     M -->|期望状态、split| R
     R -->|journal 事件| M
@@ -63,12 +71,12 @@ Redis 是硬依赖，因为分布式通道、split 队列、提交事件都在 R
 
 | 层 | 示例 | 生成方式 |
 | --- | --- | --- |
-| roundId | `net-demand-20261113-01` | 提交时生成；`(graph, bizKey)` 唯一，同一计划版本重复提交返回已有 round |
+| roundId | `net-demand-20261113-01` | 提交时生成；`(graph, bizKey)` 唯一（Redis 与 MySQL 两种控制面都保证），同一计划版本重复提交返回已有 round；round 被保留任务删除后才能用同一 bizKey 重新提交 |
 | runId | `R3` | `plan()` 按拓扑顺序编号 |
 | pipelineId | `big-net` | 用户在图里起的名字，图内唯一 |
-| chunkId | `S0012.0` | 源 chunk 是 split 编号 `S0012`；下游 chunk 是"上游 chunkId + 输出序号" |
+| chunkId | `S0012`、`S0012>2.0` | 源 chunk 是 split 编号 `S0012`；下游 chunk 是"上游 chunkId + `>` + 边序号 + `.` + 输出序号" |
 
-chunkId 由血缘推出，所以同一个输入重放时，产出的 chunkId 不变。这一点是幂等写库的基础。
+chunkId 由血缘推出，所以同一个输入重放时，产出的 chunkId 不变。这一点是幂等写库的基础。注意同一个图的每个 round 会推出**相同**的 chunkId，所以 chunkId 只在 round 内唯一；给外部系统的批次号必须再带上 roundId（见 11.1）。
 
 ## 4. Pipeline 模型
 
@@ -78,13 +86,13 @@ chunkId 由血缘推出，所以同一个输入重放时，产出的 chunkId 不
 | --- | --- | --- |
 | Puller | `SplitPuller`（MySQL / ClickHouse） | master 把表切成 split 放进 split 队列，slave 领一个 split，按范围读库 |
 | | `StreamPuller` | 用消费组读上游通道，一条 Stream 记录是一个 chunk |
-| | `KafkaPuller` | round 开始时锁定每个分区的起止 offset，一段 offset 区间是一个 split |
+| | `KafkaPuller` | **未来工作，v1 未实现。** 设想：round 开始时锁定每个分区的起止 offset，一段 offset 区间是一个 split |
 | Runner | `RowRunner` | 逐行处理：映射、过滤、展开 |
 | | `BatchRunner` | 整个 chunk 一起处理：批量查库、滚动净算、组装调用入参 |
 | Pusher | `StreamPusher` | 把结果切成 chunk 写入下游通道 |
 | | `TablePusher` | 幂等写 MySQL 或 ClickHouse |
-| | `HttpPusher` | 调外部接口，批次号用 chunkId |
-| | `Route` / `Tee` | 按条件分流到多个输出口；同一份结果写多个去向 |
+| | `HttpPusher` | **未来工作，v1 未实现。** 调外部接口需自己实现 `Sink`（示例的 `FakeAlgoSink`），批次号用 `<roundId>:<chunkId>@<attempt>`（见 11.1） |
+| | `Route` / `Tee` | 在 v1 里是 runner 的命名输出口（`ports`），每个输出口可挂多个 sink 或一条流边 |
 
 非流式的库通过 `SplitPuller` + `StreamPusher` 流化：读出来的行攒成 chunk 写进 Redis Stream，下游用 `StreamPuller` 接着处理。
 
@@ -139,32 +147,34 @@ public interface Pusher<O> extends AutoCloseable {
 
 ```text
 loop:
-    等本地额度            // 在处理中的 chunk 数低于上限才继续，上限见 7.1
+    等本地额度            // 在处理中的 chunk 数低于上限才继续，上限见 9.1
     chunk = puller.pull()  // XREADGROUP，或用 XAUTOCLAIM 接手别人超时的 chunk
-    outs  = runner.run(chunk)
-    外部 pusher 写库       // 幂等，先于提交
+    outs  = runner.run(chunk)   // 输出按 chunkKey 分组后切成 chunk
+    外部 pusher 写库       // 幂等（版本化写入，见 11.1），先于提交
     r = commit.lua(...)    // 原子：确认输入 + 写下游通道 + 写 journal
     r == BUSY     → 下游积压，保持 chunk 不放，退避后重试提交，期间续租
     r == CONFLICT → 这个 chunk 已被别人提交，丢弃本次结果
 ```
 
-处理时间长的 chunk，slave 每 20 秒执行一次 `XCLAIM ... JUSTID` 续租；超过 60 秒没有续租的 chunk 会被其他 slave 接手。投递次数超过上限的 chunk 转入死信流，状态记为 `DEAD`。
+处理时间长的 chunk，slave 每 20 秒执行一次 `XCLAIM ... JUSTID` 续租；超过 60 秒没有续租的 chunk 会被其他 slave 接手。投递次数超过上限（默认 5）的 chunk 直接转入死信流，不再处理，状态记为 `DEAD`。线程按 `(round, pipeline, run attempt)` 管理（见 8.4），attempt 变化后旧线程做完当前 chunk 即退出。
 
 ### 4.4 chunk 对业务键封闭
 
 净需求计算的粒度是料号 × 节点 × 月，逐月滚动（步骤 21）和全网平衡（步骤 22）都要求一个料号的全部节点、全部月份同时在场。框架的约定是：**一个替代组的所有行必须落在同一个 chunk 里**。
 
-- 源头切 split 时按替代组的键范围或哈希桶切，chunk 边界对齐到键边界，不在一个组中间断开。
+- 源头切 split 时按替代组的键范围或哈希桶切，由 `SplitSource` 保证同键同 split。
+- 流 pipeline 的输出口按 `chunkKey` 切 chunk：先按 `chunkRows` / `chunkBytes` 切，但 chunk 边界只落在 key 组之间，**一个 key 组永远不会被切开**；超过上限的大组整组保留成一个 chunk，不拆。切分是确定的，重放得到同样的 chunk。
+- runner 的输出必须按 `chunkKey` 分组。同一个 key 在组结束后再次出现，框架抛 `PipelinerException`（output is not grouped by chunkKey），而不是悄悄切开。
 - runner 需要的其他数据（库存、在途、安全库存）用 `ctx.lookup()` 按本 chunk 的料号批量查快照表，不做流与流的 join。
 - 逐 chunk 处理不会打散分组，所以封闭性沿着流一路保持。
 
 跨料号的计算不满足封闭性，例如翻新产能是所有料号共用的（步骤 28）。这类步骤的做法见第 6 节的"物化边"。
 
-"攒批"有两种写法，都不破坏上面的约定：源 pipeline 把一个 split 读出的行按行数或字节数切成多个 chunk；流 pipeline 把 `pullBatch` 设为 N，一次拉 N 个 chunk 合并处理、一起提交。
+"攒批"在 v1 里只有一种写法：源 pipeline 把一个 split 读出的行按行数或字节数切成多个 chunk（仍然遵守 `chunkKey` 不拆组）。流 pipeline 一次只拉一个 chunk；"一次拉 N 个 chunk 合并处理"（`pullBatch`）**未实现，列为未来工作**。
 
 ## 5. 输入数据流图与 Builder
 
-图可以用 YAML 描述，也可以直接用 Java 构建。YAML 里的 `bean` 指向 Spring 容器中的 runner。
+图可以用 YAML 描述，也可以直接用 Java 构建。下面的 YAML 和 Java 是设计稿的写法，用来说明概念；v1 的实际语法（`source` / `runner` / `sinks`、`chunkKey`、类型形式的 runner）见 README「定义一个图」。
 
 ```yaml
 graph: net-demand
@@ -278,15 +288,31 @@ public interface GateCondition {
 
 外部信号先写进控制面再判定，判定是按当前状态算的，不是按事件触发的，所以信号早到、重复到、master 当时不在线都不影响结果。
 
-每个闸门有超时策略：`FAIL`（round 失败）、`OPEN_WITH_FALLBACK`（放行并在上下文里打标，下游走兜底逻辑）、`ALERT_AND_WAIT`（告警后继续等）。
+每个闸门有超时策略：`FAIL`（闸门置 `TIMEOUT`）、`OPEN_WITH_FALLBACK`（放行并在闸门上下文里打 `fallback` 标，下游 runner 通过 `RunContext.gateFallback(gateId)` 读到它，走兜底逻辑）、`ALERT_AND_WAIT`（告警后继续等）。
+
+条件返回 `REJECT`、或超时策略为 `FAIL` 时，闸门置 `REJECTED` / `TIMEOUT`，它的 before-runs 立即置为失败；之后没有能启动的 run 时 round 失败。条件函数抛异常按 `WAIT` 处理。
+
+`external` 闸门的信号按 round + gate 存储，键是外部批次号。`Gates.externalCountOf(pipelineId)` 只统计无 `@` 的键，或以 `@<上游 run 当前 attempt>` 结尾的键，所以重跑之前的旧 attempt 的回调不会放行闸门；重跑时闸门连同它的信号一起被清掉（见 11.3）。
 
 ## 8. 多 pod 执行：master 与 slave
 
 ### 8.1 选主
 
-所有 pod 启动后都尝试 `SET pg:leader <podId> NX PX 15000`，成功者成为 master，每 5 秒续期。当选时执行 `INCR pg:epoch` 取得一个只增不减的任期号，master 对控制面的每次写入都带任期号做条件更新，旧 master 恢复后写不进去。选主做成 `LeaderElector` 接口，控制面选 MySQL 时也可以换成 MySQL 租约行实现。
+所有 pod 启动后都尝试 `SET pg:leader <podId> NX PX 15000`，成功者成为 master，每个心跳周期续期。每次（重新）获得 leadership，或发现全局 epoch 已被别人推进时，master 取新的任期号：`plane.nextEpoch(store.maxMasterEpoch())`。
 
-master 所在的 pod 默认同时承担 slave 的工作，可以用配置关掉。
+**epoch 下限**。数据面用 Lua 原子地执行"若 `pg:epoch` 小于下限则置为下限，再 `INCR`"，所以新 epoch 一定大于控制面里已记录的最大 round epoch。控制面存储提供 `maxMasterEpoch()`（MySQL：`MAX(master_epoch)`，有索引；Redis：`fenceRound` 里同步维护的 `pg:store:maxepoch`）。这是为了 Redis 数据丢失（MySQL 控制面支持的恢复场景）：`pg:epoch` 从 1 重新计数，而存储里的 round epoch 更高，所有 `fenceRound` 都会被拒绝，master 一直退位、所有活跃 round 停摆。有下限之后新 master 的 epoch 总是高于存储里的值。
+
+**round 级 fencing**。master 对每个 round 的 tick 先执行 `store.fenceRound(roundId, epoch)`（MySQL：`UPDATE ... SET master_epoch=? WHERE master_epoch<=?`；Redis：Lua），再执行 `plane.fenceRound(roundId, epoch)`（`pg:{r}:fence`，只增不减），任一返回 false 即退位。此后：
+
+- 控制面的每次 master 写入都带 epoch，并在同一个事务 / 脚本里校验 round 的 epoch 不高于它（MySQL 用对 round 行的共享锁，与 `fenceRound` 串行）。
+- 数据面的每次 master 写入（期望并行度、本地 run 分配、入队 split、删 key、trim journal、paused 标志、requeue / clear 死信、建消费组、移出活跃集合）都在 Lua 里先校验 fence 不高于 epoch，否则抛 `StaleEpochException` 且不产生任何变更。所以冻结后恢复的旧 master 什么也改不了。
+- 管理命令在 master tick 内用同一 epoch 执行。slave 的 commit / deadLetter 不需要 fence，`XACK` 守卫保证只有持有 pending 的一方能提交。
+
+选主做成接口，控制面选 MySQL 时也可以换成 MySQL 租约行实现（v1 未做，租约在 Redis）。master 所在的 pod 默认同时承担 slave 的工作，可以用配置关掉。
+
+### 8.1.1 外部触发 master 推进
+
+master 的一次推进是显式、幂等的 `engine.tick()`（续租 / 抢主、执行管理命令、推进活跃 round、保留清理、内存限流）。默认由每个 pod 内部线程按 tick 周期调用；也可以配置为 `external`，由 xxl-job 之类的外部调度器触发（或 `POST /pg/master/tick`），此时不起 master 线程，leader 语义（租约、epoch、fencing）不变，非 leader 的 tick 返回 `skipped`。worker 心跳始终是本地线程。细节见 README。
 
 ### 8.2 master 的推进循环
 
@@ -294,17 +320,20 @@ master 每秒跑一遍下面的循环。每一步都是"读当前状态，条件
 
 ```text
 for round in 运行中的 round:
-    消费 journal，把 chunk 事件批量归并进控制面存储
+    fenceRound（控制面 + 数据面），失败即退位
+    执行管理命令队列里的命令（暂停、重跑、放行……）
+    消费 journal，把 chunk 事件连同位点批量归并进控制面存储，然后 trim journal
     对每个 CLOSED 的闸门：上游条件满足 → OPEN
     对每个 PENDING 的 run：入闸全部 OPEN → 建通道和消费组、枚举 split、发布期望状态 → RUNNING
-    对每个 RUNNING 的 pipeline：上游全部成功（或枚举完成）且输入流 XLEN = 0 → SUCCEEDED
+    对每个 RUNNING 的 CLUSTER pipeline：见下面的完成判定 → SUCCEEDED / FAILED
     对每个 RUNNING 的 run：pipeline 全部成功且行数对账通过 → SUCCEEDED，清理通道
-    采样背压指标，检查 slave 心跳
+    采样背压指标，检查 slave 心跳；周期性执行保留清理
 ```
 
 两个细节：
 
-- **完成判定只看 XLEN**。提交脚本在确认输入的同时把它从流里删掉，所以输入流的长度就等于"未投递 + 处理中"的 chunk 数，长度为 0 且不会再有新数据进来，就是处理完了。不需要在流里塞结束标记。
+- **CLUSTER pipeline 的完成判定**。提交脚本在确认输入的同时把它从流里删掉，所以输入流的长度就等于"未投递 + 处理中"的 chunk 数，不需要结束标记。pipeline 完成要同时满足：上游全部成功（源 pipeline 则是 split 已全部入队）、输入流 `XLEN = 0`；然后先把 journal 完整归并一遍，再判定。对源 pipeline 还要求**每个 split 的 chunk 记录都已离开 `PENDING`**（DONE，或 DEAD / SKIPPED）：只看队列为空不够，队列空时可能还有 split 处于投递途中。最后看 `DEAD` 记录数决定 `SUCCEEDED` 还是 `FAILED`。
+- **`INLINE` / `LOCAL` run 不靠 XLEN**。这两种 run 没有 Redis 通道，被指派的 pod 执行完后向 journal 写 `LOCAL_RUN_DONE`（或 `LOCAL_RUN_FAILED`）事件，事件带 run 的 attempt；master 归并时只接受 attempt 与当前 run 一致、且 run 仍为 `RUNNING` 的事件，其余丢弃（僵尸执行者、被重跑作废的旧 attempt）。收到 DONE 后 pipeline 置成功，run 的收尾与 CLUSTER 一样要过行数对账。
 - **行数对账**。每条流边上，上游提交事件里的输出行数之和必须等于下游提交事件里的输入行数之和。对不上时 run 置为失败并告警。
 
 ### 8.3 slave 与 puller 分压
@@ -315,19 +344,27 @@ master 把"哪些 pipeline 处于运行中、各自的并行度"写成期望状�
 
 slave 每 5 秒上报心跳。某个 pod 挂掉后，它名下没提交的 chunk 超过 60 秒无人续租，被其他 slave 用 `XAUTOCLAIM` 接手。
 
+### 8.4 run attempt 与 attempt 作用域的 key
+
+`RunRecord.attempt` 是 run 的"代"。重跑（见 11.3）让 attempt 加 1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态写成 `并行度|attempt`。slave 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例，attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例；journal 事件带 `runAttempt`，与当前 attempt 不符的事件被 master 丢弃。数据面清理由 master 幂等重放：启动第 n 次 attempt 前先（带 fence）删除该 run 所有小于 n 的 key；run 成功后删除当前 attempt 的 key。
+
+### 8.5 管理操作走 leader 命令队列
+
+pause / resume / cancel / retry / rerun / skip / openGate 不由接收请求的 pod 直接执行，而是写入命令队列，由 leader 在 tick 里用自己的 epoch 取出执行并回写结果，请求方等待结果（`admin-timeout-millis`）。这样所有对控制面的变更都出自持有 fence 的 master。命令被取出后、执行前 leader 宕机会丢命令，客户端超时后重试即可。管理接口受 token 认证保护（`ADMIN` 可变更，`VIEWER` 只读，变更写审计日志），每个 pod 还提供静态的 Web UI（`/pg-ui/`）展示拓扑与 round 状态。细节见 README。
+
 ## 9. 背压
 
 puller 是主动拉取的，没拉走的数据留在 Redis 里，所以单看 puller 自身不会被撑爆。真正的风险有两处：slave 进程里同时持有的 chunk 太多；Redis 里的通道积压无限增长。背压分三层处理。
 
 ### 9.1 进程内：额度
 
-每个 pipeline 线程同一时刻只持有 `pullBatch` 个输入 chunk，上一批提交之前不拉下一批。单 pod 的内存上限可以直接算出来：
+每个 pipeline 线程同一时刻只持有一个输入 chunk（v1 没有 `pullBatch`），上一个提交之前不拉下一个。单 pod 的内存上限可以直接算出来：
 
 ```text
-内存上限 ≈ Σ(各 pipeline 线程数 × pullBatch × maxChunkBytes × 反序列化膨胀系数)
+内存上限 ≈ Σ(各 pipeline 线程数 × maxChunkBytes × 反序列化膨胀系数)
 ```
 
-`StreamPusher` 切 chunk 时同时受行数和字节数两个上限约束（默认 5000 行、1 MB），所以 `maxChunkBytes` 是有保证的。
+输出切 chunk 时同时受行数和字节数两个上限约束（`chunkRows` / `chunkBytes`），但 `chunkKey` 不拆组：遇到超大的 key 组，chunk 会超过上限，内存上限要按最大 key 组估算。
 
 ### 9.2 通道：高低水位
 
@@ -358,7 +395,7 @@ return 1
 
 高水位是软上限：一个输入 chunk 展开出多个输出 chunk 时，单次提交可能超出一点，超出量不超过一次提交的输出数。
 
-写库的 pusher 是同步调用，库慢了线程自然阻塞，效果相同。ClickHouse 的 pusher 另外限制最小批量，避免产生过多小分片。
+写库的 sink 是同步调用，库慢了线程自然阻塞，效果相同。ClickHouse 的最小批量写入（避免产生过多小分片）**未实现，列为未来工作**；目前每个 chunk 一次写入。
 
 ### 9.3 全局：master 监测
 
@@ -368,7 +405,7 @@ master 每秒采样各通道的长度、流入流出速率、最老 chunk 的等
 | --- | --- | --- |
 | 某 pipeline 输入通道满、输出通道不满 | 它是瓶颈 | 在并行度上限内调高它的期望并行度，slave 自动加线程 |
 | 某 pipeline 长时间处于 `BUSY` | 它被下游拖住 | 只记录指标，不处理，根因在瓶颈处 |
-| Redis `used_memory` 超过阈值 | 全局风险 | 置全局限流标志，所有源 puller 暂停，告警 |
+| Redis `used_memory` 超过阈值 | 全局风险 | 置全局限流标志（带 TTL，超限期间每 tick 续期，所以退位的 master 留不下残留标志），所有源 puller 暂停，告警 |
 | 某 chunk 等待时间超过阈值 | 卡死或毒数据 | 告警，附 chunkId 和持有它的 pod |
 
 ## 10. 控制面
@@ -383,7 +420,7 @@ master 每秒采样各通道的长度、流入流出速率、最老 chunk 的等
 | chunk | `PENDING → RUNNING → DONE / DEAD` | slave 产生事件，master 归并 |
 | gate | `CLOSED → OPEN / REJECTED / TIMEOUT` | master |
 
-失败向上传播：chunk 进死信，所属 pipeline 失败，所属 run 失败，round 失败。与失败 run 无依赖关系的其他 run 会跑完，不会被中断。
+失败向上传播：chunk 进死信，所属 pipeline 失败，所属 run 失败，round 失败。与失败 run 无依赖关系的其他 run 会跑完，不会被中断。闸门 `REJECTED` / `TIMEOUT` 同样让它的 before-runs 失败。
 
 ### 10.2 提交事实与控制面存储的关系
 
@@ -392,18 +429,23 @@ chunk 的提交必须和"确认输入、写下游"是同一个原子操作，而
 1. slave 在 `commit.lua` 里把提交事件写进 `journal` 流。这一步和数据提交是原子的，是事实的唯一来源。
 2. master 消费 `journal`，把事件批量、幂等地写进 `ControlPlaneStore`。存储里的 chunk 状态是 journal 的投影，会晚几百毫秒。
 
-这样两种存储的实现都很薄，slave 不直接写 MySQL，MySQL 的写入量由 master 攒批控制。master 判定 pipeline 完成时，除了输入流为空，还要求 journal 已经消费到末尾。
+**journal 位点存在控制面存储里，不用 Redis 消费组**：master 每读一批，就用 `applyChunkEvents(roundId, events, journalOffset, epoch)` 把这批事件的效果和新的位点（`RoundRecord.journalOffset`）在同一个事务 / Lua 里写入，并带 round 级 fence。所以"事件已应用"和"位点已前进"不会分离：master 在两者之间崩溃或被 fence，新 master 从存储里的位点继续，既不丢也不重复应用。应用成功后 master 再（带 fence）`trimJournal` 删掉已处理的部分，round 成功收尾时整条 journal 被删除，Redis 里的 journal 因此不会无限增长。位点落后只会让 trim 晚一些，不影响正确性。
+
+这样两种存储的实现都很薄，slave 不直接写 MySQL，MySQL 的写入量由 master 攒批控制。master 判定 pipeline 完成时，除了输入流为空，还要求 journal 已经消费到末尾（见 8.2）。
 
 ```java
 public interface ControlPlaneStore {
     void createRound(RoundRecord round, List<RunRecord> runs,
                      List<GateRecord> gates, List<PipelineRecord> pipelines);
-    boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, long epoch);
-    boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, long epoch);
-    boolean casPipelineStatus(String roundId, String pipelineId, PipelineStatus expect, PipelineStatus target, long epoch);
-    boolean casGateStatus(String roundId, String gateId, GateStatus expect, GateStatus target, long epoch);
+    boolean fenceRound(String roundId, long epoch);        // master_epoch <= epoch 才成功
+    long maxMasterEpoch();                                 // 新 epoch 的下限
+    boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch);
+    boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch);
+    boolean casPipelineStatus(String roundId, String pipelineId, PipelineStatus expect, PipelineStatus target, String error, long epoch);
+    boolean casGateStatus(String roundId, String gateId, GateStatus expect, GateStatus target, String openedBy, Map<String, String> context, long epoch);
     void saveGateSignal(String roundId, String gateId, String signalKey, String payload);
-    void applyChunkEvents(String roundId, List<ChunkEvent> events, long epoch);   // 批量、幂等
+    void applyChunkEvents(String roundId, List<ChunkEvent> events, String journalOffset, long epoch);   // 批量、幂等，位点同事务
+    void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch);          // 原子重跑复位
     RoundView loadRound(String roundId);                                          // 四层树，恢复和监控共用
     List<String> findActiveRounds();
     List<ChunkRecord> queryChunks(ChunkQuery query);
@@ -418,7 +460,7 @@ public interface ControlPlaneStore {
 | 历史查询 | SQL 任意查，可长期保留 | 只能按 key 查，round 结束后按 TTL 过期 |
 | 条件更新 | `UPDATE ... WHERE status = ? AND master_epoch <= ?` | Lua 脚本内比较后写入 |
 | 额外依赖 | 多一个 MySQL | 无 |
-| Redis 数据全丢时 | 还能知道哪些 run 已经成功，从未完成的 run 重跑 | 控制面一起丢，只能整轮重跑 |
+| Redis 数据全丢时 | round / run / gate 状态与已归并的 chunk 记录还在，已成功的 run 不动；master 重新登记活跃 round。epoch 计数器丢失由 epoch 下限兜底（8.1）。v1 不自动检测通道数据的丢失，未完成的 run 用 `rerunFrom` 重跑 | 控制面一起丢，只能整轮重跑 |
 
 ### 10.4 MySQL 表结构
 
@@ -432,10 +474,13 @@ CREATE TABLE pg_round (
   params_json   TEXT,
   status        VARCHAR(16)  NOT NULL,
   master_epoch  BIGINT       NOT NULL,
+  journal_offset VARCHAR(64) NOT NULL DEFAULT '0-0',  -- journal 位点，与 chunk 事件同事务写入
+  seq           BIGINT       NOT NULL DEFAULT 0,      -- 全局单调的提交序号，版本化写入用（11.1）
   created_at    DATETIME(3)  NOT NULL,
   started_at    DATETIME(3),
   finished_at   DATETIME(3),
-  UNIQUE KEY uk_biz (graph_name, biz_key)
+  UNIQUE KEY uk_biz (graph_name, biz_key),
+  KEY idx_master_epoch (master_epoch)                 -- MAX(master_epoch) 走索引
 );
 
 CREATE TABLE pg_run (
@@ -511,23 +556,25 @@ CREATE TABLE pg_chunk (
 );
 ```
 
-`pg_chunk` 是写入量最大的表，一轮可能有几十万行。master 每 200 毫秒或每 500 条事件写一批，round 结束 N 天后按 `round_id` 清理。
+`pg_chunk` 是写入量最大的表，一轮可能有几十万行。master 攒批写入（单批事件数有上限）。保留策略见 10.6。上面的 DDL 是简化后的示意，实际表还有 `compacted`、汇总列和若干索引，以 `MySqlControlPlaneStore.init()` 为准。
 
 ### 10.5 Redis key 布局
 
-所有 key 用 `{roundId}` 做哈希标签，保证一个 round 落在 Redis Cluster 的同一个槽上，`commit.lua` 才能跨多条流原子执行。代价是一个 round 的全部流量压在一个分片上，不同 round 可以分散到不同分片。
+key 用 `{roundId}` 做哈希标签，让同一个 round 的 key 在命名上聚在一起；但 **v1 不支持 Redis Cluster，只支持单机 Redis**：Lua 脚本里访问了没有在 `KEYS` 里声明的 key（全局 key、跨 round 的索引），在 Cluster 下会失败。
 
 ```text
 pg:leader                              STRING  当前 master 的 podId
-pg:epoch                               STRING  任期号
+pg:epoch                               STRING  任期号（nextEpoch 带下限，见 8.1）
+pg:roundseq                            STRING  全局单调的 round 提交序号
 pg:workers                             ZSET    podId → 最近心跳时间
 pg:rounds:active                       SET     运行中的 roundId
-pg:{<roundId>}:desired                 HASH    pipelineId → 期望并行度（master 写，slave 读）
-pg:{<roundId>}:ch:<edgeId>             STREAM  数据通道
-pg:{<roundId>}:split:<pipelineId>      STREAM  源 pipeline 的 split 队列
-pg:{<roundId>}:splitidx:<pipelineId>   SET     已入队的 splitId，保证枚举幂等
-pg:{<roundId>}:dlq:<pipelineId>        STREAM  死信
-pg:{<roundId>}:journal                 STREAM  chunk 提交事件
+pg:{<roundId>}:fence                   STRING  数据面 round 级 fence，只增不减
+pg:{<roundId>}:desired                 HASH    pipelineId → 并行度|attempt（master 写，slave 读）
+pg:{<roundId>}:ch:<edgeId>:<attempt>   STREAM  数据通道
+pg:{<roundId>}:split:<pipelineId>:<attempt>     STREAM  源 pipeline 的 split 队列
+pg:{<roundId>}:splitidx:<pipelineId>:<attempt>  SET     已入队的 splitId，保证枚举幂等
+pg:{<roundId>}:dlq:<pipelineId>:<attempt>       STREAM  死信
+pg:{<roundId>}:journal                 STREAM  chunk 提交事件（归并后被 trim，round 成功后删除）
 
 # 以下仅在控制面存储选 Redis 时使用
 pg:{<roundId>}:round                   HASH
@@ -535,7 +582,14 @@ pg:{<roundId>}:run:<runId>             HASH
 pg:{<roundId>}:gate:<gateId>           HASH
 pg:{<roundId>}:pl:<pipelineId>         HASH
 pg:{<roundId>}:chunk:<pipelineId>      HASH    chunkId → 状态 JSON
+pg:store:rounds / biz / active         全局索引：round 列表、(graph,bizKey) → roundId、活跃集合
+pg:store:finished / uncompacted        保留任务用的终态 / 待压缩索引
+pg:store:maxepoch                      STRING  所有 round 的最大 master epoch（8.1 的下限）
 ```
+
+### 10.6 数据保留
+
+控制面数据默认存 Redis，不清理会一直增长。leader 在 master 循环里周期性执行保留任务（有数量与时间预算，不拖长 tick）：终态 round 结束超过 `chunk-days` 后**压缩**（把每个 pipeline 的汇总写到 pipeline 记录上，删除全部 chunk 记录，round 的统计仍可读）；超过 `round-days` 后**整体删除**（round、run、gate、signal、pipeline、chunk、bizKey 索引及数据面残留 key，此后同一个 bizKey 可重新提交）。终态判断与删除是同一个原子步骤，所以与并发的 `rerunFrom` 不会互相踩：重跑把 round 改回 `RUNNING` 后保留任务就不会再动它。参数见 README「数据保留」。
 
 ## 11. 断点续传与一致性
 
@@ -544,15 +598,19 @@ pg:{<roundId>}:chunk:<pipelineId>      HASH    chunkId → 状态 JSON
 - **流到流**：恰好一次。确认输入和写出结果在同一个 Lua 脚本里，要么都发生，要么都不发生。两个 slave 同时处理同一个 chunk 时，`XACK` 的返回值保证只有一个提交成功。
 - **流到外部库**：至少一次投递，加上幂等写入，结果等同于恰好一次。写库发生在提交之前，提交前崩溃会重放这个 chunk，再写一次同样的数据。
 
-幂等写入的做法：
+幂等写入的做法是**版本化写入**。每个 round 提交时拿到全局单调的 `seq`，每次写入带版本 `pg_version = roundSeq * 1000 + attempt`（`attempt` 是 run 的 attempt，见 8.4）。版本越新的数据越能覆盖旧的，所以旧 attempt、旧 round 的僵尸写入（被 fence 的 master 之前派出的 slave、重跑前慢下来的线程）覆盖不了新结果：
 
 | 目标 | 做法 |
 | --- | --- |
-| MySQL | `INSERT ... ON DUPLICATE KEY UPDATE`，唯一键为"计划版本 + 业务键" |
-| ClickHouse | `ReplacingMergeTree` 按"计划版本 + 业务键"去重；或写入 round 专属的临时分区，run 成功时 `REPLACE PARTITION` 一次性换入 |
-| 外部接口 | 批次号用 chunkId，要求对方按批次号幂等 |
+| MySQL | 条件 upsert：`INSERT ... ON DUPLICATE KEY UPDATE c = IF(VALUES(pg_version) >= pg_version, VALUES(c), c)`，版本列放在最后赋值；唯一键为业务键 |
+| ClickHouse | 表声明为 `ReplacingMergeTree(pg_version)`，排序键为业务键；**每一个会影响结果的读取都必须带 `FINAL`**（`useFinal()`），否则可能读到合并前的旧版本行 |
+| 外部接口 | 批次号 `<roundId>:<chunkId>@<attempt>`，要求对方按批次号幂等 |
 
-幂等成立的前提是 runner 对同一个输入 chunk 产出同样的结果。runner 读的是锁定版本的快照，这一点由需求文档里"每个阶段落快照、后一阶段只读快照"保证。
+校验和只覆盖业务列，不含 `pg_version`。
+
+**外部批次号为什么带 roundId**。chunkId 在每个 round 里推出的值相同（`S0003` 每个月都是 `S0003`），如果批次号只是 chunkId，按批次号幂等的外部服务会把下个月的 round 当成重复请求，返回上个月的旧结果。所以批次号是全局唯一的 `<roundId>:<chunkId>@<attempt>`（`ChunkIds.batchId(roundId, chunkId, attempt)`）。末尾的 `@<attempt>` 是 `externalCountOf` 闸门识别当前 attempt 的依据（见 7）；重跑后 attempt 变了，批次号也变，对方会把它当新请求重新计算。
+
+幂等成立的前提是 runner 对同一个输入 chunk 产出同样的结果，且 sink 的 key 唯一。runner 读的是锁定版本的快照，这一点由需求文档里"每个阶段落快照、后一阶段只读快照"保证。
 
 ### 11.2 各种故障怎么恢复
 
@@ -561,12 +619,13 @@ pg:{<roundId>}:chunk:<pipelineId>      HASH    chunkId → 状态 JSON
 | slave 线程异常 | chunk 留在待确认列表，超时后重新投递 | 一个 chunk |
 | slave pod 挂掉 | 其他 slave 用 `XAUTOCLAIM` 接手 | 该 pod 未提交的 chunk |
 | 毒数据反复失败 | 超过重试上限进死信，run 失败；修复后调用 `retry(runId)` 把死信放回通道 | 死信里的 chunk |
-| master 挂掉 | 新 master 当选，从控制面加载运行中的 round，从 journal 的消费位点继续归并 | 无。slave 在此期间照常处理 |
+| master 挂掉 | 新 master 当选（epoch 高于存储里所有 round 的 epoch），从控制面加载运行中的 round，从存储里的 journal 位点继续归并 | 无。slave 在此期间照常处理 |
 | master 在枚举 split 中途挂掉 | 新 master 重新枚举，已入队的 splitId 被跳过 | 无 |
 | 集群整体重启 | 通道和 journal 靠 Redis 持久化保留，控制面在存储里，启动后继续 | 未提交的 chunk |
 | Redis 主从切换，丢失约 1 秒写入 | 通道和 journal 一起回退到同一个时间点，被回退的 chunk 重新处理；收尾时行数对账兜底 | 最后约 1 秒提交的 chunk |
 | Redis 数据全丢（控制面在 MySQL） | 已成功的 run 不动；运行中的 run 整体重置，从它的源快照表重跑 | 未完成的 run |
-| `INLINE` / `LOCAL` 的 run 所在 pod 挂掉 | master 把 run 派给另一个 pod | 见 6.2 的断点粒度 |
+| `INLINE` / `LOCAL` 的 run 所在 pod 挂掉 | master 把 run 派给另一个 pod；这类 run 靠 `LOCAL_RUN_DONE` 事件完成（8.2） | 见 6.2 的断点粒度 |
+| 旧 master 冻结后恢复（僵尸） | round 级 fence 使它对控制面和数据面的写都失败，它退位 | 无 |
 
 run 的边界都是落了表的 dataset，所以 run 是最后的重放单位：只要上游快照表还在，任何一个 run 都可以单独重跑。
 
@@ -576,9 +635,11 @@ run 的边界都是落了表的 dataset，所以 run 是最后的重放单位：
 | --- | --- |
 | `pause(roundId)` / `resume(roundId)` | 暂停后 slave 做完手上的 chunk 就停止拉取；恢复后从通道里剩下的继续 |
 | `retry(runId)` | 失败的 run 把死信放回通道，继续跑 |
-| `rerunFrom(runId)` | 重置该 run 及所有下游 run，清理它们的通道，从该 run 的源头重跑 |
+| `rerunFrom(runId)` | 一次原子的 `store.resetRuns`（MySQL 单事务 / Redis 单个 Lua）：该 run 及所有下游 run、它们的 pipeline、chunk 记录、相关闸门及其 signal 一起复位，run 的 attempt 加 1，round 回到 `RUNNING`；数据面旧 attempt 的 key 由 master 幂等清理 |
 | `skipChunk(chunkId)` | 把死信里的 chunk 标记为跳过，run 可以继续，round 结果打上"不完整"标记 |
 | `openGate(gateId)` | 人工放行 |
+
+以上操作都经 leader 的命令队列执行（8.5）。
 
 ## 12. 监控
 
@@ -594,7 +655,9 @@ run 的边界都是落了表的 dataset，所以 run 是最后的重放单位：
 
 源 pipeline 的进度是"已完成 chunk 数 / split 总数"。流 pipeline 在上游完成之前不知道总量，显示已完成数和当前积压。
 
-管理接口：
+另有停滞 chunk 告警（输入流里最老的待确认条目长时间无人续租 / 接手）。每个 pod 内置 Web UI（`/pg-ui/`），展示拓扑和 round 实时状态。管理接口受 token 认证（`ADMIN` / `VIEWER`），变更写审计日志。完整指标与告警规则见 README。
+
+管理接口（节选）：
 
 ```text
 GET  /pg/rounds/{roundId}                 四层树：run、闸门、pipeline、chunk 汇总
@@ -644,10 +707,12 @@ flowchart TD
 - **步骤 21–22，滚动净算与全网平衡**。只涉及单个替代组的所有节点和月份，满足 chunk 封闭，在 `big-net` 的 `BatchRunner` 里一次算完。库存、在途、安全库存用 `ctx.lookup()` 按本 chunk 的料号批量查。
 - **步骤 28，产能约束**。产能在料号之间按优先级分配，是全局约束。R3 把分级结果落表，R4 的 `cap-alloc` 以翻新点为 split，每个 split 内按月份和优先级有序读出、顺序扣减产能。一个翻新点的数据在一个 split 里，所以这里的 chunk 对"翻新点"封闭。
 - **步骤 42，拆解 BOM 展开**。报废件按大部件料号组织，利旧量按细料料号组织，键变了。不做流内重分区：报废件量在 R4 已经落表，R5 的 `harvest` 以细料料号为驱动，用 `lookup` 让 ClickHouse 按细料聚合"报废件 × 拆解 BOM"。
-- **步骤 10、34，外部调用**。提交和收结果分在闸门两侧。`HttpPusher` 用 chunkId 当批次号，重放不会重复计费或重复计算；闸门按批次号清点回调，收齐才放行。
+- **步骤 10、34，外部调用**。提交和收结果分在闸门两侧。外部调用的 sink（v1 没有内置 `HttpPusher`，示例里是 `FakeAlgoSink`）用 `<roundId>:<chunkId>@<attempt>` 当批次号，重放不会重复计费或重复计算，下个月的 round 也不会与本月撞号；闸门按批次号清点回调（`externalCountOf`），收齐当前 attempt 的才放行。
 - **两条线的两处衔接**（翻新计划量、报废件量）都经过落表的 dataset，不是流边，所以大部件线和细料线之间没有同时运行的耦合。
 
 ## 14. 模块划分与落地顺序
+
+下面是设计稿的模块名和里程碑；v1 的实际模块（`pipeliner-*`）见 README「模块一览」，里程碑 M1–M4 均已完成。
 
 ```text
 pipelinegraph-api             Chunk、Puller、Runner、Pusher、GateCondition、SplitEnumerator
@@ -656,7 +721,7 @@ pipelinegraph-runtime         Master（调度、闸门、枚举、归并、背�
 pipelinegraph-channel-redis   Redis Stream 通道、Lua 脚本
 pipelinegraph-store-mysql     ControlPlaneStore 的 MySQL 实现
 pipelinegraph-store-redis     ControlPlaneStore 的 Redis 实现
-pipelinegraph-connectors      MySQL、ClickHouse、Kafka、HTTP 的 puller 与 pusher
+pipelinegraph-connectors      MySQL、ClickHouse 的 puller 与 pusher（Kafka、HTTP 为未来工作）
 pipelinegraph-admin           管理接口、指标
 pipelinegraph-spring-boot-starter
 ```
@@ -672,10 +737,11 @@ pipelinegraph-spring-boot-starter
 
 以下几条是设计时默认的选择，与实际情况不符时对应章节需要调整。
 
-- 技术栈沿用现有工程的 Java 8 和 Spring Boot 2.6.15。
-- Redis 版本不低于 6.2。使用 Redis Cluster 时接受"一个 round 落在一个分片"。
+- 技术栈沿用现有工程的 Java 8（字节码目标）和 Spring Boot（v1 为 2.7.18）。
+- Redis 版本不低于 6.2，单机部署。**Redis Cluster 不支持**（Lua 脚本访问未在 KEYS 中声明的 key）。
 - 单个 chunk 序列化后不超过约 1 MB，直接放在 Stream 记录里。如果有更大的行，需要把内容放到外部存储，Stream 里只放引用，本文没有展开。
 - 一轮计算的 chunk 数量在百万以内，`pg_chunk` 用单表可以承受。
 - 所有落库的结果表都能按"计划版本 + 业务键"做幂等写。
-- 外部算法服务支持按批次号幂等，并能回调或被轮询。
+- 外部算法服务支持按批次号幂等，并能回调；批次号是全局唯一的 `<roundId>:<chunkId>@<attempt>`。
+- 一个 key 组（`chunkKey` 相同的行）能装进一个 chunk（内存）；超大组不会被拆开。
 - 第 13 节的 run 划分基于参考版模型的步骤描述，各 pipeline 的数据量和模式选择是估计的，要用真实数据量校准。

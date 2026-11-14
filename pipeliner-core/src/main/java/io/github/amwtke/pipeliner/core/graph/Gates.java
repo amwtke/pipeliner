@@ -18,7 +18,7 @@ public final class Gates {
     /** Signals arrive via engine.signalGate. */
     public static GateDef external(GateCondition doneWhen) { return new GateDef(GateType.EXTERNAL, doneWhen); }
 
-    /** Opens when the signals of the current attempt (key without "@" or ending "@attempt", see ChunkIds.batchId) &gt;= doneChunkCount(pipelineId). */
+    /** Opens when the signals of the current attempt (key without "@" or ending "@attempt", e.g. {@code <roundId>:<chunkId>@<attempt>} from ChunkIds.batchId; signals are stored per round and gate) &gt;= doneChunkCount(pipelineId). */
     public static GateDef externalCountOf(String pipelineId) { return new GateDef(GateType.EXTERNAL, new CountOf(pipelineId)); }
 
     public static GateDef externalCount(int expected) { return new GateDef(GateType.EXTERNAL, new Count(expected)); }
