@@ -509,16 +509,132 @@ class RedisDataPlaneTest {
         assertEquals(0, dp.pruneWorkers(600_000));
     }
 
+    /** Creates the round's data through the dataplane (so the key registry is filled). */
+    private void seedRound(String r, String edge) {
+        assertTrue(dp.fenceRound(r, E));
+        String ch = Keys.channel(r, edge, 0);
+        dp.ensureGroup(r, ch, E);
+        add(ch, "x");
+        dp.setDesiredParallelism(r, "p", 2, 0, E);
+        dp.appendJournal(r, ChunkEvent.builder().type("DONE").roundId(r).pipelineId("p").chunkId("c").ts(1L).build());
+        dp.enqueueSplit(r, "p", 0, new Split("s0", Collections.singletonMap("i", "0")), E);
+    }
+
     @Test
-    void purgeRoundDataDeletesOnlyTheGivenRounds() {
-        add(Keys.channel("gone", "e1", 0), "x");
-        add(Keys.dlq("gone", "p", 1), "x");
-        raw.sync().set(Keys.journal("gone"), "x");
-        add(Keys.channel("kept", "e1", 0), "x");
-        add(Keys.channel("gone2", "e1", 0), "x");
-        assertEquals(4, dp.purgeRoundData(Arrays.asList("gone", "gone2")));
-        assertEquals(1, raw.sync().exists(Keys.channel("kept", "e1", 0)));
-        assertEquals(0, raw.sync().exists(Keys.channel("gone", "e1", 0), Keys.dlq("gone", "p", 1), Keys.journal("gone")));
+    void purgeRoundDataDeletesOnlyTheGivenRoundsByRegistry() {
+        seedRound("gone", "e1");
+        seedRound("gone2", "e1");
+        seedRound("kept", "e1");
+        long before = raw.sync().dbsize();
+        int n = dp.purgeRoundData(Arrays.asList("gone", "gone2"));
+        assertTrue(n >= 10, "deleted " + n);
+        assertEquals(3, raw.sync().exists(Keys.channel("kept", "e1", 0), Keys.fence("kept"), Keys.registry("kept")));
+        for (String r : Arrays.asList("gone", "gone2")) {
+            assertEquals(0, raw.sync().exists(Keys.channel(r, "e1", 0), Keys.fence(r), Keys.registry(r), Keys.journal(r), Keys.desired(r),
+                    Keys.splitQueue(r, "p", 0), Keys.splitIndex(r, "p", 0)), r);
+        }
+        assertEquals(before - n, raw.sync().dbsize());
         assertEquals(0, dp.purgeRoundData(Collections.<String>emptyList()));
+        assertTrue(dp.purgeRoundData(Collections.singletonList("never-existed")) >= 0);
+    }
+
+    @Test
+    void fenceKeyHasNoTtlAndSurvivesDeleteKeys() {
+        assertTrue(dp.fenceRound(R, 7));
+        assertEquals(-1L, raw.sync().pttl(Keys.fence(R)), "no TTL");
+        assertTrue(dp.fenceRound(R, 8));
+        assertEquals(-1L, raw.sync().pttl(Keys.fence(R)));
+        dp.deleteKeys(R, Arrays.asList(IN), 8);
+        assertEquals("8", raw.sync().get(Keys.fence(R)));
+    }
+
+    @Test
+    void ensureGroupIgnoresBusyGroupButRaisesOtherErrors() {
+        dp.ensureGroup(R, IN, E);
+        dp.ensureGroup(R, IN, E);   // BUSYGROUP is fine
+        raw.sync().set("pg:{r1}:ch:wrongtype:0", "str");
+        assertThrows(RuntimeException.class, () -> dp.ensureGroup(R, "pg:{r1}:ch:wrongtype:0", E), "WRONGTYPE must not be swallowed");
+    }
+
+    @Test
+    void heartbeatReplacesTheInfoHash() {
+        Map<String, String> first = new LinkedHashMap<>();
+        first.put("graph.old", "h1");
+        first.put("pods", "1");
+        dp.heartbeat("podx", first);
+        assertEquals(first, dp.workerInfo("podx"));
+        Map<String, String> second = Collections.singletonMap("graph.new", "h2");
+        dp.heartbeat("podx", second);
+        assertEquals(second, dp.workerInfo("podx"), "stale fields are gone");
+        long ttl = raw.sync().pttl(Keys.workerInfo("podx"));
+        assertTrue(ttl > 0 && ttl <= 60_000, "ttl " + ttl);
+    }
+
+    @Test
+    void deadLetterReturnsWhetherItMovedTheEntry() {
+        dp.ensureGroup(R, IN, E);
+        add(IN, "bad");
+        StreamEntry e = dp.read("A", Collections.singletonList(IN), 1, 0).get(0);
+        DeadLetterRequest req = DeadLetterRequest.builder().roundId(R).pipelineId("p1").attempt(0).inputStreamKey(IN).inputEntryId(e.getEntryId())
+                .inputFields(e.getFields()).error("boom").event(ev("c1")).consumer("A").build();
+        assertTrue(dp.deadLetter(req));
+        assertFalse(dp.deadLetter(req), "already dead-lettered");
+        assertEquals(1, raw.sync().xlen(Keys.dlq(R, "p1", 0)));
+    }
+
+    @Test
+    void ownershipRenewCommitAndDeadLetterRequireTheOwningConsumer() throws Exception {
+        dp.ensureGroup(R, IN, E);
+        add(IN, "chunk");
+        StreamEntry e = dp.read("A", Collections.singletonList(IN), 1, 0).get(0);
+        Thread.sleep(50);
+        assertEquals(1, dp.autoClaim("B", IN, 10, 1).size(), "B autoclaims the stalled entry");
+        assertFalse(dp.renew("A", IN, e.getEntryId()), "A's renewer must not take it back");
+        assertEquals("B", raw.sync().xpending(IN, Keys.GROUP, io.lettuce.core.Range.create("-", "+"), io.lettuce.core.Limit.from(1)).get(0).getConsumer());
+        CommitRequest byA = CommitRequest.builder().roundId(R).inputStreamKey(IN).inputEntryId(e.getEntryId()).highWatermark(10)
+                .outputs(Collections.<OutputChunk>emptyList()).event(ev("c1")).consumer("A").build();
+        assertEquals(CommitResult.CONFLICT, dp.commit(byA), "A lost ownership");
+        assertEquals(1, pendingCount(IN), "nothing was acked");
+        DeadLetterRequest dlA = DeadLetterRequest.builder().roundId(R).pipelineId("p1").attempt(0).inputStreamKey(IN).inputEntryId(e.getEntryId())
+                .inputFields(e.getFields()).error("x").event(ev("c1")).consumer("A").build();
+        assertFalse(dp.deadLetter(dlA));
+        assertEquals(0, raw.sync().exists(Keys.dlq(R, "p1", 0)));
+        assertTrue(dp.renew("B", IN, e.getEntryId()));
+        byA.setConsumer("B");
+        assertEquals(CommitResult.OK, dp.commit(byA));
+        assertEquals(0, pendingCount(IN));
+    }
+
+    @Test
+    void autoClaimKeepsItsCursorAndReachesEntriesBehindRenewedOnes() throws Exception {
+        dp.ensureGroup(R, IN, E);
+        int renewed = 450;
+        for (int i = 0; i < renewed + 3; i++) add(IN, "c" + i);
+        List<StreamEntry> all = new ArrayList<>();
+        while (all.size() < renewed + 3) all.addAll(dp.read("A", Collections.singletonList(IN), 100, 0));
+        Thread.sleep(200);
+        for (int i = 0; i < renewed; i++) assertTrue(dp.renew("A", IN, all.get(i).getEntryId()));   // the head of the PEL stays fresh
+        Set<String> stale = new HashSet<>();
+        for (int i = renewed; i < all.size(); i++) stale.add(all.get(i).getEntryId());
+        Set<String> got = new HashSet<>();
+        for (int call = 0; call < 20 && got.size() < stale.size(); call++) {
+            for (StreamEntry e : dp.autoClaim("B", IN, 150, 1)) {
+                assertTrue(stale.contains(e.getEntryId()), "only a stale entry may be claimed");
+                got.add(e.getEntryId());
+            }
+        }
+        assertEquals(stale, got, "every stale entry was reclaimed although 450 renewed entries precede them");
+    }
+
+    @Test
+    void scriptsSurviveScriptFlushUnderConcurrency() throws Exception {
+        raw.sync().scriptFlush();
+        ExecutorService ex = Executors.newFixedThreadPool(8);
+        List<Future<Long>> fs = new ArrayList<>();
+        for (int i = 0; i < 64; i++) fs.add(ex.submit(() -> dp.nextRoundSeq()));
+        Set<Long> seen = new HashSet<>();
+        for (Future<Long> f : fs) seen.add(f.get(10, TimeUnit.SECONDS));
+        ex.shutdown();
+        assertEquals(64, seen.size());
     }
 }

@@ -27,6 +27,7 @@ import lombok.extern.slf4j.Slf4j;
 public class RedisDataPlane implements DataPlane {
     private static final long WORKER_INFO_TTL_MS = 60_000L;
     private static final int REQUEUE_BATCH = 500;
+    private static final int PURGE_BATCH = 200;
 
     private final RedisClient client;
     private final StatefulRedisConnection<String, String> shared;
@@ -47,12 +48,16 @@ public class RedisDataPlane implements DataPlane {
     private final Script clearDlqS = new Script("clear_dlq");
     private final Script leaderS = new Script("leader");
     private final Script releaseS = new Script("release_leader");
+    private final Script renewS = new Script("renew");
+    private final Script workerInfoS = new Script("worker_info");
+    /** Per-stream XAUTOCLAIM resume cursor (only streams mid-scan are kept). */
+    private final Map<String, String> claimCursors = new ConcurrentHashMap<>();
 
     public RedisDataPlane(RedisClient client) {
         this.client = client;
         this.shared = client.connect(StringCodec.UTF8);
         this.cmd = shared.sync();
-        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, epochS, seqS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS)) s.load();
+        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, epochS, seqS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS, renewS, workerInfoS)) s.load();
     }
 
     /** A Lua script loaded via SCRIPT LOAD, run with EVALSHA and falling back to EVAL on NOSCRIPT. */
@@ -78,15 +83,17 @@ public class RedisDataPlane implements DataPlane {
         long run(String[] keys, String... args) {
             Object r;
             try {
-                if (sha == null) load();
-                r = cmd.evalsha(sha, ScriptOutputType.INTEGER, keys, args);
+                String h = sha;   // read once: a concurrent NOSCRIPT fallback must not null it between check and use
+                if (h == null) {
+                    h = cmd.scriptLoad(text);
+                    sha = h;
+                }
+                r = cmd.evalsha(h, ScriptOutputType.INTEGER, keys, args);
             } catch (RedisNoScriptException e) {
-                r = cmd.eval(text, ScriptOutputType.INTEGER, keys, args);
-                sha = null;
+                r = cmd.eval(text, ScriptOutputType.INTEGER, keys, args);   // EVAL also caches the script; sha stays valid
             } catch (RedisCommandExecutionException e) {
                 if (e.getMessage() == null || !e.getMessage().startsWith("NOSCRIPT")) throw e;
                 r = cmd.eval(text, ScriptOutputType.INTEGER, keys, args);
-                sha = null;
             }
             return ((Number) r).longValue();
         }
@@ -116,9 +123,15 @@ public class RedisDataPlane implements DataPlane {
 
     @Override public void heartbeat(String podId, Map<String, String> info) {
         cmd.zadd(Keys.workers(), (double) System.currentTimeMillis(), podId);
-        if (info != null && !info.isEmpty()) {
-            cmd.hset(Keys.workerInfo(podId), info);
-            cmd.pexpire(Keys.workerInfo(podId), WORKER_INFO_TTL_MS);
+        if (info != null && !info.isEmpty()) {   // replaces the hash atomically (DEL + HSET + PEXPIRE): stale fields disappear
+            String[] args = new String[1 + 2 * info.size()];
+            args[0] = String.valueOf(WORKER_INFO_TTL_MS);
+            int i = 1;
+            for (Map.Entry<String, String> e : info.entrySet()) {
+                args[i++] = e.getKey();
+                args[i++] = e.getValue();
+            }
+            workerInfoS.run(new String[] {Keys.workerInfo(podId)}, args);
         }
     }
 
@@ -253,9 +266,9 @@ public class RedisDataPlane implements DataPlane {
     private RedisCommands<String, String> readConnection(long blockMillis) {
         if (blockMillis <= 0) return cmd;
         StatefulRedisConnection<String, String> c = blocking.get();
-        if (c == null || !c.isOpen()) {
-            if (closed) throw new PipelinerException("data plane closed");
-            if (c != null) blockingAll.remove(c);
+        // isOpen() is false while Lettuce auto-reconnects: keep that connection (it recovers by itself) instead of orphaning it
+        if (closed) throw new PipelinerException("data plane closed");
+        if (c == null) {
             c = client.connect(StringCodec.UTF8);
             c.setTimeout(Duration.ofSeconds(60));
             blocking.set(c);
@@ -290,12 +303,29 @@ public class RedisDataPlane implements DataPlane {
         return out;
     }
 
+    /** Max XAUTOCLAIM round trips per call when a window held nothing claimable (each inspects about COUNT*10 PEL entries). */
+    private static final int CLAIM_SCAN_ROUNDS = 20;
+
     @Override public List<StreamEntry> autoClaim(String consumer, String streamKey, long minIdleMillis, int count) {
-        XAutoClaimArgs<String> args = new XAutoClaimArgs<String>()
-                .consumer(Consumer.from(Keys.GROUP, consumer))
-                .minIdleTime(minIdleMillis).startId("0-0").count(count);
-        ClaimedMessages<String, String> r = cmd.xautoclaim(streamKey, args);
-        List<StreamEntry> out = toEntries(r.getMessages(), streamKey);
+        int n = Math.max(1, count);
+        List<StreamEntry> out = new ArrayList<>();
+        try {
+            for (int round = 0; round < CLAIM_SCAN_ROUNDS && out.isEmpty(); round++) {
+                String start = claimCursors.get(streamKey);
+                XAutoClaimArgs<String> args = new XAutoClaimArgs<String>()
+                        .consumer(Consumer.from(Keys.GROUP, consumer))
+                        .minIdleTime(minIdleMillis).startId(start == null ? "0-0" : start).count(n);
+                ClaimedMessages<String, String> r = cmd.xautoclaim(streamKey, args);
+                String next = r.getId();
+                if (next == null || next.isEmpty() || "0-0".equals(next)) claimCursors.remove(streamKey);   // scanned to the end: restart next call
+                else claimCursors.put(streamKey, next);
+                out.addAll(toEntries(r.getMessages(), streamKey));
+                if (next == null || next.isEmpty() || "0-0".equals(next)) break;
+            }
+        } catch (RuntimeException e) {
+            claimCursors.remove(streamKey);
+            throw e;
+        }
         for (StreamEntry e : out) {   // XAUTOCLAIM has just counted this delivery
             List<PendingMessage> pm = cmd.xpending(streamKey, Consumer.from(Keys.GROUP, consumer),
                     Range.create(e.getEntryId(), e.getEntryId()), Limit.from(1));
@@ -305,7 +335,7 @@ public class RedisDataPlane implements DataPlane {
     }
 
     @Override public boolean renew(String consumer, String streamKey, String entryId) {
-        return !cmd.xclaim(streamKey, Consumer.from(Keys.GROUP, consumer), new XClaimArgs().minIdleTime(0).justid(), entryId).isEmpty();
+        return renewS.run(new String[] {streamKey}, Keys.GROUP, consumer, entryId) > 0;
     }
 
     @Override public CommitResult commit(CommitRequest req) {
@@ -317,6 +347,7 @@ public class RedisDataPlane implements DataPlane {
         args.add(req.getInputEntryId());
         args.add(String.valueOf(req.getHighWatermark()));
         args.add(req.getEvent() == null ? "" : ChunkCodec.encodeEvent(req.getEvent()));
+        args.add(req.getConsumer() == null ? "" : req.getConsumer());
         if (req.getOutputs() != null) {
             for (OutputChunk o : req.getOutputs()) {
                 int idx = keys.subList(2, keys.size()).indexOf(o.getStreamKey());
@@ -333,18 +364,19 @@ public class RedisDataPlane implements DataPlane {
         return r == 1 ? CommitResult.OK : r == -1 ? CommitResult.BUSY : CommitResult.CONFLICT;
     }
 
-    @Override public void deadLetter(DeadLetterRequest req) {
+    @Override public boolean deadLetter(DeadLetterRequest req) {
         String[] keys = {req.getInputStreamKey(), Keys.dlq(req.getRoundId(), req.getPipelineId(), req.getAttempt()), Keys.journal(req.getRoundId())};
         List<String> args = new ArrayList<>(Arrays.asList(Keys.GROUP, req.getInputEntryId(),
                 req.getError() == null ? "" : req.getError(),
-                req.getEvent() == null ? "" : ChunkCodec.encodeEvent(req.getEvent())));
+                req.getEvent() == null ? "" : ChunkCodec.encodeEvent(req.getEvent()),
+                req.getConsumer() == null ? "" : req.getConsumer()));
         if (req.getInputFields() != null) {
             for (Map.Entry<String, String> e : req.getInputFields().entrySet()) {
                 args.add(e.getKey());
                 args.add(e.getValue());
             }
         }
-        deadS.run(keys, args.toArray(new String[0]));
+        return deadS.run(keys, args.toArray(new String[0])) == 1;
     }
 
     @Override public int requeueDeadLetters(String roundId, String pipelineId, int attempt, long epoch) {
@@ -417,27 +449,35 @@ public class RedisDataPlane implements DataPlane {
         }
     }
 
+    /** Deletes by the round's key registry (pg:{r}:keys, filled by the Lua scripts as keys are created) plus the fixed control keys; never scans the keyspace. */
     @Override public int purgeRoundData(Collection<String> roundIds) {
         if (roundIds == null || roundIds.isEmpty()) return 0;
-        Set<String> ids = new HashSet<>(roundIds);
         int deleted = 0;
-        List<String> batch = new ArrayList<>();
-        ScanArgs args = ScanArgs.Builder.matches("pg:{*").limit(1000);
-        KeyScanCursor<String> cur = cmd.scan(args);
-        while (true) {
-            for (String key : cur.getKeys()) {
-                int close = key.indexOf('}');
-                if (close > 4 && ids.contains(key.substring(4, close))) batch.add(key);
+        for (String r : new LinkedHashSet<>(roundIds)) {
+            String reg = Keys.registry(r);
+            List<String> batch = new ArrayList<>(PURGE_BATCH + 8);
+            batch.addAll(Arrays.asList(Keys.journal(r), Keys.desired(r), Keys.assign(r), Keys.paused(r), Keys.fence(r)));
+            ScanArgs args = ScanArgs.Builder.limit(PURGE_BATCH);
+            ValueScanCursor<String> cur = cmd.sscan(reg, args);
+            while (true) {
+                batch.addAll(cur.getValues());
+                if (batch.size() >= PURGE_BATCH) {
+                    deleted += unlink(batch);
+                    batch.clear();
+                }
+                if (cur.isFinished()) break;
+                cur = cmd.sscan(reg, cur, args);
             }
-            if (batch.size() >= 200 || (cur.isFinished() && !batch.isEmpty())) {
-                Long n = cmd.unlink(batch.toArray(new String[0]));
-                deleted += n == null ? 0 : n.intValue();
-                batch.clear();
-            }
-            if (cur.isFinished()) break;
-            cur = cmd.scan(cur, args);
+            batch.add(reg);
+            deleted += unlink(batch);
         }
         return deleted;
+    }
+
+    private int unlink(List<String> keys) {
+        if (keys.isEmpty()) return 0;
+        Long n = cmd.unlink(keys.toArray(new String[0]));
+        return n == null ? 0 : n.intValue();
     }
 
     @Override public void releaseThreadResources() {

@@ -268,10 +268,10 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
 
     private RedisCommands<String, String> r() {
         StatefulRedisConnection<String, String> c = conn;
-        if (c == null || !c.isOpen()) {
+        if (c == null) {   // isOpen() is false during Lettuce's auto-reconnect: never replace (and orphan) that connection
             synchronized (this) {
                 c = conn;
-                if (c == null || !c.isOpen()) conn = c = client.connect();
+                if (c == null) conn = c = client.connect();
             }
         }
         return c.sync();

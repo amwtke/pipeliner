@@ -66,7 +66,7 @@ public class InMemoryDataPlane implements DataPlane {
     // membership
     @Override public synchronized void heartbeat(String podId, Map<String, String> info) {
         workers.put(podId, System.currentTimeMillis());
-        if (info != null) workerInfos.put(podId, new HashMap<>(info));
+        if (info != null && !info.isEmpty()) workerInfos.put(podId, new HashMap<>(info));   // replaces the map, like the Redis hash
     }
     @Override public synchronized Map<String, String> workerInfo(String podId) {
         return workerInfos.containsKey(podId) ? new HashMap<>(workerInfos.get(podId)) : new HashMap<String, String>();
@@ -182,8 +182,10 @@ public class InMemoryDataPlane implements DataPlane {
                 for (String key : keys) {
                     Stream s = streams.get(key);
                     if (s == null || !s.group) throw new IllegalStateException("NOGROUP " + key);
+                    int taken = 0;   // COUNT applies per stream, like XREADGROUP
                     for (Map.Entry<Long, Map<String, String>> e : s.entries.tailMap(s.lastDelivered, false).entrySet()) {
-                        if (out.size() >= count) break;
+                        if (taken >= count) break;
+                        taken++;
                         Pending p = new Pending();
                         p.consumer = consumer;
                         p.since = System.currentTimeMillis();
@@ -191,8 +193,8 @@ public class InMemoryDataPlane implements DataPlane {
                         s.lastDelivered = e.getKey();
                         out.add(new StreamEntry(key, idStr(e.getKey()), new HashMap<>(e.getValue())));
                     }
-                    if (!out.isEmpty()) return out;
                 }
+                if (!out.isEmpty()) return out;
             }
             if (System.currentTimeMillis() >= deadline) return new ArrayList<>();
             try { Thread.sleep(5); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw new RuntimeException(ie); }
@@ -222,16 +224,20 @@ public class InMemoryDataPlane implements DataPlane {
         Stream s = streams.get(key);
         if (s == null || !s.group) throw new IllegalStateException("NOGROUP " + key);
         Pending p = s.pending.get(num(entryId));
-        if (p != null) { p.consumer = consumer; p.since = System.currentTimeMillis(); }
-        return p != null;
+        if (p == null || !consumer.equals(p.consumer)) return false;   // acked, or claimed by another consumer
+        p.since = System.currentTimeMillis();
+        return true;
     }
 
     @Override public synchronized CommitResult commit(CommitRequest req) {
+        Stream in = streams.get(req.getInputStreamKey());   // like XACK, never creates the key
+        long id = num(req.getInputEntryId());
+        Pending own = in == null ? null : in.pending.get(id);
+        // ownership first (like commit.lua): a consumer that lost the entry to an autoclaim gets CONFLICT, even while the outputs are full
+        if (req.getConsumer() != null && (own == null || !req.getConsumer().equals(own.consumer))) { conflictCount.incrementAndGet(); return CommitResult.CONFLICT; }
         Set<String> outKeys = new LinkedHashSet<>();
         for (OutputChunk o : req.getOutputs()) outKeys.add(o.getStreamKey());
         for (String k : outKeys) if (streamLength(k) >= req.getHighWatermark()) { busyCount.incrementAndGet(); return CommitResult.BUSY; }
-        Stream in = streams.get(req.getInputStreamKey());   // like XACK, never creates the key
-        long id = num(req.getInputEntryId());
         if (in == null || in.pending.remove(id) == null) { conflictCount.incrementAndGet(); return CommitResult.CONFLICT; }
         in.entries.remove(id);
         for (OutputChunk o : req.getOutputs()) {
@@ -245,10 +251,12 @@ public class InMemoryDataPlane implements DataPlane {
         return CommitResult.OK;
     }
 
-    @Override public synchronized void deadLetter(DeadLetterRequest req) {
+    @Override public synchronized boolean deadLetter(DeadLetterRequest req) {
         Stream in = streams.get(req.getInputStreamKey());
         long id = num(req.getInputEntryId());
-        if (in == null || in.pending.remove(id) == null) return;   // not pending any more: already committed or dead-lettered
+        Pending own = in == null ? null : in.pending.get(id);
+        if (own != null && req.getConsumer() != null && !req.getConsumer().equals(own.consumer)) return false;   // claimed by another consumer
+        if (in == null || in.pending.remove(id) == null) return false;   // not pending any more: already committed or dead-lettered
         in.entries.remove(id);
         Map<String, String> f = new HashMap<>(req.getInputFields());
         f.put("src", req.getInputStreamKey());
@@ -257,6 +265,7 @@ public class InMemoryDataPlane implements DataPlane {
         Map<String, String> je = new HashMap<>();
         je.put("e", ChunkCodec.encodeEvent(req.getEvent()));
         add(Keys.journal(req.getRoundId()), je);
+        return true;
     }
 
     @Override public synchronized int requeueDeadLetters(String r, String p, int attempt, long epoch) {
