@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 300" width="1280" height="300" role="img" aria-label="pipeliner: PipelineGraph 流式批量计算框架">
+  <title>pipeliner</title>
+  <defs>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d9488"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9" fill="none" stroke="#94a3b8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      .word   { font: 800 88px ui-sans-serif, -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif; letter-spacing: -3px; fill: url(#brand); }
+      .tag    { font: 600 25px ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #0f172a; }
+      .sub    { font: 500 15px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #64748b; letter-spacing: .2px; }
+      .label  { font: 600 14px ui-monospace, "SF Mono", Menlo, Consolas, monospace; text-anchor: middle; dominant-baseline: central; }
+      .gl     { font: 500 12px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #64748b; }
+      .node   { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .done   { fill: #ecfdf5; stroke: #10b981; stroke-width: 1.5; }
+      .run    { fill: #eef2ff; stroke: url(#brand); stroke-width: 2.5; animation: pulse 1.6s ease-in-out infinite; }
+      .gate   { fill: #ffffff; stroke: #f59e0b; stroke-width: 1.8; }
+      .edge   { fill: none; stroke: #94a3b8; stroke-width: 1.8; stroke-linecap: round; marker-end: url(#arrow); }
+      .flow   { stroke-dasharray: 5 9; animation: flow 1.1s linear infinite; }
+      .ink    { fill: #0f172a; }
+      .okink  { fill: #047857; }
+      .pend   { fill: #64748b; }
+      @keyframes flow  { to { stroke-dashoffset: -28; } }
+      @keyframes pulse { 0%, 100% { stroke-opacity: 1; } 50% { stroke-opacity: .35; } }
+      @media (prefers-reduced-motion: reduce) { .flow, .run { animation: none; } }
+    </style>
+  </defs>
+
+  <text class="word" x="56" y="138">pipeliner</text>
+  <text class="tag" x="60" y="190">把批量计算画成一张图，让它在多个 pod 上流动起来</text>
+  <text class="sub" x="60" y="226">bounded streaming · chunk-level resume · backpressure · gates</text>
+
+  <!-- R2: gd-fix -> big-net -> core-grade (done) -->
+  <rect class="done" x="738" y="46" width="124" height="44" rx="10"/>
+  <text class="label okink" x="800" y="68">gd-fix</text>
+  <path class="edge flow" d="M862 68 H904"/>
+  <rect class="done" x="908" y="46" width="124" height="44" rx="10"/>
+  <text class="label okink" x="970" y="68">big-net</text>
+  <path class="edge flow" d="M1032 68 H1074"/>
+  <rect class="done" x="1078" y="46" width="134" height="44" rx="10"/>
+  <text class="label okink" x="1145" y="68">core-grade</text>
+
+  <!-- barrier gate -->
+  <path class="edge flow" d="M1145 90 V126"/>
+  <path class="gate" d="M1145 130 L1167 152 L1145 174 L1123 152 Z"/>
+  <text class="gl" x="1176" y="156">barrier</text>
+
+  <!-- R3: cap-alloc (running) -->
+  <path class="edge flow" d="M1123 152 H1036"/>
+  <rect class="run" x="908" y="130" width="124" height="44" rx="10"/>
+  <text class="label ink" x="970" y="152">cap-alloc</text>
+
+  <!-- manual gate -->
+  <path class="edge" d="M908 152 H826"/>
+  <path class="gate" d="M800 130 L822 152 L800 174 L778 152 Z"/>
+  <text class="gl" x="716" y="156">approve</text>
+
+  <!-- R6: publish (pending) -->
+  <path class="edge" d="M800 174 V210"/>
+  <rect class="node" x="738" y="214" width="124" height="44" rx="10"/>
+  <text class="label pend" x="800" y="236">publish</text>
+</svg>
