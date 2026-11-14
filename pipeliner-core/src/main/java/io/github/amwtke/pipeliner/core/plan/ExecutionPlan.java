@@ -82,7 +82,7 @@ public final class ExecutionPlan {
             boolean first = true;
             for (PlanRun r : runs) {
                 if (r.getStage() != st) continue;
-                sb.append(first ? "Stage " + st + "  " : "         ").append(String.format("%-3s %-8s ", r.getRunId(), r.getMode()))
+                sb.append(first ? "Stage " + st + "  " : "         ").append(String.format(java.util.Locale.ROOT, "%-3s %-8s ", r.getRunId(), r.getMode()))
                         .append(describe(r)).append('\n');
                 first = false;
             }
@@ -90,7 +90,7 @@ public final class ExecutionPlan {
                 int max = 0;
                 for (String ar : g.getAfterRuns()) max = Math.max(max, run(ar).getStage());
                 if (max != st) continue;
-                sb.append("         ").append(String.format("%-20s %-9s ", g.getGateId(), g.getType().name().toLowerCase()));
+                sb.append("         ").append(String.format(java.util.Locale.ROOT, "%-20s %-9s ", g.getGateId(), g.getType().name().toLowerCase(java.util.Locale.ROOT)));
                 if (g.isAuto()) sb.append("dataset ").append(g.getDataset()).append("; ");
                 sb.append("after ").append(g.getAfterPipelines()).append(" -> before ").append(g.getBeforePipelines());
                 if (g.getTimeoutMillis() > 0) sb.append("; timeout ").append(g.getTimeoutMillis()).append("ms ").append(g.getOnTimeout());

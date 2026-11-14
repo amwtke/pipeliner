@@ -4,7 +4,7 @@ package io.github.amwtke.pipeliner.core.util;
 public final class ChunkIds {
     private ChunkIds() {}
 
-    public static String source(int splitIndex) { return String.format("S%04d", splitIndex); }
+    public static String source(int splitIndex) { return String.format(java.util.Locale.ROOT, "S%04d", splitIndex); }
 
     public static String child(String parentChunkId, int edgeOrdinal, int seq) {
         return parentChunkId + ">" + edgeOrdinal + "." + seq;

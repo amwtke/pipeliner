@@ -24,7 +24,7 @@
 - **chunk** 是唯一的工作单位：传输、确认、重试、断点都以 chunk 为粒度。runner 不保留跨 chunk 状态。
 - **闸门（gate）**：barrier、condition、external、manual、timer。闸门和落表把图切开。
 - **层级**：round（一次提交）> run（图被闸门/落表切出的、可一口气跑完的一块）> pipeline > chunk。
-- **三种执行模式**（`ExecMode`）：`INLINE`（一条直链、小数据，直接方法调用、无队列）、`LOCAL`（单 pod 内存队列）、`CLUSTER`（多 pod 经 Redis Stream 协同）。未指定 `.mode()` 时由 `PlanOptions`（`inlineMaxRows`、`localMaxRows`）按 `estimatedRows` 选择。
+- **三种执行模式**（`ExecMode`）：`INLINE`（一条直链、小数据，直接方法调用、无队列）、`LOCAL`（单 pod 内存队列）、`CLUSTER`（多 pod 经 Redis Stream 协同）。未指定 `.mode()` 时由 `PlanOptions`（`inlineMaxRows`、`localMaxRows`）按 `estimatedRows` 选择。`.mode()` 提示按 pipeline 生效，未提示的成员仍按自己的估算选择，一个 run 取其成员中最重的模式；`pipeliner.plan.force-mode` 优先级最高，覆盖所有提示。
 
 ## 快速开始
 
@@ -157,7 +157,7 @@ gates:
 
 **物化边与自动 barrier**：planner 比较各 pipeline 的 source 与 sink 的 `datasetName()`。某个 pipeline 读的 dataset 恰好被另一个 pipeline 写入时，二者之间是物化边，planner 自动生成 `barrier:<dataset>` 闸门并据此切 run；stream 边（`.edge`）则在同一个 run 内用通道连接。上例中 `publish` 读 `res`、`post` 写 `res`，所以两者之间有自动 barrier，不必手写。
 
-**何时要显式 barrier**：依赖不通过 dataset 名体现时（例如 runner 里按键 lookup 另一张表、`ReadsDatasets` 之外的隐式读），planner 看不到依赖，需要用 `Gates.barrier()` 的 `after(...)/before(...)` 手动声明。示例中的 `refurb-ready` 就是这种用法：`big-final`、`fine-net` 在运行时 lookup `cap-alloc` 的结果。
+**何时要显式 barrier**：依赖不通过 dataset 名体现时（例如 runner 里按键 lookup 另一张表、`ReadsDatasets` 之外的隐式读；`ReadsDatasets` 可由 source 或 runner 实例实现，类型声明（`row(Class)`）的 runner 不会被实例化，需提供 `public static Collection<String> readDatasets()`，否则 plan 失败），planner 看不到依赖，需要用 `Gates.barrier()` 的 `after(...)/before(...)` 手动声明。示例中的 `refurb-ready` 就是这种用法：`big-final`、`fine-net` 在运行时 lookup `cap-alloc` 的结果。
 
 ## Runner 的按需实例化与生命周期
 
@@ -336,6 +336,8 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 
 **使用方的约束（正确性依赖这些假设）**：
 - Runner 与 `enumerate` 必须确定性（同样输入、同样输出，同样的 chunk 切分）。
+- 行值类型在 `Row.set/of` 时规范化，所有模式一致（与 CLUSTER 经 JSON 往返后相同）：整数 -> `Long`，浮点 -> `BigDecimal`（NaN / Infinity 存为 `null`），`java.time` / `java.util.Date` -> ISO 字符串，不支持的类型直接报错。
+- YAML 时长（`timeout`、`delay`）写成带单位的字符串（`1h30m`）；`1:30:00` 这类写法会被拒绝，不会被当作 60 进制整数。`parallelism` 必须 >= 1。
 - Source 的 `orderBy` 必须是全序（hash / distinct 分片没有 orderBy 时会告警一次）。
 - Runner 输出必须按 `chunkKey` 分组；同一个 key 在分组结束后再次出现会抛 `PipelinerException`（output of port X is not grouped by chunkKey）。
 - Sink 的 key 必须唯一（MySQL `upsertKeys`、ClickHouse 排序键）。

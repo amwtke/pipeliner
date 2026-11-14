@@ -149,7 +149,11 @@ public final class PipelineGraph {
             l.add(s);
             return this;
         }
-        public PipelineBuilder parallelism(int p) { this.parallelism = p; return this; }
+        public PipelineBuilder parallelism(int p) {
+            if (p < 1) throw new IllegalArgumentException("pipeline " + id + ": parallelism must be >= 1, got " + p);
+            this.parallelism = p;
+            return this;
+        }
         public PipelineBuilder mode(ExecMode m) { this.mode = m; return this; }
         public PipelineBuilder estimatedRows(long n) { this.estimatedRows = n; return this; }
         public PipelineBuilder chunkRows(int n) { this.chunkRows = n; return this; }

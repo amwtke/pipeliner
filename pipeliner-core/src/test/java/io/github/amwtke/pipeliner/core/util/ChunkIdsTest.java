@@ -35,4 +35,16 @@ class ChunkIdsTest {
         assertTrue(a.endsWith("@0") && b.endsWith("@0"));
         assertNotEquals(ChunkIds.batchId("r", "p", "S0003", 0), ChunkIds.batchId("r", "p", "S0003", 1));
     }
+
+    @Test void idsDoNotDependOnTheDefaultLocale() {
+        java.util.Locale old = java.util.Locale.getDefault();
+        try {
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar-SA-u-nu-arab"));
+            assertEquals("S0007", ChunkIds.source(7));
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("fa-IR"));
+            assertEquals("S0007", ChunkIds.source(7));
+        } finally {
+            java.util.Locale.setDefault(old);
+        }
+    }
 }

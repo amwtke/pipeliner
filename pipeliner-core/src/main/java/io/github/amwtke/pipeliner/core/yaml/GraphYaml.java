@@ -21,7 +21,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+import org.yaml.snakeyaml.nodes.Tag;
+import org.yaml.snakeyaml.representer.Representer;
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.resolver.Resolver;
 
 /** Loads a PipelineGraph from YAML. */
 public final class GraphYaml {
@@ -29,8 +35,34 @@ public final class GraphYaml {
 
     private GraphYaml() {}
 
+    /**
+     * YAML 1.1 resolver without base-60 ("sexagesimal") numbers: an unquoted {@code 1:30:00} stays the String "1:30:00"
+     * (and is then rejected as a duration) instead of silently becoming the integer 5400.
+     */
+    private static final class NoSexagesimalResolver extends Resolver {
+        private static final Pattern INT = Pattern.compile("^(?:[-+]?0b[0-1_]+|[-+]?0[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)|[-+]?0x[0-9a-fA-F_]+)$");
+        private static final Pattern FLOAT = Pattern.compile("^(?:[-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+][0-9]+)?|\\.[0-9_]+(?:[eE][-+][0-9]+)?|[-+]?\\.(?:inf|Inf|INF)|\\.(?:nan|NaN|NAN))$");
+
+        @Override protected void addImplicitResolvers() {
+            addImplicitResolver(Tag.BOOL, BOOL, "yYnNtTfFoO");
+            addImplicitResolver(Tag.INT, INT, "-+0123456789");
+            addImplicitResolver(Tag.FLOAT, FLOAT, "-+0123456789.");
+            addImplicitResolver(Tag.MERGE, MERGE, "<");
+            addImplicitResolver(Tag.NULL, NULL, "~nN\0");
+            addImplicitResolver(Tag.NULL, EMPTY, null);
+            addImplicitResolver(Tag.TIMESTAMP, TIMESTAMP, "0123456789");
+        }
+    }
+
+    /** Safe loader: only standard YAML types (no global tags / arbitrary class instantiation), no sexagesimal numbers. */
+    private static Yaml yaml() {
+        LoaderOptions lo = new LoaderOptions();
+        DumperOptions dumper = new DumperOptions();
+        return new Yaml(new SafeConstructor(lo), new Representer(), dumper, lo, new NoSexagesimalResolver());
+    }
+
     public static PipelineGraph load(InputStream in, ComponentResolver resolver) {
-        Object doc = new Yaml().load(in);
+        Object doc = yaml().load(in);
         if (!(doc instanceof Map)) throw new PipelinerException("graph yaml: top level must be a mapping");
         Map<?, ?> root = (Map<?, ?>) doc;
         Object name = root.get("graph");
@@ -85,7 +117,11 @@ public final class GraphYaml {
                     pb.sink(String.valueOf(e.getKey()), bean(resolver, String.valueOf(s), Sink.class, "pipeline " + id + " sink"));
             }
         }
-        if (p.get("parallelism") != null) pb.parallelism(num(p.get("parallelism")).intValue());
+        if (p.get("parallelism") != null) {
+            long par = num(p.get("parallelism")).longValue();
+            if (par < 1 || par > Integer.MAX_VALUE) throw new PipelinerException("pipeline " + id + ": parallelism must be >= 1, got " + par);
+            pb.parallelism((int) par);
+        }
         if (p.get("mode") != null) pb.mode(ExecMode.valueOf(str(p.get("mode")).toUpperCase(Locale.ROOT)));
         if (p.get("estimatedRows") != null) pb.estimatedRows(num(p.get("estimatedRows")).longValue());
         if (p.get("chunkRows") != null) pb.chunkRows(num(p.get("chunkRows")).intValue());
@@ -134,7 +170,10 @@ public final class GraphYaml {
         });
     }
 
-    /** Parses 2h, 30m, 10s, 500ms, 1d (also sums like "1h30m"); a bare number means milliseconds. */
+    /**
+     * Parses 2h, 30m, 10s, 500ms, 1d (also sums like "1h30m"); a bare number means milliseconds. Clock notation such as
+     * 1:30:00 is not a duration and is rejected (it is never read as a base-60 number); write 1h30m.
+     */
     static Duration duration(Object o) {
         if (o instanceof Number) return Duration.ofMillis(((Number) o).longValue());
         String s = String.valueOf(o).trim().toLowerCase(Locale.ROOT);

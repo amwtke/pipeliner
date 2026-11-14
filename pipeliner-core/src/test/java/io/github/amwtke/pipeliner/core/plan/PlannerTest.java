@@ -246,7 +246,7 @@ class PlannerTest {
         PlanOptions o = PlanOptions.defaults();
         o.setForceMode(ExecMode.CLUSTER);
         assertEquals(ExecMode.CLUSTER, chain(100, 100, null).plan(o).getRuns().get(0).getMode());
-        assertEquals(ExecMode.LOCAL, chain(100, 100, ExecMode.LOCAL).plan(o).getRuns().get(0).getMode()); // hint wins
+        assertEquals(ExecMode.CLUSTER, chain(100, 100, ExecMode.LOCAL).plan(o).getRuns().get(0).getMode()); // forceMode overrides hints
         // fan-out is not a linear chain: small => LOCAL
         PipelineGraph fan = PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).ports("x").estimatedRows(1))
                 .pipeline("b", p -> p.estimatedRows(1)).pipeline("c", p -> p.estimatedRows(1)).edge("a.out", "b").edge("a.x", "c").build();
@@ -308,5 +308,70 @@ class PlannerTest {
 
     @Test void perThreadNeedsTypeBasedRunner() {
         assertMsg(PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).batch(new Batch()).runnerPerThread()).build(), "runnerPerThread");
+    }
+
+    // ------------------------------------------------------------- review round 2
+
+    static class DimRunner extends RowR implements ReadsDatasets {
+        public java.util.Collection<String> readDatasets() { return Collections.singletonList("dim"); }
+    }
+
+    private static PipelineGraph runnerReads(java.util.function.Consumer<PipelineGraph.PipelineBuilder> reader) {
+        return PipelineGraph.builder("g")
+                .pipeline("w", p -> p.source(new Src(null)).sink(new Snk("dim")))
+                .pipeline("r", reader).build();
+    }
+
+    @Test void runnerInstanceReadsDatasetsPlansABarrier() {
+        ExecutionPlan plan = runnerReads(p -> p.source(new Src(null)).row(new DimRunner())).plan();
+        assertEquals(2, plan.getRuns().size());
+        assertTrue(plan.gate("barrier:dim").isAuto());
+        assertEquals(Arrays.asList("w"), plan.gate("barrier:dim").getAfterPipelines());
+        assertEquals(Arrays.asList("r"), plan.gate("barrier:dim").getBeforePipelines());
+    }
+
+    @Test void typeBasedRunnerReadingDatasetsMustBeDeclaredStaticallyOrFails() {
+        // a type-based ReadsDatasets runner is never instantiated; without a static readDatasets() the plan fails loudly
+        PlanException e = assertThrows(PlanException.class, () -> runnerReads(p -> p.source(new Src(null)).row(DimRunner.class)).plan());
+        assertTrue(e.getMessage().contains("static"), e.getMessage());
+    }
+
+    @Test void selfReadWriteWithSecondReaderIsNotOnBothSidesOfItsGate() {
+        PipelineGraph g = PipelineGraph.builder("g")
+                .pipeline("p1", p -> p.source(new Src("d")).sink(new Snk("d")))
+                .pipeline("p2", p -> p.source(new Src("d")).sink(new Snk(null))).build();
+        ExecutionPlan plan = g.plan();
+        PlanGate b = plan.gate("barrier:d");
+        assertEquals(Arrays.asList("p1"), b.getAfterPipelines());
+        assertEquals(Arrays.asList("p2"), b.getBeforePipelines());
+    }
+
+    @Test void hintsApplyPerPipelineAndUnhintedMembersKeepTheirEstimate() {
+        // R1 = [small(INLINE hint), big(no hint, 50M rows)]: big must not inherit INLINE
+        PipelineGraph g = PipelineGraph.builder("g")
+                .pipeline("small", p -> p.source(new Src(null)).mode(ExecMode.INLINE).estimatedRows(1))
+                .pipeline("big", p -> p.source(new Src(null)).estimatedRows(50_000_000L)).build();
+        assertEquals(ExecMode.CLUSTER, g.plan().getRuns().get(0).getMode());
+        PipelineGraph h = PipelineGraph.builder("g")
+                .pipeline("small", p -> p.source(new Src(null)).mode(ExecMode.INLINE).estimatedRows(1))
+                .pipeline("tiny", p -> p.source(new Src(null)).estimatedRows(1)).build();
+        assertEquals(ExecMode.INLINE, h.plan().getRuns().get(0).getMode());
+        PipelineGraph k = PipelineGraph.builder("g")
+                .pipeline("a", p -> p.source(new Src(null)).mode(ExecMode.LOCAL).estimatedRows(1))
+                .pipeline("b", p -> p.source(new Src(null)).estimatedRows(1)).build();
+        assertEquals(ExecMode.LOCAL, k.plan().getRuns().get(0).getMode());
+    }
+
+    @Test void proxyClassNamesAreNormalizedForTheHash() {
+        assertEquals("a.b.Foo", Planner.stripLambda("a.b.Foo$$EnhancerBySpringCGLIB$$1a2b3c"));
+        assertEquals("a.b.Foo", Planner.stripLambda("a.b.Foo$$FastClassBySpringCGLIB$$ff"));
+        assertEquals("a.b.Foo", Planner.stripLambda("a.b.Foo$ByteBuddy$9xYz"));
+        assertEquals("a.b.Foo$$Lambda", Planner.stripLambda("a.b.Foo$$Lambda$17/0x0000000800c03000"));
+        assertEquals("a.b.Foo$Inner", Planner.stripLambda("a.b.Foo$Inner"));
+    }
+
+    @Test void parallelismMustBePositive() {
+        assertThrows(IllegalArgumentException.class, () -> PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).parallelism(0)).build());
+        assertThrows(IllegalArgumentException.class, () -> PipelineGraph.builder("g").pipeline("a", p -> p.source(new Src(null)).parallelism(-3)).build());
     }
 }
