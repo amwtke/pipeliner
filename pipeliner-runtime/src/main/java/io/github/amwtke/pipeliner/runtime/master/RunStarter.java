@@ -126,7 +126,7 @@ final class RunStarter {
 
     /** True if the pod's heartbeat says it has this round's graph registered with the same plan hash. */
     private boolean canExecute(String pod, RoundRecord round) {
-        String hash = c.s.plane.workerInfo(pod).get("graph." + round.getGraphName());
+        String hash = c.s.plane.workerInfo(pod).get(io.github.amwtke.pipeliner.runtime.worker.WorkerAgent.GRAPH_PREFIX + round.getGraphName());
         return round.getPlanHash() != null && round.getPlanHash().equals(hash);
     }
 
@@ -182,18 +182,13 @@ final class RunStarter {
                 PipelineRecord rec = d.pipe(p);
                 if (!d.plan.pipeline(p).isSource() || rec.getStatus() != PipelineStatus.RUNNING || rec.isEnumDone()) continue;
                 try {
-                    List<Split> raw = d.plan.getGraph().getPipelines().get(p).getSource()
-                            .enumerate(new SourceContextImpl(roundId, d.round().getParams(), c.s.dataSources));
-                    List<Split> splits = new ArrayList<>();
+                    List<Split> splits = io.github.amwtke.pipeliner.runtime.process.SplitIds.assign(d.plan.getGraph().getPipelines().get(p).getSource()
+                            .enumerate(new SourceContextImpl(roundId, d.round().getParams(), c.s.dataSources)));
                     List<ChunkRecord> pending = new ArrayList<>();
-                    int i = 0;
-                    if (raw != null) for (Split sp : raw) {
-                        Split s = sp.withId(ChunkIds.source(i++));
-                        splits.add(s);
+                    for (Split s : splits)
                         pending.add(ChunkRecord.builder().roundId(roundId).pipelineId(p).chunkId(s.getSplitId()).runId(pr.getRunId())
                                 .status(ChunkStatus.PENDING).inputEdge("split").splitSpec(ChunkCodec.toJson(s.getSpec()))
                                 .updatedAt(System.currentTimeMillis()).build());
-                    }
                     for (Split s : splits) c.s.plane.enqueueSplit(roundId, p, run.getAttempt(), s, c.epoch());
                     if (!pending.isEmpty()) c.s.store.savePendingChunks(roundId, pending);
                     c.s.store.setPipelineEnumDone(roundId, p, true, c.epoch());

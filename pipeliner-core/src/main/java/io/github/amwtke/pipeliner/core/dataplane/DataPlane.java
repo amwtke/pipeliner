@@ -53,12 +53,6 @@ public interface DataPlane extends AutoCloseable {
     /** Stores "parallelism|attempt" under the pipeline id; parallelism &lt;= 0 removes the entry. Fenced. */
     void setDesiredParallelism(String roundId, String pipelineId, int parallelism, int attempt, long epoch);
     Map<String, DesiredState> desiredState(String roundId);
-    /** Parallelism only (see {@link #desiredState}). */
-    default Map<String, Integer> desiredParallelism(String roundId) {
-        Map<String, Integer> out = new LinkedHashMap<>();
-        for (Map.Entry<String, DesiredState> e : desiredState(roundId).entrySet()) out.put(e.getKey(), e.getValue().getParallelism());
-        return out;
-    }
     /** Stores "pod|attempt" under runId. Fenced. */
     void assignLocalRun(String roundId, String runId, String podId, int attempt, long epoch);
     Map<String, String> localRunAssignments(String roundId);

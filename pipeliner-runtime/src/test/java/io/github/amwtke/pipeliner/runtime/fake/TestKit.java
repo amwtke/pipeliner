@@ -90,8 +90,10 @@ public final class TestKit {
 
         public ExecutionPlan plan() { return plan; }
 
-        public DefaultPipelinerEngine pod(RuntimeConfig cfg, boolean start) {
-            DefaultPipelinerEngine e = new DefaultPipelinerEngine(cfg, store, plane, new SimpleDataSourceRegistry(new HashMap<String, javax.sql.DataSource>()), null, factory);
+        public DefaultPipelinerEngine pod(RuntimeConfig cfg, boolean start) { return pod(cfg, start, null); }
+
+        public DefaultPipelinerEngine pod(RuntimeConfig cfg, boolean start, io.github.amwtke.pipeliner.core.engine.PipelinerMetrics metrics) {
+            DefaultPipelinerEngine e = new DefaultPipelinerEngine(cfg, store, plane, new SimpleDataSourceRegistry(new HashMap<String, javax.sql.DataSource>()), metrics, factory);
             e.registerPlan(plan);
             engines.add(e);
             if (start) e.start();

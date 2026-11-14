@@ -52,7 +52,7 @@ class ResilienceTest {
             h.plane.heartbeat("ghost", Collections.singletonMap("graph.lt", "test-lt"));
             h.plane.appendJournal(round, Events.localRun(true, round, "R1", "a", "ghost", 1, null));
             h.plane.appendJournal(round, ChunkEvent.builder().type("DONE").roundId(round).runId("R1").pipelineId("a").chunkId("S0000")
-                    .inputEdge("split").owner("ghost").rowsIn(2L).rowsOut(new HashMap<String, Long>()).ts(1L).build());
+                    .inputEdge("split").owner("ghost").rowsIn(2L).rowsOut(new HashMap<String, Long>()).attempt(1).ts(1L).build());
             h.store.failApplyOnCall = 2;   // batch 1 = LOCAL_RUN_DONE, batch 2 fails once
             m.start();
             assertEquals(RoundStatus.SUCCEEDED, m.awaitRound(round, 10000));

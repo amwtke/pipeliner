@@ -17,11 +17,6 @@ public final class RunContextImpl implements RunContext {
     private final long writeVersion;
 
     public RunContextImpl(String roundId, String runId, String pipelineId, String chunkId, Map<String, String> params,
-                          DataSourceRegistry dataSources, GateFallbackCache fallback) {
-        this(roundId, runId, pipelineId, chunkId, params, dataSources, fallback, 0, 0L);
-    }
-
-    public RunContextImpl(String roundId, String runId, String pipelineId, String chunkId, Map<String, String> params,
                           DataSourceRegistry dataSources, GateFallbackCache fallback, int attempt, long writeVersion) {
         this.attempt = attempt;
         this.writeVersion = writeVersion;

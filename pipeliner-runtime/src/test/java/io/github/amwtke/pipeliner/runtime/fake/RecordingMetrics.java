@@ -9,6 +9,8 @@ import java.util.concurrent.atomic.AtomicLong;
 /** Records the hooks the retention / alerting tests care about. */
 public class RecordingMetrics implements PipelinerMetrics {
     public final AtomicInteger chunks = new AtomicInteger();
+    public final AtomicLong rowsOutTotal = new AtomicLong();
+    public final AtomicLong rowsInTotal = new AtomicLong();
     public final AtomicInteger leaderChanges = new AtomicInteger();
     public final AtomicInteger leaderLosses = new AtomicInteger();
     public final List<String> roundsFinished = new CopyOnWriteArrayList<>();   // graph|round|status
@@ -24,7 +26,7 @@ public class RecordingMetrics implements PipelinerMetrics {
     public volatile long redisMemory = -1;
     public volatile int highWatermark = -1;
 
-    @Override public void chunkProcessed(String round, String run, String pipeline, long rowsIn, long rowsOut, long costMs) { chunks.incrementAndGet(); }
+    @Override public void chunkProcessed(String round, String run, String pipeline, long rowsIn, long rowsOut, long costMs) { chunks.incrementAndGet(); rowsInTotal.addAndGet(rowsIn); rowsOutTotal.addAndGet(rowsOut); }
     @Override public void leaderChanged(String podId, long epoch) { leaderChanges.incrementAndGet(); }
     @Override public void leaderLost(String podId) { leaderLosses.incrementAndGet(); }
     @Override public void roundFinished(String graph, String round, String status) { roundsFinished.add(graph + "|" + round + "|" + status); }

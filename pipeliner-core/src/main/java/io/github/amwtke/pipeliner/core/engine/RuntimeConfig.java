@@ -1,6 +1,9 @@
 package io.github.amwtke.pipeliner.core.engine;
 
+import io.github.amwtke.pipeliner.api.PipelinerException;
 import io.github.amwtke.pipeliner.core.plan.PlanOptions;
+import java.util.ArrayList;
+import java.util.List;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -33,6 +36,7 @@ public class RuntimeConfig {
     @Builder.Default private long readBlockMillis = 1000;
     @Builder.Default private int highWatermark = 64;
     @Builder.Default private int lowWatermark = 32;
+    /** Total number of attempts per chunk (1 = no retry); must be at least 1. */
     @Builder.Default private int maxAttempts = 3;
     @Builder.Default private long retryBackoffMillis = 1000;
     @Builder.Default private int journalBatch = 500;
@@ -55,6 +59,40 @@ public class RuntimeConfig {
     @Builder.Default private long retentionIntervalMillis = 10L * 60 * 1000;
     /** Rounds compacted / purged per pass. */
     @Builder.Default private int retentionBatch = 100;
+    /** engine.stop() waits at most this long for worker and local-run threads to finish before returning. */
+    @Builder.Default private long stopJoinMillis = 10000;
     /** Null means PlanOptions.defaults(). */
     private PlanOptions planOptions;
+
+    /** Fails fast with a clear message on values that would hang or silently break the runtime. Called by the engine at start. */
+    public void validate() {
+        List<String> bad = new ArrayList<>();
+        if (podId == null || podId.isEmpty()) bad.add("podId is required");
+        if (maxAttempts < 1) bad.add("maxAttempts must be >= 1 (it is the total number of attempts per chunk), got " + maxAttempts);
+        if (lowWatermark <= 0) bad.add("lowWatermark must be > 0, got " + lowWatermark);
+        if (highWatermark < lowWatermark) bad.add("highWatermark (" + highWatermark + ") must be >= lowWatermark (" + lowWatermark + ")");
+        positive(bad, "tickMillis", tickMillis);
+        positive(bad, "externalTickIntervalMillis", externalTickIntervalMillis);
+        positive(bad, "leaderTtlMillis", leaderTtlMillis);
+        positive(bad, "heartbeatMillis", heartbeatMillis);
+        positive(bad, "workerDeadMillis", workerDeadMillis);
+        positive(bad, "claimIdleMillis", claimIdleMillis);
+        positive(bad, "renewIntervalMillis", renewIntervalMillis);
+        positive(bad, "autoClaimIntervalMillis", autoClaimIntervalMillis);
+        positive(bad, "readBlockMillis", readBlockMillis);
+        positive(bad, "adminTimeoutMillis", adminTimeoutMillis);
+        positive(bad, "retentionIntervalMillis", retentionIntervalMillis);
+        if (retryBackoffMillis < 0) bad.add("retryBackoffMillis must be >= 0, got " + retryBackoffMillis);
+        if (stopJoinMillis < 0) bad.add("stopJoinMillis must be >= 0, got " + stopJoinMillis);
+        if (journalBatch <= 0) bad.add("journalBatch must be > 0, got " + journalBatch);
+        if (maxParallelism <= 0) bad.add("maxParallelism must be > 0, got " + maxParallelism);
+        if (localQueueCapacity <= 0) bad.add("localQueueCapacity must be > 0, got " + localQueueCapacity);
+        if (maxDeliveries < 1) bad.add("maxDeliveries must be >= 1, got " + maxDeliveries);
+        if (retentionBatch <= 0) bad.add("retentionBatch must be > 0, got " + retentionBatch);
+        if (!bad.isEmpty()) throw new PipelinerException("invalid RuntimeConfig: " + String.join("; ", bad));
+    }
+
+    private static void positive(List<String> bad, String name, long v) {
+        if (v <= 0) bad.add(name + " must be > 0, got " + v);
+    }
 }

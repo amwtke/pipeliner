@@ -284,7 +284,12 @@ public class InMemoryDataPlane implements DataPlane {
         return n;
     }
 
+    /** Test hook: appendJournal throws for events this predicate accepts (simulates a failover / outage). */
+    public volatile java.util.function.Predicate<ChunkEvent> failAppendWhen;
+
     @Override public synchronized void appendJournal(String r, ChunkEvent e) {
+        java.util.function.Predicate<ChunkEvent> f = failAppendWhen;
+        if (f != null && f.test(e)) throw new IllegalStateException("READONLY injected journal failure");
         Map<String, String> je = new HashMap<>();
         je.put("e", ChunkCodec.encodeEvent(e));
         add(Keys.journal(r), je);

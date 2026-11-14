@@ -58,6 +58,8 @@ public final class ClaimRenewer {
                 }
             } catch (InterruptedException e) {
                 return;
+            } catch (Throwable e) {   // never let an unexpected Error end the loop
+                log.warn("claim renewer loop error: {}", e.toString());
             }
         }
         plane.releaseThreadResources();

@@ -109,7 +109,7 @@ public class PipelinerAdminController {
             m.put("leader", e.getKey().equals(leader));
             m.put("heartbeatAgeMillis", Math.max(0, now - e.getValue()));
             List<Map<String, Object>> inst = new ArrayList<>();
-            String json = plane.workerInfo(e.getKey()).get("live");
+            String json = plane.workerInfo(e.getKey()).get(io.github.amwtke.pipeliner.runtime.worker.WorkerAgent.LIVE_FIELD);
             if (json != null && !json.isEmpty()) {
                 try {
                     for (List<?> row : MAPPER.readValue(json, List[].class)) {

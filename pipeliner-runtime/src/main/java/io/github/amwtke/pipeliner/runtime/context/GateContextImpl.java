@@ -15,11 +15,6 @@ public final class GateContextImpl implements GateContext {
     private final DataSourceRegistry dataSources;
     private final java.util.function.ToIntFunction<String> attemptOf;
 
-    public GateContextImpl(String roundId, String gateId, Map<String, String> params, Map<String, String> signals,
-                           long armedAt, long now, ControlPlaneStore store, DataSourceRegistry dataSources) {
-        this(roundId, gateId, params, signals, armedAt, now, store, dataSources, p -> 0);
-    }
-
     /** attemptOf maps a pipeline id to the current attempt of its run. */
     public GateContextImpl(String roundId, String gateId, Map<String, String> params, Map<String, String> signals,
                            long armedAt, long now, ControlPlaneStore store, DataSourceRegistry dataSources,

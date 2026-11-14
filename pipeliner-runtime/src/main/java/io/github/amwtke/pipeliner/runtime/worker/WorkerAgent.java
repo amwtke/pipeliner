@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.runtime.worker;
 
+import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
 import io.github.amwtke.pipeliner.core.dataplane.DesiredState;
 import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
 import io.github.amwtke.pipeliner.core.store.RoundRecord;
@@ -56,14 +57,24 @@ public final class WorkerAgent implements Runnable {
             t.interrupt();
             try { t.join(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
+        List<ClusterPipelineWorker> ws = new ArrayList<>();
+        List<LocalRunExecutor> exs = new ArrayList<>();
         synchronized (this) {
-            for (Group g : workers.values()) for (ClusterPipelineWorker w : g.list) w.kill();
-            for (ClusterPipelineWorker w : retiring) w.kill();
+            for (Group g : workers.values()) ws.addAll(g.list);
+            ws.addAll(retiring);
+            for (LocalHandle h : locals.values()) exs.add(h.executor);
             retiring.clear();
-            for (LocalHandle h : locals.values()) h.executor.cancel();
             workers.clear();
             locals.clear();
         }
+        for (ClusterPipelineWorker w : ws) w.kill();
+        for (LocalRunExecutor e : exs) e.cancel();
+        // give the threads a bounded time to leave user code and release their instances, so the caller does not close pools under them
+        long deadline = System.currentTimeMillis() + s.cfg.getStopJoinMillis();
+        int left = 0;
+        for (ClusterPipelineWorker w : ws) if (!w.join(deadline - System.currentTimeMillis())) left++;
+        for (LocalRunExecutor e : exs) if (!e.join(deadline - System.currentTimeMillis())) left++;
+        if (left > 0) log.warn("worker agent stop: {} worker/local-run thread(s) still running after {} ms", left, s.cfg.getStopJoinMillis());
         renewer.stop();
     }
 
@@ -85,20 +96,21 @@ public final class WorkerAgent implements Runnable {
     public static final String LIVE_FIELD = "live";
     private static final int MAX_LIVE = 200;
 
-    static String liveJson(List<io.github.amwtke.pipeliner.core.engine.LiveInstance> live) {
-        StringBuilder sb = new StringBuilder("[");
-        int n = 0;
-        for (io.github.amwtke.pipeliner.core.engine.LiveInstance li : live) {
-            if (n++ >= MAX_LIVE) break;
-            if (n > 1) sb.append(',');
-            sb.append("[\"").append(esc(li.getRoundId())).append("\",\"").append(esc(li.getPipelineId())).append("\",")
-                    .append(li.getAttempt()).append(',').append(li.getThreads()).append(']');
-        }
-        return sb.append(']').toString();
-    }
+    /** Heartbeat field prefix: {@code graph.<name>} holds the plan hash this pod can execute. */
+    public static final String GRAPH_PREFIX = "graph.";
 
-    private static String esc(String v) {
-        return v == null ? "" : v.replace("\\", "\\\\").replace("\"", "\\\"");
+    static String liveJson(List<io.github.amwtke.pipeliner.core.engine.LiveInstance> live) {
+        List<List<Object>> rows = new ArrayList<>();
+        for (io.github.amwtke.pipeliner.core.engine.LiveInstance li : live) {
+            if (rows.size() >= MAX_LIVE) break;
+            List<Object> row = new ArrayList<>(4);
+            row.add(li.getRoundId() == null ? "" : li.getRoundId());
+            row.add(li.getPipelineId() == null ? "" : li.getPipelineId());
+            row.add(li.getAttempt());
+            row.add(li.getThreads());
+            rows.add(row);
+        }
+        return ChunkCodec.toJson(rows);
     }
 
     private synchronized void tick() {
@@ -107,7 +119,7 @@ public final class WorkerAgent implements Runnable {
             Map<String, String> info = new HashMap<>();
             info.put("startedAt", String.valueOf(now));
             info.put(LIVE_FIELD, liveJson(s.instances.snapshot()));
-            for (String g : s.registry.names()) info.put("graph." + g, s.registry.require(g).getHash());   // plans this pod can execute
+            for (String g : s.registry.names()) info.put(GRAPH_PREFIX + g, s.registry.require(g).getHash());   // plans this pod can execute
             s.plane.heartbeat(s.podId(), info);
             lastHeartbeat = now;
         }
@@ -198,7 +210,14 @@ public final class WorkerAgent implements Runnable {
         for (Map.Entry<String, String> e : assign.entrySet()) {
             if (!isMine(e.getValue())) continue;
             String key = prefix + e.getKey();
-            if (locals.containsKey(key)) continue;
+            LocalHandle h = locals.get(key);
+            if (h != null) {
+                // still running, or finished and reported (the master has not drained it yet): leave it. A finished executor that never
+                // reported (it died) must not block the run: drop the handle so the run is driven again.
+                if (h.executor.alive() || h.executor.reported()) continue;
+                log.warn("local run {} ended without reporting; driving it again", key);
+                locals.remove(key);
+            }
             int attempt = attemptOf(e.getValue());
             LocalRunExecutor ex = new LocalRunExecutor(s, plan, rr, e.getKey(), attempt);
             locals.put(key, new LocalHandle(attempt, ex));

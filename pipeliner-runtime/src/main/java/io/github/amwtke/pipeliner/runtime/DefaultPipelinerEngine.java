@@ -48,7 +48,7 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
     private final RuntimeConfig cfg;
     private final Services s;
     private final AdminClient admin;
-    private MasterLoop master;
+    private volatile MasterLoop master;
     private WorkerAgent worker;
     private boolean started;
 
@@ -174,14 +174,18 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
         return m.tick();
     }
 
-    @Override public boolean isLeader() { return master != null && master.isLeader(); }
+    @Override public boolean isLeader() {
+        MasterLoop m = master;   // read once: stop()/halt() null the field concurrently
+        return m != null && m.isLeader();
+    }
 
     @Override public String podId() { return cfg.getPodId(); }
 
     @Override public synchronized void start() {
         if (started) return;
+        cfg.validate();   // fail fast on values that would hang or break the runtime
+        s.store.init();   // may throw (store down): the engine is not started then and start() can be retried
         started = true;
-        s.store.init();
         if (cfg.isWorkerEnabled()) { worker = new WorkerAgent(s); worker.start(); }
         if (cfg.isMasterEnabled()) { master = new MasterLoop(s); master.start(); }
         log.info("engine {} started (master={}, worker={})", cfg.getPodId(), cfg.isMasterEnabled(), cfg.isWorkerEnabled());
