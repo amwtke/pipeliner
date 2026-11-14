@@ -10,7 +10,6 @@ import io.lettuce.core.*;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
 import io.lettuce.core.codec.StringCodec;
-import io.lettuce.core.models.stream.ClaimedMessages;
 import io.lettuce.core.models.stream.PendingMessage;
 import io.lettuce.core.models.stream.PendingMessages;
 import java.io.ByteArrayOutputStream;
@@ -27,6 +26,7 @@ import lombok.extern.slf4j.Slf4j;
 public class RedisDataPlane implements DataPlane {
     private static final long WORKER_INFO_TTL_MS = 60_000L;
     private static final int REQUEUE_BATCH = 500;
+    private static final int TRIM_BATCH = 1000;
     private static final int PURGE_BATCH = 200;
     /** Rounds purged without a key registry (created before pg:{r}:keys existed) whose keys are still to be found by an incremental SCAN. */
     static final String LEGACY_PENDING = "pg:purge:legacy";
@@ -59,14 +59,16 @@ public class RedisDataPlane implements DataPlane {
     private final Script releaseS = new Script("release_leader");
     private final Script renewS = new Script("renew");
     private final Script workerInfoS = new Script("worker_info");
-    /** Per-stream XAUTOCLAIM resume cursor (only streams mid-scan are kept). */
+    private final Script claimIdleS = new Script("claim_idle");
+    private final Script trimJournalS = new Script("trim_journal");
+    /** Per-stream resume cursor of the idle-claim scan (only streams mid-scan are kept). */
     private final Map<String, String> claimCursors = new ConcurrentHashMap<>();
 
     public RedisDataPlane(RedisClient client) {
         this.client = client;
         this.shared = client.connect(StringCodec.UTF8);
         this.cmd = shared.sync();
-        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, epochS, seqS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS, renewS, workerInfoS)) s.load();
+        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, epochS, seqS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS, renewS, workerInfoS, claimIdleS, trimJournalS)) s.load();
     }
 
     /** A Lua script loaded via SCRIPT LOAD, run with EVALSHA and falling back to EVAL on NOSCRIPT. */
@@ -90,21 +92,23 @@ public class RedisDataPlane implements DataPlane {
         void load() { sha = cmd.scriptLoad(text); }
 
         long run(String[] keys, String... args) {
-            Object r;
+            return ((Number) eval(ScriptOutputType.INTEGER, keys, args)).longValue();
+        }
+
+        Object eval(ScriptOutputType type, String[] keys, String... args) {
             try {
                 String h = sha;   // read once: a concurrent NOSCRIPT fallback must not null it between check and use
                 if (h == null) {
                     h = cmd.scriptLoad(text);
                     sha = h;
                 }
-                r = cmd.evalsha(h, ScriptOutputType.INTEGER, keys, args);
+                return cmd.evalsha(h, type, keys, args);
             } catch (RedisNoScriptException e) {
-                r = cmd.eval(text, ScriptOutputType.INTEGER, keys, args);   // EVAL also caches the script; sha stays valid
+                return cmd.eval(text, type, keys, args);   // EVAL also caches the script; sha stays valid
             } catch (RedisCommandExecutionException e) {
                 if (e.getMessage() == null || !e.getMessage().startsWith("NOSCRIPT")) throw e;
-                r = cmd.eval(text, ScriptOutputType.INTEGER, keys, args);
+                return cmd.eval(text, type, keys, args);
             }
-            return ((Number) r).longValue();
         }
     }
 
@@ -314,7 +318,7 @@ public class RedisDataPlane implements DataPlane {
         return out;
     }
 
-    /** Max XAUTOCLAIM round trips per call when a window held nothing claimable (each inspects about COUNT*10 PEL entries). */
+    /** Max claim_idle round trips per call when a window held nothing claimable (each inspects COUNT*10 PEL entries). */
     private static final int CLAIM_SCAN_ROUNDS = 20;
 
     @Override public List<StreamEntry> autoClaim(String consumer, String streamKey, long minIdleMillis, int count) {
@@ -323,24 +327,26 @@ public class RedisDataPlane implements DataPlane {
         try {
             for (int round = 0; round < CLAIM_SCAN_ROUNDS && out.isEmpty(); round++) {
                 String start = claimCursors.get(streamKey);
-                XAutoClaimArgs<String> args = new XAutoClaimArgs<String>()
-                        .consumer(Consumer.from(Keys.GROUP, consumer))
-                        .minIdleTime(minIdleMillis).startId(start == null ? "0-0" : start).count(n);
-                ClaimedMessages<String, String> r = cmd.xautoclaim(streamKey, args);
-                String next = r.getId();
-                if (next == null || next.isEmpty() || "0-0".equals(next)) claimCursors.remove(streamKey);   // scanned to the end: restart next call
+                // XPENDING + XCLAIM in one script instead of XAUTOCLAIM, which needs Redis 6.2
+                List<?> r = (List<?>) claimIdleS.eval(ScriptOutputType.MULTI, new String[] {streamKey},
+                        Keys.GROUP, consumer, String.valueOf(minIdleMillis), start == null ? "0-0" : start, String.valueOf(n));
+                String next = String.valueOf(r.get(0));
+                if ("0-0".equals(next)) claimCursors.remove(streamKey);   // scanned to the end: restart next call
                 else claimCursors.put(streamKey, next);
-                out.addAll(toEntries(r.getMessages(), streamKey));
-                if (next == null || next.isEmpty() || "0-0".equals(next)) break;
+                for (int i = 1; i < r.size(); i++) {   // {entry id, delivery count, {field, value, ...}}
+                    List<?> c = (List<?>) r.get(i);
+                    List<?> kv = (List<?>) c.get(2);
+                    Map<String, String> f = new LinkedHashMap<>();
+                    for (int j = 0; j + 1 < kv.size(); j += 2) f.put(String.valueOf(kv.get(j)), String.valueOf(kv.get(j + 1)));
+                    StreamEntry e = new StreamEntry(streamKey, String.valueOf(c.get(0)), f);
+                    e.setDeliveryCount(((Number) c.get(1)).longValue());
+                    out.add(e);
+                }
+                if ("0-0".equals(next)) break;
             }
         } catch (RuntimeException e) {
             claimCursors.remove(streamKey);
             throw e;
-        }
-        for (StreamEntry e : out) {   // XAUTOCLAIM has just counted this delivery
-            List<PendingMessage> pm = cmd.xpending(streamKey, Consumer.from(Keys.GROUP, consumer),
-                    Range.create(e.getEntryId(), e.getEntryId()), Limit.from(1));
-            if (!pm.isEmpty()) e.setDeliveryCount(pm.get(0).getRedeliveryCount());
         }
         return out;
     }
@@ -412,7 +418,7 @@ public class RedisDataPlane implements DataPlane {
     @Override public List<ChunkEvent> readJournal(String roundId, String afterId, int count) {
         Range<String> range = (afterId == null || afterId.isEmpty() || "0-0".equals(afterId) || "0".equals(afterId))
                 ? Range.unbounded()
-                : Range.from(Range.Boundary.excluding(afterId), Range.Boundary.unbounded());
+                : Range.from(Range.Boundary.including(nextStreamId(afterId)), Range.Boundary.unbounded());   // "(id" needs Redis 6.2
         List<ChunkEvent> out = new ArrayList<>();
         for (StreamMessage<String, String> m : cmd.xrange(Keys.journal(roundId), range, Limit.from(count))) {
             String json = m.getBody() == null ? null : m.getBody().get("e");
@@ -424,8 +430,19 @@ public class RedisDataPlane implements DataPlane {
         return out;
     }
 
+    /** The smallest stream id above {@code id} ("ms-seq"; a bare "ms" means "ms-0"). */
+    static String nextStreamId(String id) {
+        int d = id.indexOf('-');
+        long ms = Long.parseUnsignedLong(d < 0 ? id : id.substring(0, d));
+        long seq = d < 0 ? 0 : Long.parseUnsignedLong(id.substring(d + 1));
+        if (seq == -1L) return Long.toUnsignedString(ms + 1) + "-0";   // seq is 2^64-1: roll over to the next millisecond
+        return Long.toUnsignedString(ms) + "-" + Long.toUnsignedString(seq + 1);
+    }
+
     @Override public void trimJournal(String roundId, String upToId, long epoch) {
-        fencedCmd(roundId, epoch, "XTRIM", new String[] {Keys.journal(roundId)}, "MINID", upToId);
+        String[] keys = {Keys.journal(roundId)};
+        // XRANGE + XDEL in a script instead of XTRIM MINID, which needs Redis 6.2
+        while (fenced(trimJournalS, roundId, epoch, keys, upToId, String.valueOf(TRIM_BATCH)) >= TRIM_BATCH) { }
     }
 
     @Override public void deleteKeys(String roundId, Collection<String> keys, long epoch) {

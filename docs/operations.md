@@ -317,7 +317,7 @@ curl $BASE/pg/rounds/$RID                        # 单个 round 的 run / gate /
 
 | 情形 | 会发生什么 | 你需要做什么 |
 |---|---|---|
-| worker pod 被 `kill -9` / 宕机 | 它手上未提交的 chunk 留在待确认列表，空闲超过 `claim-idle-millis`（默认 60 秒）后被其他 worker `XAUTOCLAIM` 接手，从头重新处理这个 chunk（只重做这个 chunk）；一个 chunk 被投递超过 `max-deliveries` 次会直接进死信 | 通常无需处理；重启 pod 即可。关注 `pipeliner_chunk_retries_total`、死信 |
+| worker pod 被 `kill -9` / 宕机 | 它手上未提交的 chunk 留在待确认列表，空闲超过 `claim-idle-millis`（默认 60 秒）后被其他 worker 用 `XPENDING` + `XCLAIM` 接手，从头重新处理这个 chunk（只重做这个 chunk）；一个 chunk 被投递超过 `max-deliveries` 次会直接进死信 | 通常无需处理；重启 pod 即可。关注 `pipeliner_chunk_retries_total`、死信 |
 | leader 挂了 | 租约在 `leader-ttl-millis` 后过期，另一个 pod 抢到租约，取更高的 epoch，从控制面加载运行中的 round，从 journal 位点继续。worker 在此期间照常处理 chunk，只是 round 不推进、管理命令得不到执行 | 无需处理；观察 `PipelinerNoLeader`。`external` 模式要确保外部触发能到达存活 pod |
 | LOCAL / INLINE run 所在的 pod 挂了 | master 在该 pod 心跳过期（`worker-dead-millis`）后把 run 分配给另一个 plan hash 一致的 pod，以新的 attempt 整体重放（sink 是版本化的，旧 attempt 的写入覆盖不了新的） | 无需处理；如果没有任何存活 pod 能执行该图，master 每个 tick 打 `no live worker able to run local run` 并重试 |
 | 整个集群重启 | 通道和 journal 依赖 Redis 持久化保留，控制面在存储里；启动后继续跑，未提交的 chunk 重做。示例的 `restart-resume.sh` 验证了这一点 | Redis 要开启持久化（AOF），否则按下面的「Redis 数据丢失」处理 |

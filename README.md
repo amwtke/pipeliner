@@ -16,7 +16,7 @@
 
 ![Java 8+](https://img.shields.io/badge/Java-8%2B-437291?logo=openjdk&logoColor=white)
 ![Spring Boot 2.7](https://img.shields.io/badge/Spring%20Boot-2.7-6DB33F?logo=springboot&logoColor=white)
-![Redis Streams](https://img.shields.io/badge/Redis%20Streams-%E2%89%A5%206.2-DC382D?logo=redis&logoColor=white)
+![Redis Streams](https://img.shields.io/badge/Redis%20Streams-%E2%89%A5%206.0-DC382D?logo=redis&logoColor=white)
 ![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql&logoColor=white)
 ![ClickHouse](https://img.shields.io/badge/ClickHouse-supported-FFCC01?logo=clickhouse&logoColor=black)
 ![Version](https://img.shields.io/badge/version-0.1.0--SNAPSHOT-8b5cf6)
@@ -225,7 +225,7 @@ flowchart LR
 
 ## 🚀 快速开始
 
-**准备**：JDK 21（构建用，产物是 Java 8 字节码）、Redis ≥ 6.2、MySQL 8、ClickHouse。示例配置里 Redis 的端口是 `6380`。在一台 Ubuntu 虚拟机上可以用 [`deploy/lima/setup-services.sh`](deploy/lima/setup-services.sh) 一次装好这三个服务。
+**准备**：JDK 21（构建用，产物是 Java 8 字节码）、Redis ≥ 6.0、MySQL 8、ClickHouse。示例配置里 Redis 的端口是 `6380`。在一台 Ubuntu 虚拟机上可以用 [`deploy/lima/setup-services.sh`](deploy/lima/setup-services.sh) 一次装好这三个服务。
 
 ```bash
 git clone https://github.com/amwtke/pipeliner.git && cd pipeliner
