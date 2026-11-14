@@ -16,7 +16,7 @@
 |---|---|
 | JDK 21 | 构建用。产物是 Java 8 字节码（`maven.compiler.release=8`），运行时 Java 8 及以上即可。 |
 | Maven | 项目没有 Maven Wrapper，用你本机的 `mvn`。 |
-| Redis | 数据面（Redis Streams）必需，只支持**单机** Redis（不支持 Redis Cluster）；设计文档要求 6.2 及以上（用到 `XAUTOCLAIM`）。示例默认连 `127.0.0.1:6380`，注意是 **6380** 而不是 6379。 |
+| Redis | 数据面（Redis Streams）必需，只支持**单机** Redis（不支持 Redis Cluster）；要求 6.0 及以上（不依赖 6.2 才有的 `XAUTOCLAIM`、`XTRIM MINID` 和 `XRANGE` 开区间）。示例默认连 `127.0.0.1:6380`，注意是 **6380** 而不是 6379。 |
 | MySQL | 示例的业务表在 MySQL；控制面选 `mysql` 时也用它。默认连 `127.0.0.1:3306`，用户 / 密码 `pipeliner` / `pipeliner`。 |
 | ClickHouse | 示例的结果表在 ClickHouse。默认连 HTTP `127.0.0.1:8123`，用户 / 密码 `pipeliner` / `pipeliner`。 |
 

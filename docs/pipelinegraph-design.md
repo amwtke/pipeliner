@@ -1,6 +1,6 @@
 # PipelineGraph：流式计算框架设计
 
-适用：Java 8（字节码目标）、Spring Boot 2.7.18、Redis ≥ 6.2（Streams、`XAUTOCLAIM`，仅单机，不支持 Redis Cluster）、MySQL 8、ClickHouse。
+适用：Java 8（字节码目标）、Spring Boot 2.7.18、Redis ≥ 6.0（Streams，仅单机，不支持 Redis Cluster）、MySQL 8、ClickHouse。
 
 对应《售后预测计划净需求计算模型（参考版）》的 7 个阶段、52 个步骤。
 
@@ -148,7 +148,7 @@ public interface Pusher<O> extends AutoCloseable {
 ```text
 loop:
     等本地额度            // 在处理中的 chunk 数低于上限才继续，上限见 9.1
-    chunk = puller.pull()  // XREADGROUP，或用 XAUTOCLAIM 接手别人超时的 chunk
+    chunk = puller.pull()  // XREADGROUP，或用 XPENDING + XCLAIM 接手别人超时的 chunk
     outs  = runner.run(chunk)   // 输出按 chunkKey 分组后切成 chunk
     外部 pusher 写库       // 幂等（版本化写入，见 11.1），先于提交
     r = commit.lua(...)    // 原子：确认输入 + 写下游通道 + 写 journal
@@ -346,7 +346,7 @@ master 把"哪些 pipeline 处于运行中、各自的并行度"写成期望状�
 
 分压不需要 master 分配：所有 pod 的线程在同一个消费组里竞争拉取，谁有空余额度谁拉。处理慢的 pod 自然拉得少。源 pipeline 的 split 队列也是同样的机制。
 
-slave 每 5 秒上报心跳。某个 pod 挂掉后，它名下没提交的 chunk 超过 60 秒无人续租，被其他 slave 用 `XAUTOCLAIM` 接手。
+slave 每 5 秒上报心跳。某个 pod 挂掉后，它名下没提交的 chunk 超过 60 秒无人续租，被其他 slave 用 `XPENDING` + `XCLAIM` 接手（一个 Lua 脚本内完成；不用 6.2 才有的 `XAUTOCLAIM`）。
 
 ### 8.4 run attempt 与 attempt 作用域的 key
 
@@ -632,7 +632,7 @@ pg:purge:legacy / pg:purge:legacycur   SET/HASH 没有注册表的旧 round 待�
 | 故障 | 恢复方式 | 重做范围 |
 | --- | --- | --- |
 | slave 线程异常 | chunk 留在待确认列表，超时后重新投递 | 一个 chunk |
-| slave pod 挂掉 | 其他 slave 用 `XAUTOCLAIM` 接手 | 该 pod 未提交的 chunk |
+| slave pod 挂掉 | 其他 slave 用 `XPENDING` + `XCLAIM` 接手 | 该 pod 未提交的 chunk |
 | 毒数据反复失败 | 超过重试上限进死信，run 失败；修复后调用 `retry(runId)` 把死信放回通道 | 死信里的 chunk |
 | master 挂掉 | 新 master 当选（epoch 高于存储里所有 round 的 epoch），从控制面加载运行中的 round，从存储里的 journal 位点继续归并 | 无。slave 在此期间照常处理 |
 | master 在枚举 split 中途挂掉 | 新 master 重新枚举，已入队的 splitId 被跳过 | 无 |
@@ -767,7 +767,7 @@ pipelinegraph-spring-boot-starter
 以下几条是设计时默认的选择，与实际情况不符时对应章节需要调整。
 
 - 技术栈沿用现有工程的 Java 8（字节码目标）和 Spring Boot（v1 为 2.7.18）。
-- Redis 版本不低于 6.2，单机部署。**Redis Cluster 不支持**（Lua 脚本访问未在 KEYS 中声明的 key）。
+- Redis 版本不低于 6.0，单机部署（不使用 6.2 才有的 `XAUTOCLAIM`、`XTRIM MINID` 和 `XRANGE` 开区间，对应逻辑用 6.0 已有的命令在 Lua 脚本里实现）。**Redis Cluster 不支持**（Lua 脚本访问未在 KEYS 中声明的 key）。
 - 单个 chunk 序列化后不超过约 1 MB，直接放在 Stream 记录里。如果有更大的行，需要把内容放到外部存储，Stream 里只放引用，本文没有展开。
 - 一轮计算的 chunk 数量在百万以内，`pg_chunk` 用单表可以承受。
 - 所有落库的结果表都能按"计划版本 + 业务键"做幂等写。

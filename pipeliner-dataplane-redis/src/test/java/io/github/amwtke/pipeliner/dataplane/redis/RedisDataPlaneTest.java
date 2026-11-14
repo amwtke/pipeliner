@@ -710,4 +710,58 @@ class RedisDataPlaneTest {
         ex.shutdown();
         assertEquals(64, seen.size());
     }
+
+    @Test
+    void nextStreamIdIsTheSmallestIdAbove() {
+        assertEquals("5-1", RedisDataPlane.nextStreamId("5-0"));
+        assertEquals("5-1", RedisDataPlane.nextStreamId("5"));
+        assertEquals("1700000000000-10", RedisDataPlane.nextStreamId("1700000000000-9"));
+        assertEquals("6-0", RedisDataPlane.nextStreamId("5-18446744073709551615"));
+    }
+
+    @Test
+    void trimJournalRemovesALongBacklogInBatchesAndKeepsTheOffsetEntry() {
+        dp.trimJournal(R, "5-0", E);   // no journal yet: a no-op
+        String journal = Keys.journal(R);
+        List<String> ids = new ArrayList<>();
+        for (int i = 0; i < 2100; i++) ids.add(raw.sync().xadd(journal, Collections.singletonMap("e", "x")));
+        dp.trimJournal(R, "0-0", E);
+        assertEquals(2100, raw.sync().xlen(journal), "nothing is below 0-0");
+        dp.trimJournal(R, ids.get(2000), E);   // 2000 entries below the offset: exactly two full batches
+        assertEquals(100, raw.sync().xlen(journal));
+        assertEquals(ids.get(2000), raw.sync().xrange(journal, io.lettuce.core.Range.unbounded(), io.lettuce.core.Limit.from(1)).get(0).getId());
+        dp.trimJournal(R, ids.get(2099), E);
+        assertEquals(1, raw.sync().xlen(journal));
+    }
+
+    @Test
+    void readJournalResumesAfterAnOffsetThatWasTrimmedAway() {
+        for (int i = 0; i < 3; i++) dp.appendJournal(R, ev("c" + i));
+        List<ChunkEvent> all = dp.readJournal(R, null, 10);
+        dp.trimJournal(R, all.get(2).getEventId(), E);
+        List<ChunkEvent> rest = dp.readJournal(R, all.get(0).getEventId(), 10);
+        assertEquals(1, rest.size());
+        assertEquals("c2", rest.get(0).getChunkId());
+    }
+
+    @Test
+    void autoClaimOnAMissingStreamRaisesNoGroup() {
+        RuntimeException e = assertThrows(RuntimeException.class, () -> dp.autoClaim("B", IN, 10, 1));
+        assertTrue(e.getMessage() != null && e.getMessage().startsWith("NOGROUP"), String.valueOf(e.getMessage()));
+    }
+
+    @Test
+    void autoClaimDropsThePendingRecordOfADeletedEntry() throws Exception {
+        dp.ensureGroup(R, IN, E);
+        String gone = add(IN, "x");
+        String kept = add(IN, "y");
+        assertEquals(2, dp.read("A", Collections.singletonList(IN), 10, 0).size());
+        raw.sync().xdel(IN, gone);
+        Thread.sleep(30);
+        List<StreamEntry> claimed = dp.autoClaim("B", IN, 10, 10);
+        assertEquals(1, claimed.size());
+        assertEquals(kept, claimed.get(0).getEntryId());
+        assertEquals("y", claimed.get(0).getFields().get("c"));
+        assertEquals(1, pendingCount(IN), "the deleted entry's pending record is gone");
+    }
 }

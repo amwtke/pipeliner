@@ -93,7 +93,7 @@ public interface DataPlane extends AutoCloseable {
     default boolean groupExists(String streamKey) { return true; }
     /** XREADGROUP with ">"; blocking reads use a per-thread dedicated connection. */
     List<StreamEntry> read(String consumer, List<String> streamKeys, int count, long blockMillis);
-    /** XAUTOCLAIM; the scan cursor is kept per stream across calls so entries behind many renewed ones are reached; claims at most {@code count} entries. */
+    /** Claims pending entries idle for at least {@code minIdleMillis} (Redis: XPENDING + XCLAIM, which unlike XAUTOCLAIM work on Redis 6.0); the scan cursor is kept per stream across calls so entries behind many renewed ones are reached; claims at most {@code count} entries. */
     List<StreamEntry> autoClaim(String consumer, String streamKey, long minIdleMillis, int count);
     /** XCLAIM with min-idle 0 to reset the idle clock, only if the entry is still pending for {@code consumer}. Returns false when it is no longer pending (acked or deleted) or was claimed by another consumer. */
     boolean renew(String consumer, String streamKey, String entryId);

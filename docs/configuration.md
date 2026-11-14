@@ -70,7 +70,7 @@
 
 | 属性 | 类型 | 默认 | 含义 |
 |---|---|---|---|
-| `pipeliner.runtime.claim-idle-millis` | long | `60000` | 一个已投递但未确认的 chunk 空闲超过这个时间，会被别的 worker 用 `XAUTOCLAIM` 接手。 |
+| `pipeliner.runtime.claim-idle-millis` | long | `60000` | 一个已投递但未确认的 chunk 空闲超过这个时间，会被别的 worker 用 `XPENDING` + `XCLAIM` 接手。 |
 | `pipeliner.runtime.renew-interval-millis` | long | `20000` | 正在处理的 chunk 的续租间隔。应明显小于 `claim-idle-millis`，否则正常处理中的 chunk 会被别人抢走。 |
 | `pipeliner.runtime.auto-claim-interval-millis` | long | `10000` | worker 扫描「空闲 chunk」的间隔。 |
 | `pipeliner.runtime.read-block-millis` | long | `1000` | worker 读输入 stream 时的阻塞等待时间。 |
