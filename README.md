@@ -297,11 +297,11 @@ master 的一次推进（续租/抢主、执行管理命令、推进所有活跃
 | 属性 | 默认 | 说明 |
 |---|---|---|
 | `pipeliner.runtime.master-tick-mode` | `local` | `local` = 内部线程；`external` = 不起线程，由外部调用 `engine.tick()` |
-| `pipeliner.runtime.external-tick-interval-millis` | `2000` | 预期的外部触发间隔，仅用于校验与监控：`leader-ttl-millis < 3 ×` 该值时启动打 WARN（租约会在两次触发之间过期，leader 抖动） |
+| `pipeliner.runtime.external-tick-interval-millis` | `2000` | 预期的外部触发间隔，仅用于校验与监控：`leader-ttl-millis < 3 ×` 该值时启动打 WARN（租约会在两次触发之间过期，leader 抖动）。运行期另有检查：相邻两次 tick 的间隔超过 `leader-ttl-millis / 2` 时打 WARN（每分钟最多一条），提示调大 `leader-ttl-millis` 或缩短触发间隔 |
 
 语义：
 - leader 语义不变：租约 + 每次（重新）获得 leadership 取新 epoch + round 级 fencing。非 leader 的 tick 在尝试抢租约后返回 `skipped`，`skipReason="not leader"`。同一 pod 上并发的 tick 由 `tryLock` 保护，后到者返回 `skipped "tick in progress"`；`master-enabled=false` 返回 `skipped "master disabled"`。
-- worker 心跳/agent 在任何模式下都是本地线程：pod 的存活判定不能依赖调度器。
+- worker 心跳/agent 在任何模式下都是本地线程：pod 的存活判定不能依赖调度器。但 leader 租约不是：租约只在 master tick 里续期（心跳不碰它），external 模式下只有触发时才续。**规则：触发间隔 < `leader-ttl-millis` / 3**，否则租约会在两次触发之间过期，每次触发落到不同 pod 时都会换 leader、取新 epoch。
 - 管理命令（pause/cancel/open gate 等）在下一次 tick 才执行，延迟最长约一个触发间隔（`admin-timeout-millis` 需大于它）。round 的推进粒度同样变为触发间隔：间隔越大越省资源，但闸门/run 切换越慢；建议 1–5 秒。
 
 xxl-job 处理器示例（仅示例，框架不依赖 xxl-job）：
@@ -311,7 +311,7 @@ xxl-job 处理器示例（仅示例，框架不依赖 xxl-job）：
 public void pipelinerTick() { TickResult r = engine.tick(); XxlJobHelper.log(r.toString()); }
 ```
 
-路由建议：任何路由策略都可用——只有持有租约的 pod 会推进，其余 pod 返回 `not leader`（无副作用）。推荐 FAILOVER 或 RANDOM，触发间隔 1–5 秒，`leader-ttl-millis` ≥ 3 × 间隔；不要用"广播"以外会长期固定到已死 pod 的策略。
+路由建议：任何路由策略都可用——只有持有租约的 pod 会推进，其余 pod 返回 `not leader`（无副作用）。推荐 FAILOVER 或 RANDOM，触发间隔 1–5 秒，且触发间隔 < `leader-ttl-millis` / 3（即 `leader-ttl-millis` > 3 × 间隔）；不要用"广播"以外会长期固定到已死 pod 的策略。
 
 HTTP 替代：调度器直接请求任意存活 pod：
 
@@ -328,11 +328,11 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 
 **Attempt**：`RunRecord.attempt` 是 run 的"代"。`rerunFrom` / `retryRun`（本地 run）通过一次原子的 `store.resetRuns`（MySQL 单事务 / Redis 单个 Lua）把 run、pipeline、chunk 记录、下游闸门（含其 signal）和 round 状态一起复位，attempt+1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态为 `并行度|attempt`。Worker 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例：attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例（`open()` 会重新执行）。journal 事件带 `runAttempt`，attempt 不符的事件被 master 丢弃。数据面清理由 master 幂等重放：RunStarter 启动第 n 次 attempt 前先（带 fence）删除该 run 所有 <n 的 key；run 成功后删除当前 attempt 的 key。
 
-**Epoch 下限**：master 每次取新 epoch 用 `plane.nextEpoch(store.maxMasterEpoch())`：Lua 里若 `pg:epoch` 小于下限先置为下限再 `INCR`。`maxMasterEpoch` 在 MySQL 控制面是 `MAX(pg_round.master_epoch)`（有索引），在 Redis 控制面是 `fenceRound` 里维护的 `pg:store:maxepoch`。这样 Redis 数据丢失（`pg:epoch` 被清）后，新 epoch 仍高于存储里的 round epoch，`fenceRound` 不会被永久拒绝。
+**Epoch 下限与持久预留**：master 每次取新 epoch：`floor = store.maxMasterEpoch()`，`e = plane.nextEpoch(floor)`（Lua 里若 `pg:epoch` 小于下限先置为下限再 `INCR`，所以 `e > floor`），再 `store.reserveMasterEpoch(e)`：在控制面存储里原子地"当且仅当 `e` 高于已预留的最大值和所有 round 的 epoch 时写入"，返回 false 就**不当 leader**（本 tick 返回，下一 tick 重新检查租约并取新 epoch）。`maxMasterEpoch` 是已预留 epoch 与所有 round epoch 的最大值：MySQL 是单行表 `pg_master_epoch`（条件 `UPDATE`，影响行数为 1 即拥有）与 `MAX(pg_round.master_epoch)`；Redis 控制面是 `pg:store:maxepoch`（Lua compare-and-set，`fenceRound` 只在 round epoch 真正升高时才顺带抬高它，`init()` 从已有 round 回填）。两层作用：Redis 数据丢失（`pg:epoch` 被清）后新 epoch 仍高于已用过的所有 epoch；一个已取得 epoch 但在写任何 round 之前冻结的 master，它的 epoch 不会在计数器丢失后发给第二个 master。接口方法都有默认实现（`maxMasterEpoch()`→0，`reserveMasterEpoch`→true 即无持久预留，`nextEpoch(floor)`→`nextEpoch()`），自定义的旧实现仍可编译运行。master 取得租约后若存储调用失败，会先释放租约再抛出；`stop()` 在本 pod 持有租约时一律释放。master / worker 的循环线程捕获 `Throwable`，记录日志后退避重试，线程不会因为一个 Error 消失。
 
 **Fencing**：master 每次 tick 先 `store.fenceRound` 再 `plane.fenceRound(roundId, epoch)`（`pg:{r}:fence` 只增不减），任一返回 false 即退位。master 对数据面的所有写（期望并行度、本地 run 分配、入队 split、删 key、trim journal、paused 标志、requeue/clear DLQ、建 group、移出 active）都在 Lua 里先校验 fence ≤ epoch，否则抛 `StaleEpochException` 且不产生任何变更，所以冻结后恢复的僵尸 master 什么也改不了。管理命令也在 master tick 内用同一 epoch 执行。Worker 的 commit / deadLetter 不需要 fence（XACK 守卫保证只有持有 pending 的一方能提交）。每个 tick master 还按 round 状态校正 `paused` 标志；`pg:throttle` 带 TTL（`max(3×tick, 5s)`），超限期间每 tick 续期。
 
-**版本化 sink**：每个 round 提交时拿到全局单调的 `RoundRecord.seq`（`INCR pg:roundseq`），`SinkContext.writeVersion() = seq × 1000 + attempt`（`RunContext` 同样提供 `attempt()` / `writeVersion()`）。`JdbcSinks.xxx(...).versionColumn("pg_version")` 会在每一行写入该列：MySQL upsert 变为条件更新（`c = IF(VALUES(ver) >= ver, VALUES(c), c)`，版本列最后赋值），旧 attempt / 旧 round 的僵尸写入覆盖不了新结果；ClickHouse 需把表声明为 `ReplacingMergeTree(pg_version)`，`FINAL` 读取保留最高版本。校验和只覆盖业务列。外部系统（如算法回调）请按 batch id 幂等，batch id 必须全局唯一：`ChunkIds.batchId(roundId, chunkId, attempt)` = `<roundId>:<chunkId>@<attempt>`。chunk id 每个 round 都按同样规则推出（`S0003`），只用 `chunkId@attempt` 的话，按 batch id 去重的外部服务会把下个月的 round 当成重复请求并返回旧结果，所以 round id 必须在 batch id 里（旧的两参数 `batchId(chunkId, attempt)` 已 `@Deprecated`，不要再用）。signal 按 round + 闸门存储；`Gates.externalCountOf` 只统计无 `@` 或以 `@<当前 attempt>` 结尾的 signal，`GateContext.runAttemptOf(pipelineId)` 提供当前 attempt。
+**版本化 sink**：每个 round 提交时拿到全局单调的 `RoundRecord.seq`（`plane.nextRoundSeq(store.maxRoundSeq())`：`pg:roundseq` 先被抬到存储里已有的最大 seq 再 `INCR`，所以 Redis 数据丢失后新 round 的版本仍高于 sink 表里已有的版本；MySQL 控制面的 `maxRoundSeq` 是 `MAX(pg_round.seq)`，Redis 控制面是 `pg:store:maxseq`；retention 删光所有 round 后这个下限随之消失），`SinkContext.writeVersion() = seq × 1000 + attempt`（`RunContext` 同样提供 `attempt()` / `writeVersion()`）。`JdbcSinks.xxx(...).versionColumn("pg_version")` 会在每一行写入该列：MySQL upsert 变为条件更新（`c = IF(VALUES(ver) >= ver, VALUES(c), c)`，版本列最后赋值），旧 attempt / 旧 round 的僵尸写入覆盖不了新结果；ClickHouse 需把表声明为 `ReplacingMergeTree(pg_version)`，`FINAL` 读取保留最高版本。校验和只覆盖业务列。外部系统（如算法回调）请按 batch id 幂等，batch id 必须全局唯一，由框架签发：sink 里调用 `ctx.batchId(chunk)`（`SinkContext.batchId(Chunk)`），格式 `<roundId>:<pipelineId>:<chunkId>@<attempt>`（`ChunkIds.batchId(roundId, pipelineId, chunkId, attempt)`）。chunk id 每个 round、每个源 pipeline 都按同样规则推出（`S0003`），只用 `chunkId@attempt` 的话，按 batch id 去重的外部服务会把下个月的 round、或同一 round 里另一个 pipeline 的 chunk 当成重复请求，所以 round id 和 pipeline id 都在 batch id 里（旧的两参、三参 `batchId` 重载已删除；pipeline id 和输出口名不允许含 `:`，图构建时会报错）。signal 按 round + 闸门存储，key 最长 512 个字符：`engine.signalGate` 对更长（或空）的 key 抛 `IllegalArgumentException`，不会静默截断（MySQL 的 `pg_gate_signal.signal_key` 为 `VARCHAR(512)`，`init()` 会把旧的 `VARCHAR(190)` 自动 `ALTER` 加宽；主键 64+64+512 个字符 × 4 字节 = 2560 字节，低于 InnoDB 的 3072）。`Gates.externalCountOf(p)` 的条件：当前 attempt 里按 chunk id **去重**后的 signal 数 ≥ 该 pipeline「真正调用过 sink 的 DONE chunk 数」（`GateContext.sinkChunkCount`：sink 写出行数 > 0 的 chunk；输出为空的 chunk 不会调用 sink，也就不会回调）。signal key 无 `@` 的算任意 attempt，以 `@<当前 attempt>` 结尾的算当前，旧格式（`chunk@attempt`、`round:chunk@attempt`）与新格式对应同一 chunk 时只算一次；`GateContext.runAttemptOf(pipelineId)` 提供当前 attempt。
 
 **使用方的约束（正确性依赖这些假设）**：
 - Runner 与 `enumerate` 必须确定性（同样输入、同样输出，同样的 chunk 切分）。
@@ -340,7 +340,7 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 - Runner 输出必须按 `chunkKey` 分组；同一个 key 在分组结束后再次出现会抛 `PipelinerException`（output of port X is not grouped by chunkKey）。
 - Sink 的 key 必须唯一（MySQL `upsertKeys`、ClickHouse 排序键）。
 - ClickHouse 凡是参与产出结果的读取都要加 `FINAL`（`useFinal()`）。
-- 外部系统对全局唯一的 batch id（`<roundId>:<chunkId>@<attempt>`）幂等。
+- 外部系统对全局唯一、由框架签发的 batch id（`ctx.batchId(chunk)` = `<roundId>:<pipelineId>:<chunkId>@<attempt>`）幂等。
 
 ## 数据保留
 
@@ -413,6 +413,6 @@ curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
 - 管理命令被 leader 取出后、执行前 leader 宕机，命令会丢失（客户端超时，重试即可）。
 - MySQL fencing 在读取 round epoch 的子查询与新 master 的 `fenceRound` 之间有极小窗口。
 - ClickHouse sink 的幂等依赖 ReplacingMergeTree 与 `FINAL` 读取。
-- 行数为 0 的 source split 不会触发外部回调（`externalCountOf` 闸门据此计数）。
+- `externalCountOf` 期望的回调数来自 chunk 记录里的 sink 行数（MySQL 列 `pg_chunk.sink_rows`、Redis 计数器 `_sink`）：行数为 0 的 split / chunk 不调用 sink，也不计入期望。升级前已落库的 chunk 记录没有该数值（按 0 计），跨升级进行中的 round 其 `externalCountOf` 闸门会少算，需要时用 `openGate` 或 `rerunFrom`。
 - 尚无 Kafka source、HTTP sink。
 - 未实现按 chunk 批量拉取（`pullBatch`）。

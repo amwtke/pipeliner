@@ -30,10 +30,27 @@ public interface ControlPlaneStore {
     boolean fenceRound(String roundId, long epoch);
 
     /**
-     * Highest master epoch ever stored on any round (0 if none). Used as the floor for a new master epoch, so epochs stay above the
-     * stored round epochs even after the data plane's epoch counter was lost (Redis wiped).
+     * Highest master epoch ever reserved ({@link #reserveMasterEpoch}) or stored on any round (0 if none). The floor for a new master
+     * epoch, so epochs stay above every epoch already used even after the data plane's epoch counter was lost (Redis wiped).
+     * Default 0 (stores that predate it: no floor).
      */
-    long maxMasterEpoch();
+    default long maxMasterEpoch() { return 0L; }
+
+    /**
+     * Durably claims {@code epoch} for the calling master before it is used: atomically sets the stored maximum to {@code epoch} iff
+     * {@code epoch} is above both the highest reserved epoch and every round's epoch, and returns whether it did. Of two masters that were
+     * handed the same epoch (e.g. after the data plane's counter was lost) only one gets true. Default true: no durable reservation.
+     */
+    default boolean reserveMasterEpoch(long epoch) { return true; }
+
+    /**
+     * Highest {@link RoundRecord#getSeq()} ever created (0 if none): the floor for the next round sequence, so write versions stay above
+     * every existing one even after the data plane's sequence counter was lost. Default 0 (no floor).
+     */
+    default long maxRoundSeq() { return 0L; }
+
+    /** Longest accepted gate signal key (characters); {@link #saveGateSignal} throws IllegalArgumentException above it, never truncates. */
+    int MAX_SIGNAL_KEY_LENGTH = 512;
 
     /** Status in CREATED, RUNNING, PAUSED. */
     List<String> findActiveRounds();
@@ -69,7 +86,7 @@ public interface ControlPlaneStore {
     /** To CLOSED; clears armed/deadline/opened/context/alerted (signals kept; resetRuns also deletes them). */
     void resetGate(String roundId, String gateId, long epoch);
 
-    /** Idempotent per key. */
+    /** Idempotent per key. @throws IllegalArgumentException when the key is longer than {@link #MAX_SIGNAL_KEY_LENGTH} (or null/empty) */
     void saveGateSignal(String roundId, String gateId, String signalKey, String payload);
 
     Map<String, String> loadGateSignals(String roundId, String gateId);
@@ -108,6 +125,13 @@ public interface ControlPlaneStore {
     List<ChunkRecord> queryChunks(ChunkQuery q);
 
     long countChunks(String roundId, String pipelineId, ChunkStatus status);
+
+    /**
+     * DONE chunks of the pipeline that wrote more than 0 rows to a sink (sum of the {@code "sink:"} entries of rowsOut &gt; 0), i.e. the chunks
+     * that actually called {@code Sink.write}. An empty chunk skips the sink, so only these can produce an external callback.
+     * Default: all DONE chunks (stores that predate it).
+     */
+    default long countSinkChunks(String roundId, String pipelineId) { return countChunks(roundId, pipelineId, ChunkStatus.DONE); }
 
     /** Over DONE chunks: rowsOut keys starting with "e" summed. */
     Map<String, Long> sumRowsOutByEdge(String roundId, String runId);

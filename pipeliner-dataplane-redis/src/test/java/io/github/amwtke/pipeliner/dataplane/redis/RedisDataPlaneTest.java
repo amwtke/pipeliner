@@ -254,6 +254,15 @@ class RedisDataPlaneTest {
     }
 
     @Test
+    void nextRoundSeqRespectsFloor() {
+        assertEquals(1, dp.nextRoundSeq());
+        assertEquals(58, dp.nextRoundSeq(57), "a counter below the floor (Redis wiped) is raised to it, then incremented");
+        assertEquals(59, dp.nextRoundSeq(3), "a lower floor changes nothing");
+        assertEquals(60, dp.nextRoundSeq());
+        assertEquals("60", raw.sync().get(Keys.roundSeq()), "the raised counter is persisted");
+    }
+
+    @Test
     void nextEpochRespectsFloor() {
         assertEquals(0, dp.currentEpoch());
         assertEquals(8, dp.nextEpoch(7), "counter below the floor is raised to it, then incremented");

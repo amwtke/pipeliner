@@ -82,6 +82,10 @@ public final class PipelineGraph {
             for (PipelineSpec s : specs) {
                 if (s.getId() == null || s.getId().isEmpty()) throw new PipelinerException("pipeline id must not be empty");
                 if (map.put(s.getId(), s) != null) throw new PipelinerException("duplicate pipeline id: " + s.getId());
+                // ':' separates the parts of a batch id / signal key (ChunkIds.batchId); chunk ids embed port names
+                if (s.getId().indexOf(':') >= 0) throw new PipelinerException("pipeline id must not contain ':': " + s.getId());
+                for (String port : s.getPorts())
+                    if (port == null || port.indexOf(':') >= 0) throw new PipelinerException("port name of pipeline " + s.getId() + " must not contain ':': " + port);
             }
             List<EdgeSpec> edges = new ArrayList<>();
             for (String[] e : rawEdges) {

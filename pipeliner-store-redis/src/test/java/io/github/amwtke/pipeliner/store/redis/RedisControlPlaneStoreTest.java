@@ -68,6 +68,30 @@ class RedisControlPlaneStoreTest extends AbstractControlPlaneStoreContractTest {
         assertFalse(c.sismember("pg:store:active", rid));
     }
 
+    @org.junit.jupiter.api.Test
+    void initBackfillsMaxEpochAndSeqFromExistingRounds() {
+        String rid = "bf-" + Long.toString(System.nanoTime(), 36);
+        io.github.amwtke.pipeliner.core.store.RoundRecord r = io.github.amwtke.pipeliner.core.store.RoundRecord.builder().roundId(rid).graphName("bf-g").bizKey(rid)
+                .planHash("h").planJson("{}").status(io.github.amwtke.pipeliner.core.store.RoundStatus.CREATED).createdAt(1L).seq(9_000_000L).build();
+        shared.createRound(r, java.util.Collections.singletonList(io.github.amwtke.pipeliner.core.store.RunRecord.builder().roundId(rid).runId("run1").stage(0)
+                .status(io.github.amwtke.pipeliner.core.store.RunStatus.PENDING).build()), java.util.Collections.<io.github.amwtke.pipeliner.core.store.GateRecord>emptyList(),
+                java.util.Collections.singletonList(io.github.amwtke.pipeliner.core.store.PipelineRecord.builder().roundId(rid).pipelineId("p1").runId("run1")
+                        .status(io.github.amwtke.pipeliner.core.store.PipelineStatus.PENDING).build()));
+        // the round's epoch was written by a path that does not maintain the global max (e.g. an upgraded store)
+        io.lettuce.core.api.sync.RedisCommands<String, String> c = client.connect().sync();
+        c.hset("pg:{" + rid + "}:round", "epoch", "8000000");
+        c.del("pg:store:maxepoch", "pg:store:maxseq");
+        assertEquals(0, shared.maxMasterEpoch());
+        assertEquals(0, shared.maxRoundSeq());
+        shared.init();
+        assertTrue(shared.maxMasterEpoch() >= 8_000_000L, "init backfilled the max epoch: " + shared.maxMasterEpoch());
+        assertTrue(shared.maxRoundSeq() >= 9_000_000L, "init backfilled the max seq: " + shared.maxRoundSeq());
+        shared.init();   // idempotent, never lowers
+        assertTrue(shared.maxMasterEpoch() >= 8_000_000L);
+        assertFalse(shared.reserveMasterEpoch(8_000_000L), "a reservation at the backfilled epoch is refused");
+        assertTrue(shared.reserveMasterEpoch(shared.maxMasterEpoch() + 1));
+    }
+
     private static int scan(io.lettuce.core.api.sync.RedisCommands<String, String> c, String rid) {
         int n = 0;
         io.lettuce.core.ScanArgs args = io.lettuce.core.ScanArgs.Builder.matches("pg:{" + rid + "}:*").limit(1000);

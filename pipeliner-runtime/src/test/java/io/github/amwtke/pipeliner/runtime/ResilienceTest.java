@@ -72,10 +72,11 @@ class ResilienceTest {
 
     @Test void newLeaderEpochStaysAboveStoredRoundEpochsAfterTheEpochCounterWasLost() throws Exception {
         try (Harness h = new Harness(slowGraph(), Collections.<String, ExecMode>emptyMap())) {
-            DefaultPipelinerEngine e = h.pod("pod1");
+            DefaultPipelinerEngine e = h.pod(cfg("pod1").build(), false);   // not started yet: the master must not read the floor before the setup below
             String round = e.submit("slow", "k", null);
             assertTrue(h.store.fenceRound(round, 7));   // the round was last fenced by epoch 7 ...
             h.plane.resetEpoch();                        // ... then Redis lost pg:epoch (INCR would restart at 1)
+            e.start();
             assertEquals(RoundStatus.SUCCEEDED, e.awaitRound(round, 20000));
             List<Long> issued = h.plane.issuedEpochs();
             assertFalse(issued.isEmpty(), "a new epoch was taken");

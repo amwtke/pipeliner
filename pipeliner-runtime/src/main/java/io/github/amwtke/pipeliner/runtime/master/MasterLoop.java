@@ -28,6 +28,9 @@ public final class MasterLoop implements Runnable {
     private volatile boolean leader;
     private volatile long lastRenew;
     private long lastActiveSync;
+    private volatile long lastExternalTick;
+    private volatile long lastGapWarn;
+    private static final long GAP_WARN_EVERY_MILLIS = 60_000;
     private Thread thread;
     private final ReentrantLock tickLock = new ReentrantLock();
     private int roundsTicked;
@@ -70,7 +73,7 @@ public final class MasterLoop implements Runnable {
         boolean locked = false;
         try { locked = tickLock.tryLock(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }   // wait out an external tick
         try {
-            if (leader && release) {
+            if (release) {   // not only when leader: a pod that took the lease but failed before becoming leader holds it too (release deletes only our own)
                 try { s.plane.releaseLeadership(s.podId()); } catch (RuntimeException e) { log.warn("release leadership failed: {}", e.toString()); }
             }
             if (leader) s.metrics.leaderLost(s.podId());
@@ -87,6 +90,7 @@ public final class MasterLoop implements Runnable {
     public TickResult tick() {
         long t0 = System.currentTimeMillis();
         if (stopped) return TickResult.skipped("master stopped", false, ctx.epoch(), 0);
+        if (s.cfg.getMasterTickMode() == MasterTickMode.EXTERNAL) checkExternalGap(t0);
         if (!tickLock.tryLock()) return TickResult.skipped(TickResult.IN_PROGRESS, leader, ctx.epoch(), 0);
         try {
             roundsTicked = 0;
@@ -106,6 +110,21 @@ public final class MasterLoop implements Runnable {
         }
     }
 
+    /**
+     * EXTERNAL mode: the lease is only renewed by ticks, so a gap above leaderTtl/2 between two ticks is one bad delay away from an expired lease
+     * (and a leadership flap). Warns at most once a minute. Rule of thumb: trigger interval &lt; leaderTtl / 3.
+     */
+    private void checkExternalGap(long now) {
+        long prev = lastExternalTick;
+        lastExternalTick = now;
+        long limit = s.cfg.getLeaderTtlMillis() / 2;
+        if (prev == 0 || now - prev <= limit || now - lastGapWarn < GAP_WARN_EVERY_MILLIS) return;
+        lastGapWarn = now;
+        log.warn("{}: {} ms passed between two master ticks, more than half of leader-ttl-millis ({}). The lease may expire between triggers and "
+                + "leadership will flap: raise pipeliner.runtime.leader-ttl-millis or shorten the trigger interval (keep it below leader-ttl-millis / 3)",
+                s.podId(), now - prev, s.cfg.getLeaderTtlMillis());
+    }
+
     @Override public void run() {
         while (!stopped) {
             try {
@@ -113,7 +132,7 @@ public final class MasterLoop implements Runnable {
                 Thread.sleep(s.cfg.getTickMillis());
             } catch (InterruptedException e) {
                 return;
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {   // incl. Errors (e.g. AbstractMethodError from an old custom store): the master thread must never die
                 log.warn("master tick failed: {}", e.toString());
                 try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
             }
@@ -131,7 +150,22 @@ public final class MasterLoop implements Runnable {
         }
         lastRenew = System.currentTimeMillis();
         if (!leader || s.plane.currentEpoch() != ctx.epoch()) {
-            long epoch = s.plane.nextEpoch(s.store.maxMasterEpoch());   // floor: stored round epochs survive a wiped Redis epoch counter
+            long epoch;
+            boolean reserved;
+            try {
+                // floor: epochs already reserved / stored survive a wiped Redis epoch counter; the reservation makes the epoch durable BEFORE
+                // it is used, so a master that stalls before its first write cannot have its epoch handed out again
+                epoch = s.plane.nextEpoch(s.store.maxMasterEpoch());
+                reserved = s.store.reserveMasterEpoch(epoch);
+            } catch (RuntimeException | Error e) {
+                if (!leader) releaseLease();   // do not sit on the lease (renewed every tick) while unable to become leader
+                throw e;
+            }
+            if (!reserved) {
+                log.warn("{} could not reserve master epoch {} (another master holds it or a higher one); retrying next tick", s.podId(), epoch);
+                if (leader) stepDown("epoch " + epoch + " already reserved by another master");
+                return false;
+            }
             ctx.epoch(epoch);
             leader = true;
             lastActiveSync = 0;   // re-register every active round (the Redis active set may have been lost)
@@ -139,6 +173,10 @@ public final class MasterLoop implements Runnable {
             log.info("{} became leader (epoch {})", s.podId(), epoch);
         }
         return true;
+    }
+
+    private void releaseLease() {
+        try { s.plane.releaseLeadership(s.podId()); } catch (RuntimeException e) { log.warn("release leadership failed: {}", e.toString()); }
     }
 
     private void stepDown(String why) {

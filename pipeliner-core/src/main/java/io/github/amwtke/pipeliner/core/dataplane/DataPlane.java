@@ -22,10 +22,13 @@ public interface DataPlane extends AutoCloseable {
     /** Deletes only if ours. */
     void releaseLeadership(String podId);
     String currentLeader();
-    /** Same as {@code nextEpoch(0)}. */
-    default long nextEpoch() { return nextEpoch(0); }
-    /** Atomically raises the epoch counter to at least {@code floor}, then increments it: the result is always &gt; floor. */
-    long nextEpoch(long floor);
+    /** Increments the epoch counter and returns it (new master term). */
+    long nextEpoch();
+    /**
+     * Atomically raises the epoch counter to at least {@code floor}, then increments it: the result is always &gt; floor.
+     * Default ignores the floor (implementations that predate it).
+     */
+    default long nextEpoch(long floor) { return nextEpoch(); }
     long currentEpoch();
 
     // rounds and desired state
@@ -39,6 +42,11 @@ public interface DataPlane extends AutoCloseable {
     boolean fenceRound(String roundId, long epoch);
     /** Global, monotonic submit sequence (INCR pg:roundseq). */
     long nextRoundSeq();
+    /**
+     * Like {@link #nextRoundSeq()} but the result is always &gt; {@code floor} (the counter is raised to the floor first, atomically), so
+     * sequences stay above the stored rounds' even after the counter was lost. Default ignores the floor.
+     */
+    default long nextRoundSeq(long floor) { return nextRoundSeq(); }
     void addActiveRound(String roundId);
     void removeActiveRound(String roundId, long epoch);
     Set<String> activeRounds();

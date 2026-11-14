@@ -42,6 +42,7 @@ public final class GateContextImpl implements GateContext {
     @Override public long armedAtMillis() { return armedAt; }
     @Override public long nowMillis() { return now; }
     @Override public long doneChunkCount(String pipelineId) { return store.countChunks(roundId, pipelineId, ChunkStatus.DONE); }
+    @Override public long sinkChunkCount(String pipelineId) { return store.countSinkChunks(roundId, pipelineId); }
     @Override public DataSourceRegistry dataSources() { return dataSources; }
     @Override public int runAttemptOf(String pipelineId) { return attemptOf.applyAsInt(pipelineId); }
 }

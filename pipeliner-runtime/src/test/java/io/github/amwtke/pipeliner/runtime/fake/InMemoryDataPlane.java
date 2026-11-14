@@ -92,7 +92,12 @@ public class InMemoryDataPlane implements DataPlane {
     }
     @Override public synchronized void releaseLeadership(String podId) { if (podId.equals(leader)) leader = null; }
     @Override public synchronized String currentLeader() { return leader != null && System.currentTimeMillis() <= leaderExpiry ? leader : null; }
-    @Override public synchronized long nextEpoch(long floor) { if (epoch < floor) epoch = floor; issued.add(++epoch); return epoch; }
+    @Override public synchronized long nextEpoch() { return nextEpoch(0); }
+    /** Test hook: nextEpoch hands out exactly this value (ignoring floor and counter), like two masters that read the floor before either reserved. */
+    public volatile Long forcedEpoch;
+    @Override public synchronized long nextEpoch(long floor) {
+        if (forcedEpoch != null) { issued.add(forcedEpoch); epoch = forcedEpoch; return forcedEpoch; }
+        if (epoch < floor) epoch = floor; issued.add(++epoch); return epoch; }
     /** Simulates losing the epoch counter (Redis wiped); forgets the epochs handed out so far. */
     public synchronized void resetEpoch() { epoch = 0; issued.clear(); }
     /** Epochs handed out since construction / the last resetEpoch. */
@@ -113,7 +118,10 @@ public class InMemoryDataPlane implements DataPlane {
         fences.put(r, epoch);
         return true;
     }
-    @Override public synchronized long nextRoundSeq() { return ++roundSeq; }
+    @Override public synchronized long nextRoundSeq() { return nextRoundSeq(0); }
+    @Override public synchronized long nextRoundSeq(long floor) { if (roundSeq < floor) roundSeq = floor; return ++roundSeq; }
+    /** Simulates losing the round sequence counter (Redis wiped). */
+    public synchronized void resetRoundSeq() { roundSeq = 0; }
     @Override public synchronized void removeActiveRound(String r, long epoch) { fenced(r, epoch); active.remove(r); }
     @Override public synchronized Set<String> activeRounds() { return new LinkedHashSet<>(active); }
     @Override public synchronized void setDesiredParallelism(String r, String p, int n, int attempt, long epoch) {

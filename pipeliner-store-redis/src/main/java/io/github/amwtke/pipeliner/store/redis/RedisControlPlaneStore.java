@@ -33,6 +33,12 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     /** Retention indexes (score = finishedAt, member = roundId): all terminal rounds / terminal rounds not yet compacted. Candidates only: the scripts re-check the round. */
     private static final String FINISHED = "pg:store:finished";
     private static final String UNCOMPACTED = "pg:store:uncompacted";
+    /** Highest master epoch reserved ({@link #reserveMasterEpoch}) or stored on a round (fence/backfill); one number, compare-and-set only. */
+    private static final String MAX_EPOCH = "pg:store:maxepoch";
+    /** Highest round seq ever created (raised in the createRound script and by the init backfill). */
+    private static final String MAX_SEQ = "pg:store:maxseq";
+    /** Chunk counter field (in pg:{r}:cnt:PID): DONE chunks that wrote sink rows. Not a ChunkStatus. */
+    private static final String SINK_CNT = "_sink";
 
     /** KEYS[1]=hash, KEYS[2]=round hash (round-level epoch fence); ARGV[1]=expected status or ''; ARGV[2]=epoch or -1 (no fence); then (op,field,value) triples: S set, N set-if-absent, D delete, I incr. */
     private static final String MUTATE =
@@ -54,7 +60,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "end\n"
             + "return 1\n";
 
-    /** KEYS[1]=biz hash; ARGV: bizField, roundId, nItems, items (H key n f v.. | S key member | Z key score member). Returns winning roundId. */
+    /** KEYS[1]=biz hash; ARGV: bizField, roundId, nItems, items (H key n f v.. | S key member | Z key score member | M key value: raise a max). Returns winning roundId. */
     private static final String CREATE =
             "if redis.call('HSETNX',KEYS[1],ARGV[1],ARGV[2])==0 then return redis.call('HGET',KEYS[1],ARGV[1]) end\n"
             + "local p=4\n"
@@ -65,13 +71,16 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "    for j=0,n-1 do redis.call('HSET',ARGV[p+1],ARGV[p+3+2*j],ARGV[p+4+2*j]) end\n"
             + "    p=p+3+2*n\n"
             + "  elseif t=='S' then redis.call('SADD',ARGV[p+1],ARGV[p+2]); p=p+3\n"
+            + "  elseif t=='M' then\n"
+            + "    if tonumber(ARGV[p+2])>tonumber(redis.call('GET',ARGV[p+1]) or '0') then redis.call('SET',ARGV[p+1],ARGV[p+2]) end\n"
+            + "    p=p+3\n"
             + "  else redis.call('ZADD',ARGV[p+1],ARGV[p+2],ARGV[p+3]); p=p+4 end\n"
             + "end\n"
             + "return ARGV[2]\n";
 
     /**
-     * KEYS[1]=round hash; ARGV[1]=epoch or -1 (no fence), ARGV[2]=journal offset or '', then 7-tuples (mode,pid,cid,status,json,rowsIn,rowsOutTotal).
-     * mode O overwrite, D overwrite unless DONE, N insert if absent. Keeps per-pipeline status counters and DONE row sums in pg:{r}:cnt:PID.
+     * KEYS[1]=round hash; ARGV[1]=epoch or -1 (no fence), ARGV[2]=journal offset or '', then 8-tuples (mode,pid,cid,status,json,rowsIn,rowsOutTotal,sinkRows).
+     * mode O overwrite, D overwrite unless DONE, N insert if absent. Keeps per-pipeline status counters, DONE row sums and the count of DONE chunks with sink rows (_sink) in pg:{r}:cnt:PID.
      * Returns 1 ok, 0 fenced, -1 round missing.
      */
     private static final String CHUNKS =
@@ -85,7 +94,12 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "  if ARGV[2]~='' then redis.call('HSET',rk,'journalOffset',ARGV[2]) end\n"
             + "end\n"
             + "local function num(x) if type(x)=='number' then return x end return 0 end\n"
-            + "for i=3,#ARGV,7 do\n"
+            + "local function sinkOf(rec)\n"
+            + "  local t=0\n"
+            + "  if type(rec.rowsOut)=='table' then for k,v in pairs(rec.rowsOut) do if string.sub(k,1,5)=='sink:' then t=t+num(v) end end end\n"
+            + "  return t\n"
+            + "end\n"
+            + "for i=3,#ARGV,8 do\n"
             + "  local mode,pid,cid,st,js=ARGV[i],ARGV[i+1],ARGV[i+2],ARGV[i+3],ARGV[i+4]\n"
             + "  local ck,nk=pre..'chunk:'..pid,pre..'cnt:'..pid\n"
             + "  local old=redis.call('HGET',ck,cid)\n"
@@ -102,6 +116,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "        local ot=0\n"
             + "        if type(orec.rowsOut)=='table' then for _,v in pairs(orec.rowsOut) do ot=ot+num(v) end end\n"
             + "        redis.call('HINCRBYFLOAT',nk,'_out',-ot)\n"
+            + "        if sinkOf(orec)>0 then redis.call('HINCRBY',nk,'_sink',-1) end\n"
             + "      end\n"
             + "      if type(orec.splitSpec)=='string' and not string.find(js,'\"splitSpec\":',1,true) then\n"
             + "        js=string.sub(js,1,-2)..',\"splitSpec\":'..cjson.encode(orec.splitSpec)..'}'\n"
@@ -112,6 +127,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "    if st=='DONE' then\n"
             + "      redis.call('HINCRBYFLOAT',nk,'_in',ARGV[i+5])\n"
             + "      redis.call('HINCRBYFLOAT',nk,'_out',ARGV[i+6])\n"
+            + "      if tonumber(ARGV[i+7])>0 then redis.call('HINCRBY',nk,'_sink',1) end\n"
             + "    end\n"
             + "  end\n"
             + "end\n"
@@ -194,7 +210,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "  local h=redis.call('HGETALL',nk)\n"
             + "  local counts,ins,outs={},nil,nil\n"
             + "  for i=1,#h,2 do\n"
-            + "    if h[i]=='_in' then ins=h[i+1] elseif h[i]=='_out' then outs=h[i+1]\n"
+            + "    if h[i]=='_in' then ins=h[i+1] elseif h[i]=='_out' then outs=h[i+1] elseif h[i]=='_sink' then -- not a status\n"
             + "    elseif tonumber(h[i+1])>0 then counts[h[i]]=tonumber(h[i+1]) end\n"
             + "  end\n"
             + "  removed=removed+redis.call('HLEN',ck)\n"
@@ -265,11 +281,15 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     public void init() {
         RedisCommands<String, String> c = r();
         c.ping();
-        // retention indexes: backfill terminal rounds created before they existed (idempotent, ZADD NX)
+        // one pass over the rounds: retention indexes for terminal rounds created before they existed (idempotent, ZADD NX), and the
+        // maximum epoch / seq of the existing rounds (the floors of new epochs and sequences; raised only, so concurrent inits cannot lower them)
+        long maxEpoch = 0, maxSeq = 0;
         long total = c.zcard(ROUNDS);
         for (long from = 0; from < total; from += 1000) {
             for (String rid : c.zrange(ROUNDS, from, from + 999)) {
-                List<io.lettuce.core.KeyValue<String, String>> v = c.hmget(k(rid, "round"), "status", "finishedAt", "createdAt", "compacted");
+                List<io.lettuce.core.KeyValue<String, String>> v = c.hmget(k(rid, "round"), "status", "finishedAt", "createdAt", "compacted", "epoch", "seq");
+                if (v.get(4).hasValue()) maxEpoch = Math.max(maxEpoch, Long.parseLong(v.get(4).getValue()));
+                if (v.get(5).hasValue()) maxSeq = Math.max(maxSeq, Long.parseLong(v.get(5).getValue()));
                 String st = v.get(0).hasValue() ? v.get(0).getValue() : null;
                 if (st == null || !RoundStatus.valueOf(st).terminal()) continue;
                 String fin = v.get(1).hasValue() ? v.get(1).getValue() : (v.get(2).hasValue() ? v.get(2).getValue() : "0");
@@ -278,6 +298,8 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
                     c.zadd(UNCOMPACTED, io.lettuce.core.ZAddArgs.Builder.nx(), Double.parseDouble(fin), rid);
             }
         }
+        if (maxEpoch > 0) evalLong(RAISE_MAX, new String[]{MAX_EPOCH}, Collections.singletonList(String.valueOf(maxEpoch)));
+        if (maxSeq > 0) evalLong(RAISE_MAX, new String[]{MAX_SEQ}, Collections.singletonList(String.valueOf(maxSeq)));
     }
 
     // ---------------------------------------------------------------- keys & helpers
@@ -303,6 +325,13 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
 
     private static boolean bool(Map<String, String> h, String f) { return "1".equals(h.get(f)); }
 
+    /** Rows written to sinks: the {@code "sink:<port>"} entries of a chunk's rowsOut. */
+    private static long sinkRowsOf(Map<String, Long> m) {
+        long t = 0;
+        if (m != null) for (Map.Entry<String, Long> e : m.entrySet()) if (e.getKey().startsWith("sink:") && e.getValue() != null) t += e.getValue();
+        return t;
+    }
+
     private static long totalOf(Map<String, Long> m) {
         long t = 0;
         if (m != null) for (Long v : m.values()) if (v != null) t += v;
@@ -323,26 +352,44 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
 
     private boolean mutate(String roundId, String key, Ops o) { return evalLong(MUTATE, new String[]{key, k(roundId, "round")}, o.args) == 1; }
 
-    /** KEYS[1]=round hash; ARGV[1]=epoch. 1 fenced ok, 0 higher epoch holds the round or it is missing. */
+    /** KEYS[1]=max key; ARGV[1]=value. Raises the stored number to the value if it is higher; returns 1 when it did. */
+    private static final String RAISE_MAX =
+            "if tonumber(ARGV[1])>tonumber(redis.call('GET',KEYS[1]) or '0') then redis.call('SET',KEYS[1],ARGV[1]); return 1 end\n"
+            + "return 0\n";
+
+    /** KEYS[1]=round hash, KEYS[2]=max epoch key; ARGV[1]=epoch. 1 fenced ok, 0 higher epoch holds the round or it is missing. Raises the max only when the round's epoch actually rises (not on every tick). */
     private static final String FENCE =
             "local cur=redis.call('HGET',KEYS[1],'epoch')\n"
             + "if not cur then return 0 end\n"
             + "if tonumber(cur)>tonumber(ARGV[1]) then return 0 end\n"
-            + "redis.call('HSET',KEYS[1],'epoch',ARGV[1])\n"
-            + "local mx=tonumber(redis.call('GET','pg:store:maxepoch') or '0')\n"
-            + "if tonumber(ARGV[1])>mx then redis.call('SET','pg:store:maxepoch',ARGV[1]) end\n"
+            + "if tonumber(cur)<tonumber(ARGV[1]) then\n"
+            + "  redis.call('HSET',KEYS[1],'epoch',ARGV[1])\n"
+            + "  if tonumber(ARGV[1])>tonumber(redis.call('GET',KEYS[2]) or '0') then redis.call('SET',KEYS[2],ARGV[1]) end\n"
+            + "end\n"
             + "return 1\n";
+
+    /** KEYS[1]=max epoch key; ARGV[1]=epoch. Compare-and-set: stores the epoch and returns 1 iff it is above the stored maximum, else 0. */
+    private static final String RESERVE_EPOCH =
+            "if tonumber(ARGV[1])>tonumber(redis.call('GET',KEYS[1]) or '0') then redis.call('SET',KEYS[1],ARGV[1]); return 1 end\n"
+            + "return 0\n";
 
     @Override
     public boolean fenceRound(String roundId, long epoch) {
-        return evalLong(FENCE, new String[]{k(roundId, "round")}, java.util.Collections.singletonList(String.valueOf(epoch))) == 1;
+        return evalLong(FENCE, new String[]{k(roundId, "round"), MAX_EPOCH}, Collections.singletonList(String.valueOf(epoch))) == 1;
     }
 
     @Override
-    public long maxMasterEpoch() {
-        String v = r().get("pg:store:maxepoch");
-        return v == null ? 0L : Long.parseLong(v);
+    public boolean reserveMasterEpoch(long epoch) {
+        return evalLong(RESERVE_EPOCH, new String[]{MAX_EPOCH}, Collections.singletonList(String.valueOf(epoch))) == 1;
     }
+
+    @Override
+    public long maxMasterEpoch() { return longOf(r().get(MAX_EPOCH)); }
+
+    @Override
+    public long maxRoundSeq() { return longOf(r().get(MAX_SEQ)); }
+
+    private static long longOf(String v) { return v == null ? 0L : Long.parseLong(v); }
 
     // ---------------------------------------------------------------- rounds
 
@@ -433,6 +480,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             n += setItem(items, k(rid, "pls"), p.getPipelineId());
         }
         items.add("Z"); items.add(ROUNDS); items.add(String.valueOf(round.getCreatedAt())); items.add(rid); n++;
+        items.add("M"); items.add(MAX_SEQ); items.add(String.valueOf(round.getSeq())); n++;
         if (!round.getStatus().terminal()) n += setItem(items, ACTIVE, rid);
         List<String> args = new ArrayList<>();
         args.add(round.getGraphName() + "|" + round.getBizKey());
@@ -678,6 +726,8 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public void saveGateSignal(String roundId, String gateId, String signalKey, String payload) {
+        if (signalKey == null || signalKey.isEmpty() || signalKey.length() > MAX_SIGNAL_KEY_LENGTH)
+            throw new IllegalArgumentException("signal key must be 1.." + MAX_SIGNAL_KEY_LENGTH + " characters, got " + (signalKey == null ? "null" : String.valueOf(signalKey.length())));
         r().hsetnx(k(roundId, "signal:" + gateId), signalKey, payload == null ? "" : payload);
     }
 
@@ -691,6 +741,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     private static void tuple(List<String> args, String mode, ChunkRecord c) {
         args.add(mode); args.add(c.getPipelineId()); args.add(c.getChunkId()); args.add(c.getStatus().name()); args.add(ChunkCodec.toJson(c));
         args.add(String.valueOf(c.getRowsIn() == null ? 0 : c.getRowsIn())); args.add(String.valueOf(totalOf(c.getRowsOut())));
+        args.add(String.valueOf(sinkRowsOf(c.getRowsOut())));
     }
 
     private long chunkScript(String roundId, long epoch, String offset, List<String> tuples) {
@@ -792,6 +843,12 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             for (ChunkStatus s : ChunkStatus.values()) if (status == null || status == s) total += Math.max(0, lng0(h, s.name()));
         }
         return total;
+    }
+
+    @Override
+    public long countSinkChunks(String roundId, String pipelineId) {
+        String v = r().hget(k(roundId, "cnt:" + pipelineId), SINK_CNT);
+        return v == null ? 0L : Math.max(0L, Long.parseLong(v));
     }
 
     @Override

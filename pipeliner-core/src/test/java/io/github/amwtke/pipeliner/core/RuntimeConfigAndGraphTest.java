@@ -38,4 +38,11 @@ class RuntimeConfigAndGraphTest {
         assertThrows(PipelinerException.class, () -> PipelineGraph.builder("g").pipeline("a", p -> { }).pipeline("a", p -> { }).build());
         assertThrows(io.github.amwtke.pipeliner.core.plan.PlanException.class, g::plan);
     }
+
+    @Test void colonIsReservedForBatchIds() {
+        // ':' separates round, pipeline and chunk in batch ids / signal keys; chunk ids embed port names
+        assertThrows(PipelinerException.class, () -> PipelineGraph.builder("g").pipeline("a:b", p -> { }).build());
+        assertThrows(PipelinerException.class, () -> PipelineGraph.builder("g").pipeline("a", p -> p.ports("x:y")).build());
+        PipelineGraph.builder("g").pipeline("a", p -> p.ports("side-1")).build();
+    }
 }

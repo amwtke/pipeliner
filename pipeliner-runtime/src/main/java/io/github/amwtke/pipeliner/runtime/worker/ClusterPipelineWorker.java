@@ -123,9 +123,9 @@ public final class ClusterPipelineWorker implements Runnable {
                     }
                 } catch (InterruptedException e) {
                     return;
-                } catch (RuntimeException e) {
+                } catch (Throwable e) {   // incl. Errors: a worker loop must not die silently (chunk failures are handled in handle())
                     if (killed || stopRequested) return;
-                    if (isNoGroup(e)) {
+                    if (e instanceof RuntimeException && isNoGroup((RuntimeException) e)) {
                         log.debug("worker {}: stream gone ({})", consumer, e.getMessage());
                         sleepQuietly(500);
                     } else {

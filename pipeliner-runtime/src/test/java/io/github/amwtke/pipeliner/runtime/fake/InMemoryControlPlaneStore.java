@@ -23,6 +23,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         RoundRecord ex = findRoundByBizKey(round.getGraphName(), round.getBizKey());
         if (ex != null) return ex;
         String id = round.getRoundId();
+        maxSeq = Math.max(maxSeq, round.getSeq());
         rounds.put(id, copy(round));
         Map<String, RunRecord> rm = new LinkedHashMap<>();
         for (RunRecord r : rs) rm.put(r.getRunId(), copy(r));
@@ -91,11 +92,29 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         return true;
     }
 
+    private long reservedEpoch;
+    private long maxSeq;
+    /** Test hooks: maxMasterEpoch throws it (RuntimeException or Error), reserveMasterEpoch always refuses. */
+    public volatile Throwable failMaxMasterEpoch;
+    public volatile boolean refuseReservations;
+
     @Override public synchronized long maxMasterEpoch() {
-        long m = 0;
+        Throwable f = failMaxMasterEpoch;
+        if (f instanceof Error) throw (Error) f;
+        if (f instanceof RuntimeException) throw (RuntimeException) f;
+        long m = reservedEpoch;
         for (RoundRecord r : rounds.values()) m = Math.max(m, r.getMasterEpoch());
         return m;
     }
+
+    @Override public synchronized boolean reserveMasterEpoch(long epoch) {
+        if (refuseReservations) return false;
+        if (epoch <= maxMasterEpoch()) return false;
+        reservedEpoch = epoch;
+        return true;
+    }
+
+    @Override public synchronized long maxRoundSeq() { return maxSeq; }
 
     /** Round-level fence: a write is allowed only if round.masterEpoch &lt;= epoch. */
     private boolean fenced(String roundId, long epoch) { return rounds.get(roundId).getMasterEpoch() > epoch; }
@@ -213,6 +232,7 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override public synchronized void saveGateSignal(String roundId, String gateId, String key, String payload) {
+        if (key == null || key.isEmpty() || key.length() > MAX_SIGNAL_KEY_LENGTH) throw new IllegalArgumentException("signal key must be 1.." + MAX_SIGNAL_KEY_LENGTH + " characters");
         Map<String, String> m = signals.get(roundId + "|" + gateId);
         if (m == null) { m = new LinkedHashMap<>(); signals.put(roundId + "|" + gateId, m); }
         m.put(key, payload);
@@ -338,6 +358,17 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
     @Override public synchronized long countChunks(String roundId, String pipelineId, ChunkStatus status) {
         long n = 0;
         for (ChunkRecord c : chunks.get(roundId).values()) if (c.getPipelineId().equals(pipelineId) && c.getStatus() == status) n++;
+        return n;
+    }
+
+    @Override public synchronized long countSinkChunks(String roundId, String pipelineId) {
+        long n = 0;
+        for (ChunkRecord c : chunks.get(roundId).values()) {
+            if (!c.getPipelineId().equals(pipelineId) || c.getStatus() != ChunkStatus.DONE || c.getRowsOut() == null) continue;
+            long sink = 0;
+            for (Map.Entry<String, Long> e : c.getRowsOut().entrySet()) if (e.getKey().startsWith("sink:")) sink += e.getValue();
+            if (sink > 0) n++;
+        }
         return n;
     }
 

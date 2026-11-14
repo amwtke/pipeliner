@@ -107,6 +107,13 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     @SuppressWarnings("unchecked")
     private static List<String> strList(String j) { return j == null ? null : (List<String>) ChunkCodec.fromJson(j, List.class); }
 
+    /** Rows written to sinks: the {@code "sink:<port>"} entries of a chunk's rowsOut. */
+    private static long sinkRowsOf(Map<String, Long> m) {
+        long t = 0;
+        if (m != null) for (Map.Entry<String, Long> e : m.entrySet()) if (e.getKey().startsWith("sink:") && e.getValue() != null) t += e.getValue();
+        return t;
+    }
+
     private static long totalOf(Map<String, Long> m) {
         long t = 0;
         if (m != null) for (Long v : m.values()) if (v != null) t += v;
@@ -128,15 +135,17 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             "CREATE TABLE IF NOT EXISTS pg_gate (round_id VARCHAR(64) NOT NULL, gate_id VARCHAR(64) NOT NULL, type VARCHAR(16), before_runs TEXT,"
                 + " status VARCHAR(16) NOT NULL, armed_at BIGINT, deadline_at BIGINT, opened_by VARCHAR(128), opened_at BIGINT, context_json TEXT,"
                 + " master_epoch BIGINT NOT NULL DEFAULT 0, alerted TINYINT(1) NOT NULL DEFAULT 0, PRIMARY KEY (round_id, gate_id))" + TBL,
-            "CREATE TABLE IF NOT EXISTS pg_gate_signal (round_id VARCHAR(64) NOT NULL, gate_id VARCHAR(64) NOT NULL, signal_key VARCHAR(190) NOT NULL,"
+            "CREATE TABLE IF NOT EXISTS pg_gate_signal (round_id VARCHAR(64) NOT NULL, gate_id VARCHAR(64) NOT NULL, signal_key VARCHAR(512) NOT NULL,"
                 + " payload MEDIUMTEXT, created_at BIGINT, PRIMARY KEY (round_id, gate_id, signal_key))" + TBL,
             "CREATE TABLE IF NOT EXISTS pg_pipeline (round_id VARCHAR(64) NOT NULL, pipeline_id VARCHAR(64) NOT NULL, run_id VARCHAR(64) NOT NULL,"
                 + " status VARCHAR(16) NOT NULL, parallelism INT NOT NULL DEFAULT 1, enum_done TINYINT(1) NOT NULL DEFAULT 0, master_epoch BIGINT NOT NULL DEFAULT 0,"
                 + " started_at BIGINT, finished_at BIGINT, error TEXT, PRIMARY KEY (round_id, pipeline_id), KEY idx_run (round_id, run_id))" + TBL,
             "CREATE TABLE IF NOT EXISTS pg_chunk (round_id VARCHAR(64) NOT NULL, pipeline_id VARCHAR(64) NOT NULL, chunk_id VARCHAR(255) NOT NULL,"
                 + " run_id VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL, attempt INT NOT NULL DEFAULT 0, owner VARCHAR(128), input_edge VARCHAR(64),"
-                + " split_spec TEXT, rows_in BIGINT, rows_out_json TEXT, rows_out_total BIGINT, cost_ms INT, error TEXT, updated_at BIGINT,"
-                + " PRIMARY KEY (round_id, pipeline_id, chunk_id), KEY idx_run_status (round_id, run_id, status))" + TBL
+                + " split_spec TEXT, rows_in BIGINT, rows_out_json TEXT, rows_out_total BIGINT, sink_rows BIGINT NOT NULL DEFAULT 0, cost_ms INT, error TEXT, updated_at BIGINT,"
+                + " PRIMARY KEY (round_id, pipeline_id, chunk_id), KEY idx_run_status (round_id, run_id, status))" + TBL,
+            // single row (id=1): the highest master epoch ever reserved (reserveMasterEpoch)
+            "CREATE TABLE IF NOT EXISTS pg_master_epoch (id TINYINT NOT NULL, max_epoch BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (id))" + TBL
         };
         try (Connection c = ds.getConnection(); Statement st = c.createStatement()) {
             for (String s : ddl) st.execute(s);
@@ -147,11 +156,33 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             alter(st, "ALTER TABLE pg_round ADD KEY idx_graph_created (graph_name, created_at)");
             alter(st, "ALTER TABLE pg_round ADD KEY idx_created (created_at)");
             alter(st, "ALTER TABLE pg_round ADD KEY idx_master_epoch (master_epoch)");   // MAX(master_epoch) = index lookup
+            alter(st, "ALTER TABLE pg_round ADD KEY idx_seq (seq)");   // MAX(seq) = index lookup
+            alter(st, "ALTER TABLE pg_chunk ADD COLUMN sink_rows BIGINT NOT NULL DEFAULT 0");   // rows written to sinks (0 for chunks stored before the column existed)
+            st.execute("INSERT IGNORE INTO pg_master_epoch (id, max_epoch) VALUES (1, 0)");
+            widenSignalKey(c);
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_counts TEXT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_in BIGINT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_out BIGINT");
         } catch (SQLException e) {
             throw new IllegalStateException("init failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * pg_gate_signal.signal_key was VARCHAR(190): widens it to {@link ControlPlaneStore#MAX_SIGNAL_KEY_LENGTH} when narrower. The primary key
+     * (round_id 64 + gate_id 64 + signal_key 512 characters = 640 x 4 bytes under utf8mb4 = 2560) stays below InnoDB's 3072-byte limit.
+     */
+    private static void widenSignalKey(Connection c) throws SQLException {
+        int len = 0;
+        try (PreparedStatement ps = c.prepareStatement("SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS "
+                + "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='pg_gate_signal' AND COLUMN_NAME='signal_key'");
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) len = rs.getInt(1);
+        }
+        if (len > 0 && len < MAX_SIGNAL_KEY_LENGTH) {
+            try (Statement st = c.createStatement()) {
+                st.execute("ALTER TABLE pg_gate_signal MODIFY signal_key VARCHAR(" + MAX_SIGNAL_KEY_LENGTH + ") NOT NULL");
+            }
         }
     }
 
@@ -309,7 +340,21 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public long maxMasterEpoch() {
-        List<Long> r = query("SELECT COALESCE(MAX(master_epoch),0) FROM pg_round", rs -> rs.getLong(1));
+        List<Long> r = query("SELECT GREATEST(COALESCE((SELECT max_epoch FROM pg_master_epoch WHERE id=1),0), COALESCE((SELECT MAX(master_epoch) FROM pg_round),0))",
+                rs -> rs.getLong(1));
+        return r.isEmpty() ? 0L : r.get(0);
+    }
+
+    @Override
+    public boolean reserveMasterEpoch(long epoch) {
+        // matched rows == changed rows here (the WHERE only matches when the value rises); above every round's epoch too
+        return update("UPDATE pg_master_epoch SET max_epoch=? WHERE id=1 AND max_epoch<? AND ? > (SELECT COALESCE(MAX(master_epoch),0) FROM pg_round)",
+                epoch, epoch, epoch) == 1;
+    }
+
+    @Override
+    public long maxRoundSeq() {
+        List<Long> r = query("SELECT COALESCE(MAX(seq),0) FROM pg_round", rs -> rs.getLong(1));
         return r.isEmpty() ? 0L : r.get(0);
     }
 
@@ -427,6 +472,8 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public void saveGateSignal(String roundId, String gateId, String signalKey, String payload) {
+        if (signalKey == null || signalKey.isEmpty() || signalKey.length() > MAX_SIGNAL_KEY_LENGTH)   // INSERT IGNORE would truncate silently
+            throw new IllegalArgumentException("signal key must be 1.." + MAX_SIGNAL_KEY_LENGTH + " characters, got " + (signalKey == null ? "null" : String.valueOf(signalKey.length())));
         update("INSERT IGNORE INTO pg_gate_signal (round_id,gate_id,signal_key,payload,created_at) VALUES (?,?,?,?,?)",
                 roundId, gateId, signalKey, payload, System.currentTimeMillis());
     }
@@ -441,7 +488,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     // ---------------------------------------------------------------- chunks
 
-    private static final String CHUNK_INS = "INSERT %s INTO pg_chunk (round_id,pipeline_id,chunk_id,run_id,status,attempt,owner,input_edge,split_spec,rows_in,rows_out_json,rows_out_total,cost_ms,error,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    private static final String CHUNK_INS = "INSERT %s INTO pg_chunk (round_id,pipeline_id,chunk_id,run_id,status,attempt,owner,input_edge,split_spec,rows_in,rows_out_json,rows_out_total,sink_rows,cost_ms,error,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
     @Override
     public void savePendingChunks(String roundId, List<ChunkRecord> chunks) {
@@ -451,7 +498,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 long now = System.currentTimeMillis();
                 for (ChunkRecord k : chunks) {
                     bind(ps, roundId, k.getPipelineId(), k.getChunkId(), k.getRunId(), k.getStatus() == null ? "PENDING" : k.getStatus().name(), k.getAttempt(),
-                            k.getOwner(), k.getInputEdge(), k.getSplitSpec(), k.getRowsIn(), json(k.getRowsOut()), k.getRowsOut() == null ? null : totalOf(k.getRowsOut()),
+                            k.getOwner(), k.getInputEdge(), k.getSplitSpec(), k.getRowsIn(), json(k.getRowsOut()), k.getRowsOut() == null ? null : totalOf(k.getRowsOut()), sinkRowsOf(k.getRowsOut()),
                             k.getCostMs(), k.getError(), k.getUpdatedAt() == null ? now : k.getUpdatedAt());
                     ps.addBatch();
                 }
@@ -461,7 +508,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         });
     }
 
-    private static final String[] UPSERT_COLS = {"run_id", "attempt", "owner", "input_edge", "rows_in", "rows_out_json", "rows_out_total", "cost_ms", "error", "updated_at"};
+    private static final String[] UPSERT_COLS = {"run_id", "attempt", "owner", "input_edge", "rows_in", "rows_out_json", "rows_out_total", "sink_rows", "cost_ms", "error", "updated_at"};
 
     private static String upsertSql(boolean dead) {
         StringBuilder sb = new StringBuilder(String.format(CHUNK_INS, "")).append(" ON DUPLICATE KEY UPDATE ");
@@ -491,7 +538,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                         curType = t;
                     }
                     bind(ps, roundId, e.getPipelineId(), e.getChunkId(), e.getRunId(), t, e.getAttempt(), e.getOwner(), e.getInputEdge(), null, e.getRowsIn(),
-                            json(e.getRowsOut()), e.getRowsOut() == null ? null : totalOf(e.getRowsOut()), e.getCostMs(), e.getError(), e.getTs());
+                            json(e.getRowsOut()), e.getRowsOut() == null ? null : totalOf(e.getRowsOut()), sinkRowsOf(e.getRowsOut()), e.getCostMs(), e.getError(), e.getTs());
                     ps.addBatch();
                 }
                 if (ps != null) ps.executeBatch();
@@ -553,6 +600,11 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
         if (pipelineId != null) { sb.append(" AND pipeline_id=?"); a.add(pipelineId); }
         if (status != null) { sb.append(" AND status=?"); a.add(status.name()); }
         return query(sb.toString(), rs -> rs.getLong(1), a.toArray()).get(0);
+    }
+
+    @Override
+    public long countSinkChunks(String roundId, String pipelineId) {
+        return query("SELECT COUNT(*) FROM pg_chunk WHERE round_id=? AND pipeline_id=? AND status='DONE' AND sink_rows>0", rs -> rs.getLong(1), roundId, pipelineId).get(0);
     }
 
     @Override

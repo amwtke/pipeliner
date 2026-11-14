@@ -51,8 +51,8 @@ public final class ClaimRenewer {
                 for (Claim c : claims) {
                     try {
                         if (!plane.renew(c.consumer, c.streamKey, c.entryId)) claims.remove(c);   // acked or deleted meanwhile
-                    } catch (RuntimeException e) {
-                        if (ClusterPipelineWorker.isNoGroup(e)) claims.remove(c);   // the stream/group is gone (round cleaned up)
+                    } catch (Throwable e) {   // incl. Errors: the renewer thread must never die (claims would expire and be re-delivered)
+                        if (e instanceof RuntimeException && ClusterPipelineWorker.isNoGroup((RuntimeException) e)) claims.remove(c);   // the stream/group is gone (round cleaned up)
                         else log.warn("claim renew failed for {} {}: {}", c.streamKey, c.entryId, e.toString());
                     }
                 }

@@ -41,6 +41,7 @@ public class RedisDataPlane implements DataPlane {
     private final Script requeueS = new Script("requeue_dlq");
     private final Script fenceS = new Script("fence");
     private final Script epochS = new Script("next_epoch");
+    private final Script seqS = new Script("next_round_seq");
     private final Script fencedCmdS = new Script("fenced_cmd");
     private final Script ensureGroupS = new Script("ensure_group");
     private final Script clearDlqS = new Script("clear_dlq");
@@ -51,7 +52,7 @@ public class RedisDataPlane implements DataPlane {
         this.client = client;
         this.shared = client.connect(StringCodec.UTF8);
         this.cmd = shared.sync();
-        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS)) s.load();
+        for (Script s : Arrays.asList(commitS, enqueueS, deadS, requeueS, fenceS, epochS, seqS, fencedCmdS, ensureGroupS, clearDlqS, leaderS, releaseS)) s.load();
     }
 
     /** A Lua script loaded via SCRIPT LOAD, run with EVALSHA and falling back to EVAL on NOSCRIPT. */
@@ -158,7 +159,9 @@ public class RedisDataPlane implements DataPlane {
         return fenceS.run(new String[] {Keys.fence(roundId)}, String.valueOf(epoch)) == 1;
     }
 
-    @Override public long nextRoundSeq() { return cmd.incr(Keys.roundSeq()); }
+    @Override public long nextRoundSeq() { return nextRoundSeq(0); }
+
+    @Override public long nextRoundSeq(long floor) { return seqS.run(new String[] {Keys.roundSeq()}, String.valueOf(floor)); }
 
     @Override public void addActiveRound(String roundId) { cmd.sadd(Keys.activeRounds(), roundId); }
 

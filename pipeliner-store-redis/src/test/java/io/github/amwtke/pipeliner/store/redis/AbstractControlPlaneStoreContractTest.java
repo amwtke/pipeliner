@@ -738,4 +738,98 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals(1, store.findTerminalRounds(FUTURE, 1).size());
         assertTrue(store.purgeRounds(FUTURE, 1).size() <= 1);
     }
+
+    @Test
+    void reserveMasterEpochIsAtomicCompareAndSet() throws Exception {
+        long base = store.maxMasterEpoch();
+        long e = base + 10;
+        assertTrue(store.reserveMasterEpoch(e));
+        assertEquals(e, store.maxMasterEpoch());
+        assertFalse(store.reserveMasterEpoch(e), "the same epoch cannot be owned twice");
+        assertFalse(store.reserveMasterEpoch(e - 5), "a lower epoch is refused");
+        assertEquals(e, store.maxMasterEpoch(), "a refused reservation does not lower the maximum");
+        assertTrue(store.reserveMasterEpoch(e + 1));
+        // a round fenced by a higher epoch also blocks a lower reservation
+        String rid = mk("reserve");
+        long high = e + 100;
+        assertTrue(store.fenceRound(rid, high));
+        assertFalse(store.reserveMasterEpoch(high), "round epochs count");
+        assertTrue(store.reserveMasterEpoch(high + 1));
+        // two masters handed the same epoch: exactly one owns it
+        long raced = high + 50;
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<Boolean>> fs = new ArrayList<>();
+            for (int i = 0; i < 8; i++) fs.add(pool.submit(() -> store.reserveMasterEpoch(raced)));
+            int owners = 0;
+            for (Future<Boolean> f : fs) if (f.get()) owners++;
+            assertEquals(1, owners);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(raced, store.maxMasterEpoch());
+    }
+
+    @Test
+    void maxRoundSeqTracksCreatedRounds() {
+        long base = store.maxRoundSeq();
+        RoundRecord a = newRound(rid("seqa"), "biz-seqa");
+        a.setSeq(base + 7);
+        store.createRound(a, Collections.singletonList(run(a.getRoundId(), "run1", 0)), Collections.<GateRecord>emptyList(), Collections.singletonList(pl(a.getRoundId(), "p1", "run1")));
+        assertEquals(base + 7, store.maxRoundSeq());
+        RoundRecord b = newRound(rid("seqb"), "biz-seqb");
+        b.setSeq(base + 3);
+        store.createRound(b, Collections.singletonList(run(b.getRoundId(), "run1", 0)), Collections.<GateRecord>emptyList(), Collections.singletonList(pl(b.getRoundId(), "p1", "run1")));
+        assertEquals(base + 7, store.maxRoundSeq(), "a lower seq does not lower the maximum");
+    }
+
+    @Test
+    void countSinkChunksCountsOnlyDoneChunksThatWroteSinkRows() {
+        String rid = mk("sinkchunks");
+        assertEquals(0, store.countSinkChunks(rid, "p1"));
+        store.savePendingChunks(rid, Collections.singletonList(pending(rid, "p1", "S0004", "run1")));
+        store.applyChunkEvents(rid, Arrays.asList(
+                ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("sink:out", 10)),                 // wrote rows
+                ev(rid, "DONE", "p1", "S0001", "run1", "split", 5, m("e1", 5, "sink:out", 0)),          // empty sink output: sink never called
+                ev(rid, "DONE", "p1", "S0002", "run1", "split", 0, m("sink:out", 0)),                   // empty chunk
+                ev(rid, "DONE", "p1", "S0003", "run1", "split", 6, m("sink:a", 2, "sink:b", 3, "e1", 1)), // two ports: still one chunk
+                ev(rid, "DEAD", "p1", "S0005", "run1", "split", 0, null),
+                ev(rid, "DONE", "p2", "S0000>1.0", "run1", "e1", 3, m("sink:out", 3))), "1-0", 1);
+        assertEquals(2, store.countSinkChunks(rid, "p1"), "S0000 and S0003");
+        assertEquals(4, store.countChunks(rid, "p1", ChunkStatus.DONE), "all DONE chunks, empty or not");
+        assertEquals(1, store.countSinkChunks(rid, "p2"));
+        // events are replayed after a failover: counting stays idempotent
+        store.applyChunkEvents(rid, Arrays.asList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("sink:out", 10)),
+                ev(rid, "DONE", "p1", "S0003", "run1", "split", 6, m("sink:a", 2, "sink:b", 3, "e1", 1))), "2-0", 1);
+        assertEquals(2, store.countSinkChunks(rid, "p1"));
+        // a later DONE with other numbers replaces the record, and the count follows
+        store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("sink:out", 0))), "3-0", 1);
+        assertEquals(1, store.countSinkChunks(rid, "p1"));
+        store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0004", "run1", "split", 1, m("sink:out", 1))), "4-0", 1);
+        assertEquals(2, store.countSinkChunks(rid, "p1"), "a pending chunk completing counts once");
+        // a rerun deletes the chunk records, and the count with them
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 2);
+        assertEquals(0, store.countSinkChunks(rid, "p1"));
+        assertEquals(0, store.countSinkChunks(rid, "p2"));
+    }
+
+    @Test
+    void gateSignalKeyLongerThanTheLimitIsRejectedNotTruncated() {
+        String rid = mk("sigkey");
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() < ControlPlaneStore.MAX_SIGNAL_KEY_LENGTH - 2) sb.append('k');
+        String stem = sb.toString();
+        String ka = stem + "@0", kb = stem + "@1";                  // exactly at the limit, differing only in the last characters
+        assertEquals(ControlPlaneStore.MAX_SIGNAL_KEY_LENGTH, ka.length());
+        store.saveGateSignal(rid, "gate1", ka, "a");
+        store.saveGateSignal(rid, "gate1", kb, "b");
+        Map<String, String> got = store.loadGateSignals(rid, "gate1");
+        assertEquals(2, got.size(), "keys past the old 190 character limit stay distinct");
+        assertEquals("a", got.get(ka));
+        assertEquals("b", got.get(kb));
+        String tooLong = stem + "@10";
+        assertThrows(IllegalArgumentException.class, () -> store.saveGateSignal(rid, "gate1", tooLong, "x"));
+        assertThrows(IllegalArgumentException.class, () -> store.saveGateSignal(rid, "gate1", "", "x"));
+        assertEquals(2, store.loadGateSignals(rid, "gate1").size(), "nothing was stored for the rejected keys");
+    }
 }

@@ -1,7 +1,9 @@
 package io.github.amwtke.pipeliner.runtime.context;
 
+import io.github.amwtke.pipeliner.api.Chunk;
 import io.github.amwtke.pipeliner.api.DataSourceRegistry;
 import io.github.amwtke.pipeliner.api.SinkContext;
+import io.github.amwtke.pipeliner.core.util.ChunkIds;
 import java.util.Map;
 
 /** SinkContext over round params. */
@@ -29,6 +31,7 @@ public final class SinkContextImpl implements SinkContext {
 
     @Override public int attempt() { return attempt; }
     @Override public long writeVersion() { return writeVersion; }
+    @Override public String batchId(Chunk chunk) { return ChunkIds.batchId(roundId, pipelineId, chunk.getChunkId(), attempt); }
     @Override public String roundId() { return roundId; }
     @Override public String runId() { return runId; }
     @Override public String pipelineId() { return pipelineId; }

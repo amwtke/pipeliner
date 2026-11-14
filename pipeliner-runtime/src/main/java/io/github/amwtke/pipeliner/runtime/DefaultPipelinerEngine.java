@@ -94,7 +94,7 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
         p.put("bizKey", bizKey);
         long now = System.currentTimeMillis();
         RoundRecord round = RoundRecord.builder().roundId(roundId).graphName(graphName).bizKey(bizKey).planHash(plan.getHash())
-                .planJson(planJson(plan)).params(p).status(RoundStatus.CREATED).createdAt(now).seq(s.plane.nextRoundSeq()).build();
+                .planJson(planJson(plan)).params(p).status(RoundStatus.CREATED).createdAt(now).seq(s.plane.nextRoundSeq(s.store.maxRoundSeq())).build();
         List<RunRecord> runs = new ArrayList<>();
         for (PlanRun r : plan.getRuns())
             runs.add(RunRecord.builder().roundId(roundId).runId(r.getRunId()).stage(r.getStage()).mode(r.getMode()).status(RunStatus.PENDING).build());
@@ -123,7 +123,12 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
     @Override public void retryRun(String roundId, String runId) { admin.execute("retryRun", roundId, runId, null); }
     @Override public void rerunFrom(String roundId, String runId) { admin.execute("rerunFrom", roundId, runId, null); }
     @Override public void skipDeadLetters(String roundId, String runId) { admin.execute("skipDeadLetters", roundId, runId, null); }
-    @Override public void signalGate(String roundId, String gateId, String signalKey, String payload) { s.store.saveGateSignal(roundId, gateId, signalKey, payload); }
+    @Override public void signalGate(String roundId, String gateId, String signalKey, String payload) {
+        if (signalKey == null || signalKey.isEmpty() || signalKey.length() > ControlPlaneStore.MAX_SIGNAL_KEY_LENGTH)
+            throw new IllegalArgumentException("signal key must be 1.." + ControlPlaneStore.MAX_SIGNAL_KEY_LENGTH + " characters, got "
+                    + (signalKey == null ? "null" : String.valueOf(signalKey.length())));
+        s.store.saveGateSignal(roundId, gateId, signalKey, payload);
+    }
     @Override public void openGate(String roundId, String gateId, String operator) { admin.execute("openGate", roundId, gateId, operator); }
 
     @Override public RoundView view(String roundId) { return s.store.loadRound(roundId); }

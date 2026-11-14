@@ -3,6 +3,7 @@ package io.github.amwtke.pipeliner.core.graph;
 import io.github.amwtke.pipeliner.api.GateCondition;
 import io.github.amwtke.pipeliner.api.GateContext;
 import io.github.amwtke.pipeliner.api.GateDecision;
+import io.github.amwtke.pipeliner.core.util.ChunkIds;
 import java.time.Duration;
 
 /** Gate factories. Conditions are named classes so plan hashes are stable across JVMs. */
@@ -18,7 +19,12 @@ public final class Gates {
     /** Signals arrive via engine.signalGate. */
     public static GateDef external(GateCondition doneWhen) { return new GateDef(GateType.EXTERNAL, doneWhen); }
 
-    /** Opens when the signals of the current attempt (key without "@" or ending "@attempt", e.g. {@code <roundId>:<chunkId>@<attempt>} from ChunkIds.batchId; signals are stored per round and gate) &gt;= doneChunkCount(pipelineId). */
+    /**
+     * Opens when the number of DISTINCT chunks that signalled in the current attempt is &gt;= the number of chunks of the pipeline that called
+     * the sink ({@code GateContext.sinkChunkCount}; chunks with no sink rows skip the sink and never signal). A signal key is the value of
+     * {@code SinkContext.batchId(chunk)} ({@code <roundId>:<pipelineId>:<chunkId>@<attempt>}); keys without '@' count for any attempt,
+     * keys of older attempts are ignored, and keys of the same chunk in different formats count once. Signals are stored per round and gate.
+     */
     public static GateDef externalCountOf(String pipelineId) { return new GateDef(GateType.EXTERNAL, new CountOf(pipelineId)); }
 
     public static GateDef externalCount(int expected) { return new GateDef(GateType.EXTERNAL, new Count(expected)); }
@@ -36,9 +42,10 @@ public final class Gates {
         CountOf(String pipelineId) { this.pipelineId = pipelineId; }
         @Override public GateDecision evaluate(GateContext ctx) {
             String suffix = "@" + ctx.runAttemptOf(pipelineId);
-            long n = 0;
-            for (String k : ctx.signals().keySet()) if (k.indexOf('@') < 0 || k.endsWith(suffix)) n++;   // signals of older attempts do not count
-            return n >= ctx.doneChunkCount(pipelineId) ? GateDecision.OPEN : GateDecision.WAIT;
+            java.util.Set<String> chunks = new java.util.HashSet<>();
+            for (String k : ctx.signals().keySet())
+                if (k.indexOf('@') < 0 || k.endsWith(suffix)) chunks.add(ChunkIds.chunkOfSignalKey(k));   // signals of older attempts do not count
+            return chunks.size() >= ctx.sinkChunkCount(pipelineId) ? GateDecision.OPEN : GateDecision.WAIT;
         }
     }
 

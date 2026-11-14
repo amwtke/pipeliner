@@ -10,8 +10,12 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class GatesTest {
-    private static GateContext ctx(Map<String, String> signals, long done, int attempt) {
+    private static GateContext ctx(Map<String, String> signals, long done, int attempt) { return ctx(signals, done, done, attempt); }
+
+    /** done: DONE chunks; sink: DONE chunks that called the sink. */
+    private static GateContext ctx(Map<String, String> signals, long done, long sink, int attempt) {
         return new GateContext() {
+            @Override public long sinkChunkCount(String pipelineId) { return sink; }
             public String roundId() { return "r"; }
             public String gateId() { return "g"; }
             public Map<String, String> params() { return null; }
@@ -44,11 +48,11 @@ class GatesTest {
 
     @Test void roundScopedBatchIdsCount() throws Exception {
         Map<String, String> sig = new LinkedHashMap<>();
-        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0000", 2), "x");
-        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0001", 2), "x");
-        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0002", 1), "x");   // older attempt
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0000", 2), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0001", 2), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0002", 1), "x");   // older attempt
         assertEquals(GateDecision.WAIT, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 3, 2)));
-        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "S0002", 2), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0002", 2), "x");
         assertEquals(GateDecision.OPEN, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 3, 2)));
     }
 
@@ -56,5 +60,29 @@ class GatesTest {
         Map<String, String> sig = new LinkedHashMap<>();
         sig.put("legacy-key", "x");
         assertEquals(GateDecision.OPEN, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 1, 5)));
+    }
+
+    @Test void countsDistinctChunksNotRawKeys() throws Exception {
+        Map<String, String> sig = new LinkedHashMap<>();
+        // a rolling deploy: the old pod signalled "S0003#out@0", the new pod re-ran the chunk and signalled the new format: one chunk, two keys
+        sig.put("S0003#out@0", "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0003#out", 0), "x");
+        sig.put("r:S0003#out@0", "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0004#out", 0), "x");
+        assertEquals(GateDecision.WAIT, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 3, 0)), "two distinct chunks of three");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0005#out", 0), "x");
+        assertEquals(GateDecision.OPEN, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 3, 0)));
+    }
+
+    @Test void expectsOnlyChunksThatCalledTheSink() throws Exception {
+        Map<String, String> sig = new LinkedHashMap<>();
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0001#out", 0), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0003#out", 0), "x");
+        // 8 DONE chunks, but 4 of them were empty and never called the sink: 2 of 4 signals is not enough, 4 of 4 is
+        assertEquals(GateDecision.WAIT, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 8, 4, 0)));
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0005#out", 0), "x");
+        sig.put(io.github.amwtke.pipeliner.core.util.ChunkIds.batchId("r", "p", "S0007#out", 0), "x");
+        assertEquals(GateDecision.OPEN, Gates.externalCountOf("p").getCondition().evaluate(ctx(sig, 8, 4, 0)));
+        assertEquals(GateDecision.OPEN, Gates.externalCountOf("p").getCondition().evaluate(ctx(new LinkedHashMap<String, String>(), 8, 0, 0)), "all chunks empty: nothing to wait for");
     }
 }

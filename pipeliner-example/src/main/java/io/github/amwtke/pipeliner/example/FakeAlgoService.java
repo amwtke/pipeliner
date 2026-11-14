@@ -43,7 +43,7 @@ public class FakeAlgoService {
         return Demo.q(BigDecimal.valueOf(Math.floorMod(h, 40) - 3));
     }
 
-    /** Asynchronously computes demand for the given material rows and signals gate algo-callback with batchId (<roundId>:<chunkId>@<attempt>, globally unique; a real service should dedupe on it). */
+    /** Asynchronously computes demand for the given material rows and signals gate algo-callback with batchId ({@code <roundId>:<pipelineId>:<chunkId>@<attempt>} from {@code SinkContext.batchId}, globally unique; a real service should dedupe on it). */
     public void submit(String roundId, String planVersion, String batchId, List<Row> materials) {
         executor.submit(() -> {
             try {

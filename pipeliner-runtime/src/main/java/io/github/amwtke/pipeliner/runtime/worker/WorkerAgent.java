@@ -74,7 +74,7 @@ public final class WorkerAgent implements Runnable {
                 Thread.sleep(s.cfg.getTickMillis());
             } catch (InterruptedException e) {
                 return;
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {   // incl. Errors (e.g. AbstractMethodError from an old custom plane): the worker agent thread must never die
                 log.warn("worker agent tick failed: {}", e.toString());
                 try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
             }
