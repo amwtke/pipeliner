@@ -60,14 +60,9 @@ public final class ClusterPipelineWorker implements Runnable {
         this.plan = plan;
         this.params = round.getParams();
         this.splitQueue = pp.isSource() ? Keys.splitQueue(roundId, pipelineId, attempt) : null;
-        if (pp.isSource()) {
-            inputs.add(splitQueue);
-        } else {
-            for (String edgeId : pp.getInputEdgeIds()) {
-                String key = Keys.channel(roundId, edgeId, attempt);
-                inputs.add(key);
-                streamToEdge.put(key, edgeId);
-            }
+        for (Map.Entry<String, String> in : io.github.amwtke.pipeliner.runtime.RunKeys.inputStreams(roundId, pp, attempt).entrySet()) {
+            inputs.add(in.getKey());
+            if (in.getValue() != null) streamToEdge.put(in.getKey(), in.getValue());
         }
     }
 

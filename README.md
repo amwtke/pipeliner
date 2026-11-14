@@ -301,7 +301,7 @@ master 的一次推进（续租/抢主、执行管理命令、推进所有活跃
 
 语义：
 - leader 语义不变：租约 + 每次（重新）获得 leadership 取新 epoch + round 级 fencing。非 leader 的 tick 在尝试抢租约后返回 `skipped`，`skipReason="not leader"`。同一 pod 上并发的 tick 由 `tryLock` 保护，后到者返回 `skipped "tick in progress"`；`master-enabled=false` 返回 `skipped "master disabled"`。
-- worker 心跳/agent 在任何模式下都是本地线程：pod 的存活判定不能依赖调度器。但 leader 租约不是：租约只在 master tick 里续期（心跳不碰它），external 模式下只有触发时才续。**规则：触发间隔 < `leader-ttl-millis` / 3**，否则租约会在两次触发之间过期，每次触发落到不同 pod 时都会换 leader、取新 epoch。
+- worker 心跳/agent 在任何模式下都是本地线程：pod 的存活判定不能依赖调度器。leader 租约和全局限流标志（`pg:throttle`）同样不再依赖触发节奏：external 模式下每个 pod 有一个轻量的本地 `pg-lease-keeper` 线程，**仅当本 pod 是 leader** 时每约 `leader-ttl-millis / 3` 续一次租约（以及限流生效时刷新限流标志的 TTL），它不抢主、不推进 round、不执行命令。抢主（取新 epoch）仍由外部 tick 触发，所以 leader 一旦产生就不会因为触发间隔抖动、或随机路由落到别的 pod 而丢租约。路由建议不变：触发间隔 < `leader-ttl-millis` / 3，并让触发能到达存活 pod；只有 leader 宕机后，才需要一次落到其他 pod 的 tick 来接管（租约到期之后）。
 - 管理命令（pause/cancel/open gate 等）在下一次 tick 才执行，延迟最长约一个触发间隔（`admin-timeout-millis` 需大于它）。round 的推进粒度同样变为触发间隔：间隔越大越省资源，但闸门/run 切换越慢；建议 1–5 秒。
 
 xxl-job 处理器示例（仅示例，框架不依赖 xxl-job）：
@@ -414,5 +414,6 @@ curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
 - MySQL fencing 在读取 round epoch 的子查询与新 master 的 `fenceRound` 之间有极小窗口。
 - ClickHouse sink 的幂等依赖 ReplacingMergeTree 与 `FINAL` 读取。
 - `externalCountOf` 期望的回调数来自 chunk 记录里的 sink 行数（MySQL 列 `pg_chunk.sink_rows`、Redis 计数器 `_sink`）：行数为 0 的 split / chunk 不调用 sink，也不计入期望。升级前已落库的 chunk 记录没有该数值（按 0 计），跨升级进行中的 round 其 `externalCountOf` 闸门会少算，需要时用 `openGate` 或 `rerunFrom`。
+- Redis 数据面丢失（如被 FLUSHALL）时，运行中的 CLUSTER 源 pipeline（split 队列和 split 索引都没了、chunk 记录仍为 PENDING）会被 master 判为失败，错误为「data plane lost ... rerunFrom required」并打 ERROR 日志；需用 `rerunFrom` 重跑。只丢了消费组、队列还在的情形不会被识别。
 - 尚无 Kafka source、HTTP sink。
 - 未实现按 chunk 批量拉取（`pullBatch`）。

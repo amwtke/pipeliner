@@ -137,7 +137,7 @@ public class InMemoryDataPlane implements DataPlane {
         fenced(r, epoch);
         Map<String, String> m = assign.get(r);
         if (m == null) { m = new HashMap<>(); assign.put(r, m); }
-        m.put(run, pod + "|" + attempt);
+        m.put(run, io.github.amwtke.pipeliner.core.dataplane.LocalRunAssignment.format(pod, attempt));
     }
     @Override public synchronized Map<String, String> localRunAssignments(String r) {
         return assign.get(r) == null ? new HashMap<String, String>() : new HashMap<>(assign.get(r));

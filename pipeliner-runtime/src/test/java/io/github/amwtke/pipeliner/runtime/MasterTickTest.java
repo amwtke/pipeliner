@@ -138,14 +138,14 @@ class MasterTickTest {
             TickResult ra = a.tick();
             assertTrue(ra.isLeader());
             assertTrue(b.tick().isSkipped());
-            Thread.sleep(800);   // leaderTtl 600
+            Thread.sleep(800);   // leaderTtl 600: the lease keeper of the live leader keeps it, no handover
+            assertTrue(b.tick().isSkipped(), "a live leader keeps its lease between triggers");
+            a.halt();   // the leader dies (no release): after the TTL the next trigger on another pod takes over
+            Thread.sleep(800);
             TickResult rb = b.tick();
             assertTrue(rb.isLeader());
             assertFalse(rb.isSkipped());
             assertTrue(rb.getEpoch() > ra.getEpoch());
-            TickResult ra2 = a.tick();
-            assertTrue(ra2.isSkipped());
-            assertEquals("not leader", ra2.getSkipReason());
             assertFalse(a.isLeader());
             assertTrue(b.isLeader());
         }

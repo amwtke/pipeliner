@@ -32,9 +32,25 @@ final class RoundMaster {
 
     void memoryThrottle() { backpressure.memoryThrottle(); }
 
+    /** Lease keeper (EXTERNAL mode): re-arms the global throttle flag's TTL. */
+    void refreshThrottleFlag() { backpressure.refreshThrottleFlag(); }
+
+    /** Prunes the per-round state of every round that left the active set (finished, admin-cancelled, purged). */
+    void retain(Set<String> active) {
+        warned.retainAll(active);
+        backpressure.retain(active);
+        stalled.retain(active);
+    }
+
+    private void forget(String roundId) {
+        stalled.forget(roundId);
+        warned.remove(roundId);
+        c.s.fallback.evict(roundId);
+    }
+
     void tick(String roundId) {
         RoundRecord rr = c.s.store.loadRoundRecord(roundId);
-        if (rr == null || rr.getStatus().terminal()) { c.s.plane.removeActiveRound(roundId, c.epoch()); stalled.forget(roundId); return; }
+        if (rr == null || rr.getStatus().terminal()) { c.s.plane.removeActiveRound(roundId, c.epoch()); forget(roundId); return; }
         ExecutionPlan plan = c.s.registry.find(rr.getGraphName());
         if (plan == null || !plan.getHash().equals(rr.getPlanHash())) {
             if (warned.add(roundId)) log.warn("round {}: graph '{}' not registered here or plan hash differs; master skips it", roundId, rr.getGraphName());
@@ -47,11 +63,15 @@ final class RoundMaster {
         boolean paused = rr.getStatus() == RoundStatus.PAUSED;
         if (c.s.plane.isPaused(roundId) != paused) c.s.plane.setPaused(roundId, paused, c.epoch());
         if (paused) return;
-        if (rr.getStatus() == RoundStatus.CREATED
-                && !c.s.store.casRoundStatus(roundId, RoundStatus.CREATED, RoundStatus.RUNNING, null, c.epoch())) return;
+        boolean started = false;
+        if (rr.getStatus() == RoundStatus.CREATED) {
+            if (!c.s.store.casRoundStatus(roundId, RoundStatus.CREATED, RoundStatus.RUNNING, null, c.epoch())) return;
+            started = true;
+        }
 
-        drainer.drain(roundId, plan);
-        RoundData d = RoundData.load(c, roundId, plan);
+        // the drain reuses the record loaded above and hands back the RoundData it loaded (unless local-run events made it stale)
+        JournalDrainer.Drained dr = drainer.drain(roundId, plan, rr);
+        RoundData d = dr.data != null && !started ? dr.data : RoundData.load(c, roundId, plan);
         if (d == null) return;
         gates.evaluate(d);
         d = refresh(d);
@@ -65,7 +85,7 @@ final class RoundMaster {
         d = refresh(d);
         starter.watchdog(d);
         d = refresh(d);
-        if (completion.finishRound(d)) stalled.forget(roundId);
+        if (completion.finishRound(d)) forget(roundId);
         else { backpressure.monitor(d); stalled.sample(d); }
     }
 

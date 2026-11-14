@@ -3,6 +3,8 @@ package io.github.amwtke.pipeliner.runtime.master;
 import io.github.amwtke.pipeliner.api.Split;
 import io.github.amwtke.pipeliner.core.dataplane.DesiredState;
 import io.github.amwtke.pipeliner.core.dataplane.Keys;
+import io.github.amwtke.pipeliner.core.dataplane.LocalRunAssignment;
+import io.github.amwtke.pipeliner.core.store.StaleEpochException;
 import io.github.amwtke.pipeliner.runtime.RunKeys;
 import io.github.amwtke.pipeliner.core.graph.ExecMode;
 import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
@@ -94,8 +96,7 @@ final class RunStarter {
         int attempt = d.run(pr.getRunId()).getAttempt();
         // attempt n starts from a clean slate: drop the keys of every older attempt first (fenced, idempotent, re-driven on recovery)
         if (attempt > 0) c.s.plane.deleteKeys(roundId, RunKeys.ofAttemptsBefore(roundId, d.plan, pr, attempt), c.epoch());
-        for (PlanChannel ch : d.plan.getChannels())
-            if (ch.getRunId().equals(pr.getRunId())) c.s.plane.ensureGroup(roundId, Keys.channel(roundId, ch.getEdgeId(), attempt), c.epoch());
+        for (PlanChannel ch : RunKeys.channelsOf(d.plan, pr.getRunId())) c.s.plane.ensureGroup(roundId, Keys.channel(roundId, ch.getEdgeId(), attempt), c.epoch());
         for (String p : pr.getPipelineIds())
             if (d.plan.pipeline(p).isSource()) c.s.plane.ensureGroup(roundId, Keys.splitQueue(roundId, p, attempt), c.epoch());
         for (String p : pr.getPipelineIds()) {
@@ -138,8 +139,8 @@ final class RunStarter {
         if (load.isEmpty()) return null;
         for (String r : c.s.plane.activeRounds())
             for (String a : c.s.plane.localRunAssignments(r).values()) {
-                String pod = a.substring(0, a.lastIndexOf('|'));
-                if (load.containsKey(pod)) load.put(pod, load.get(pod) + 1);
+                String pod = LocalRunAssignment.podOf(a);   // malformed values are skipped, never thrown on
+                if (pod != null && load.containsKey(pod)) load.put(pod, load.get(pod) + 1);
             }
         String best = null;
         for (String pod : new java.util.TreeSet<>(load.keySet()))
@@ -165,7 +166,7 @@ final class RunStarter {
                 continue;
             }
             if (assign == null) assign = c.s.plane.localRunAssignments(d.roundId());
-            if (!(a + "|" + run.getAttempt()).equals(assign.get(run.getRunId()))) {
+            if (!LocalRunAssignment.format(a, run.getAttempt()).equals(assign.get(run.getRunId()))) {
                 log.warn("local run {}/{}: assign entry '{}' differs from the store; republishing", d.roundId(), run.getRunId(), assign.get(run.getRunId()));
                 c.s.plane.assignLocalRun(d.roundId(), run.getRunId(), a, run.getAttempt(), c.epoch());
             }
@@ -181,11 +182,11 @@ final class RunStarter {
             for (String p : pr.getPipelineIds()) {
                 PipelineRecord rec = d.pipe(p);
                 if (!d.plan.pipeline(p).isSource() || rec.getStatus() != PipelineStatus.RUNNING || rec.isEnumDone()) continue;
-                try {
+                List<Split> splits = new ArrayList<>();
+                List<ChunkRecord> pending = new ArrayList<>();
+                try {   // user code only: a SplitSource failure fails the pipeline
                     List<Split> raw = d.plan.getGraph().getPipelines().get(p).getSource()
                             .enumerate(new SourceContextImpl(roundId, d.round().getParams(), c.s.dataSources));
-                    List<Split> splits = new ArrayList<>();
-                    List<ChunkRecord> pending = new ArrayList<>();
                     int i = 0;
                     if (raw != null) for (Split sp : raw) {
                         Split s = sp.withId(ChunkIds.source(i++));
@@ -194,15 +195,23 @@ final class RunStarter {
                                 .status(ChunkStatus.PENDING).inputEdge("split").splitSpec(ChunkCodec.toJson(s.getSpec()))
                                 .updatedAt(System.currentTimeMillis()).build());
                     }
+                } catch (Exception e) {
+                    log.error("enumeration of {}/{} failed: {}", roundId, p, e.toString());
+                    c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, PipelineStatus.FAILED, "enumerate failed: " + Events.describe(e), c.epoch());
+                    d.touch();
+                    continue;
+                }
+                try {   // infrastructure: every write is idempotent, so a transient failure is simply retried on the next tick
                     for (Split s : splits) c.s.plane.enqueueSplit(roundId, p, run.getAttempt(), s, c.epoch());
                     if (!pending.isEmpty()) c.s.store.savePendingChunks(roundId, pending);
                     c.s.store.setPipelineEnumDone(roundId, p, true, c.epoch());
                     d.touch();
                     log.info("round {} pipeline {} enumerated {} splits", roundId, p, splits.size());
-                } catch (Exception e) {
-                    log.error("enumeration of {}/{} failed: {}", roundId, p, e.toString());
-                    c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, PipelineStatus.FAILED, "enumerate failed: " + Events.describe(e), c.epoch());
-                    d.touch();
+                } catch (StaleEpochException e) {
+                    throw e;   // deposed
+                } catch (RuntimeException e) {
+                    log.error("enumeration of {}/{}: infrastructure failure, will retry on the next tick: {}", roundId, p, e.toString());
+                    d.touch();   // part of it may have been written
                 }
             }
         }
