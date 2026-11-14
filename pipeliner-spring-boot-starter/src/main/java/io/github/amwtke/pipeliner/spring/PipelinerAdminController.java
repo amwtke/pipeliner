@@ -243,11 +243,12 @@ public class PipelinerAdminController {
 
     @PostMapping("/gates/{roundId}/{gateId}/open")
     public Map<String, String> open(@PathVariable String roundId, @PathVariable String gateId,
-                                    @RequestParam(defaultValue = "admin") String operator, HttpServletRequest req) {
+                                    @RequestParam(defaultValue = "admin") String operator,
+                                    @RequestParam(defaultValue = "false") boolean force, HttpServletRequest req) {
         // the authenticated principal wins; the query param is only honoured when no principal exists (security disabled)
         Object principal = req.getAttribute(AdminSecurityFilter.PRINCIPAL_ATTR);
         String op = principal != null ? principal.toString() : operator;
-        return audited(req, roundId, "gate=" + gateId, () -> { engine.openGate(roundId, gateId, op); return ok(); });
+        return audited(req, roundId, "gate=" + gateId, () -> { if (force) engine.openGate(roundId, gateId, op, true); else engine.openGate(roundId, gateId, op); return ok(); });
     }
 
     /** Runs a mutating call and writes one audit line with the resulting HTTP status (never logs tokens). */

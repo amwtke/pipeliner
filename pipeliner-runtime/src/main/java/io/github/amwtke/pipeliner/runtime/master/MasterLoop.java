@@ -222,8 +222,16 @@ public final class MasterLoop implements Runnable {
         lastActiveSync = now;
     }
 
+    /**
+     * Pops ONE command at a time, so a deposition (or a lost lease) in the middle never drops commands that were popped but not run: the rest
+     * simply stays queued for the next leader. A command past its deadline (client timeout) is answered "expired" and not executed.
+     */
     private void executeCommands() {
-        for (String json : s.plane.popCommands(COMMANDS_PER_TICK)) {
+        for (int n = 0; n < COMMANDS_PER_TICK; n++) {
+            if (stopped || !leader || !keepLease()) return;   // checked BEFORE popping: a popped command is always answered
+            java.util.List<String> popped = s.plane.popCommands(1);
+            if (popped.isEmpty()) return;
+            String json = popped.get(0);
             Map<String, String> cmd;
             String id = null;
             try {
@@ -235,8 +243,16 @@ public final class MasterLoop implements Runnable {
             }
             Map<String, String> result = new LinkedHashMap<>();
             boolean deposed = false;
+            long deadline = parseLong(cmd.get("deadline"));
+            if (deadline > 0 && System.currentTimeMillis() > deadline) {
+                log.warn("admin command {} ({}) expired before execution; skipped", id, cmd.get("op"));
+                result.put("ok", "false");
+                result.put("expired", "true");
+                result.put("error", "command expired before the leader executed it (not executed)");
+                if (id != null) s.plane.putCommandResult(id, ChunkCodec.toJson(result));
+                continue;
+            }
             try {
-                if (!keepLease()) throw new PipelinerException("this pod is no longer the leader; retry");
                 new AdminOps(s, ctx.epoch()).execute(cmd);
                 result.put("ok", "true");
             } catch (StaleEpochException e) {
@@ -252,5 +268,9 @@ public final class MasterLoop implements Runnable {
             if (id != null) s.plane.putCommandResult(id, ChunkCodec.toJson(result));
             if (deposed) throw new StaleEpochException("deposed by admin command");
         }
+    }
+
+    private static long parseLong(String v) {
+        try { return v == null ? 0 : Long.parseLong(v); } catch (NumberFormatException e) { return 0; }
     }
 }

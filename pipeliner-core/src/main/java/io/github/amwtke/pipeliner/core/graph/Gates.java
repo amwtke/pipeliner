@@ -53,7 +53,15 @@ public final class Gates {
         private final int expected;
         Count(int expected) { this.expected = expected; }
         @Override public GateDecision evaluate(GateContext ctx) {
-            return ctx.signals().size() >= expected ? GateDecision.OPEN : GateDecision.WAIT;
+            // only signals of the current attempt count: a key "...<pipeline>:<chunk>@n" with n below its pipeline's run attempt is a leftover
+            int n = 0;
+            for (String k : ctx.signals().keySet()) {
+                int attempt = ChunkIds.attemptOfSignalKey(k);
+                String p = attempt < 0 ? null : ChunkIds.pipelineOfSignalKey(k);
+                if (p != null && attempt < ctx.runAttemptOf(p)) continue;
+                n++;
+            }
+            return n >= expected ? GateDecision.OPEN : GateDecision.WAIT;
         }
     }
 

@@ -228,6 +228,8 @@ public class RedisDataPlane implements DataPlane {
         return out;
     }
 
+    @Override public boolean withdrawCommand(String commandJson) { return cmd.lrem(Keys.commands(), 1, commandJson) > 0; }
+
     @Override public void putCommandResult(String commandId, String resultJson) {
         cmd.set(Keys.commandResult(commandId), resultJson, SetArgs.Builder.ex(600));
     }

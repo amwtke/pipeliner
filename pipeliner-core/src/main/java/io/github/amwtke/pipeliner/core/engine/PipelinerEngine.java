@@ -27,8 +27,15 @@ public interface PipelinerEngine {
     void rerunFrom(String roundId, String runId);
     /** Drops DLQ, chunks SKIPPED, failed pipelines to RUNNING, round marked incomplete. */
     void skipDeadLetters(String roundId, String runId);
-    void signalGate(String roundId, String gateId, String signalKey, String payload);
+    /**
+     * Stores an external signal (idempotent per key). Returns false when the signal was rejected without being stored: its key carries an
+     * {@code @<attempt>} lower than the current attempt of the gate's after-pipeline run (a late callback of a superseded attempt).
+     */
+    boolean signalGate(String roundId, String gateId, String signalKey, String payload);
+    /** Opens a CLOSED gate if all its after-runs SUCCEEDED; fails (PipelinerException) for an unknown gate or one that is not CLOSED. */
     void openGate(String roundId, String gateId, String operator);
+    /** As {@link #openGate(String, String, String)}; {@code force} skips the after-runs check. */
+    default void openGate(String roundId, String gateId, String operator, boolean force) { openGate(roundId, gateId, operator); }
     RoundView view(String roundId);
     List<ChunkRecord> chunks(ChunkQuery q);
     /** "e1".., "split:&lt;p&gt;", "dlq:&lt;p&gt;" to XLEN for running runs. */

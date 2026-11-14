@@ -28,6 +28,7 @@ import io.github.amwtke.pipeliner.core.store.RoundStatus;
 import io.github.amwtke.pipeliner.core.store.RoundView;
 import io.github.amwtke.pipeliner.core.store.RunRecord;
 import io.github.amwtke.pipeliner.core.store.RunStatus;
+import io.github.amwtke.pipeliner.core.util.ChunkIds;
 import io.github.amwtke.pipeliner.core.util.ReflectionComponentFactory;
 import io.github.amwtke.pipeliner.runtime.master.MasterLoop;
 import io.github.amwtke.pipeliner.runtime.worker.WorkerAgent;
@@ -123,13 +124,44 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
     @Override public void retryRun(String roundId, String runId) { admin.execute("retryRun", roundId, runId, null); }
     @Override public void rerunFrom(String roundId, String runId) { admin.execute("rerunFrom", roundId, runId, null); }
     @Override public void skipDeadLetters(String roundId, String runId) { admin.execute("skipDeadLetters", roundId, runId, null); }
-    @Override public void signalGate(String roundId, String gateId, String signalKey, String payload) {
+    @Override public boolean signalGate(String roundId, String gateId, String signalKey, String payload) {
         if (signalKey == null || signalKey.isEmpty() || signalKey.length() > ControlPlaneStore.MAX_SIGNAL_KEY_LENGTH)
             throw new IllegalArgumentException("signal key must be 1.." + ControlPlaneStore.MAX_SIGNAL_KEY_LENGTH + " characters, got "
                     + (signalKey == null ? "null" : String.valueOf(signalKey.length())));
+        if (isStaleSignal(roundId, gateId, signalKey)) return false;
         s.store.saveGateSignal(roundId, gateId, signalKey, payload);
+        return true;
     }
-    @Override public void openGate(String roundId, String gateId, String operator) { admin.execute("openGate", roundId, gateId, operator); }
+
+    /** A key {@code ...@<attempt>} lower than the current run attempt of the pipeline it names (or of the gate's after-pipelines) is a late callback. */
+    private boolean isStaleSignal(String roundId, String gateId, String signalKey) {
+        int attempt = ChunkIds.attemptOfSignalKey(signalKey);
+        if (attempt < 0) return false;
+        try {
+            RoundView v = s.store.loadRoundState(roundId);
+            if (v == null) return false;
+            ExecutionPlan plan = s.registry.find(v.getRound().getGraphName());
+            if (plan == null) return false;
+            java.util.List<String> pipelines = new ArrayList<>();
+            String named = ChunkIds.pipelineOfSignalKey(signalKey);
+            if (named != null && plan.pipeline(named) != null) pipelines.add(named);
+            else for (PlanGate g : plan.getGates()) if (g.getGateId().equals(gateId)) pipelines.addAll(g.getAfterPipelines());
+            for (String p : pipelines) {
+                PlanPipeline pp = plan.pipeline(p);
+                if (pp == null) continue;
+                for (RunRecord r : v.getRuns())
+                    if (r.getRunId().equals(pp.getRunId()) && attempt < r.getAttempt()) {
+                        log.debug("signal {} for gate {}/{} rejected: attempt {} < current attempt {} of {}", signalKey, roundId, gateId, attempt, r.getAttempt(), p);
+                        return true;
+                    }
+            }
+        } catch (RuntimeException e) {
+            log.debug("signal staleness check failed, accepting {}: {}", signalKey, e.toString());
+        }
+        return false;
+    }
+    @Override public void openGate(String roundId, String gateId, String operator) { admin.execute("openGate", roundId, gateId, operator, false); }
+    @Override public void openGate(String roundId, String gateId, String operator, boolean force) { admin.execute("openGate", roundId, gateId, operator, force); }
 
     @Override public RoundView view(String roundId) { return s.store.loadRound(roundId); }
 

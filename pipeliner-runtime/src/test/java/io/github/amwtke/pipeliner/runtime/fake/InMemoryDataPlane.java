@@ -77,6 +77,7 @@ public class InMemoryDataPlane implements DataPlane {
         while (out.size() < max && !commands.isEmpty()) out.add(commands.removeFirst());
         return out;
     }
+    @Override public synchronized boolean withdrawCommand(String json) { return commands.remove(json); }
     @Override public synchronized void putCommandResult(String id, String json) { commandResults.put(id, json); }
     @Override public synchronized String getCommandResult(String id) { return commandResults.get(id); }
     @Override public synchronized Map<String, Long> liveWorkers(long maxAge) {
