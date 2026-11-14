@@ -34,16 +34,21 @@ public final class ChunkProcessor {
     private final int attempt;
     private final long writeVersion;
 
-    /** The lease supplies the resolved source and runner (own runner when the pipeline is perThread). */
-    public ChunkProcessor(Services s, ExecutionPlan plan, String roundId, Map<String, String> params, String pipelineId, PipelineInstance.Lease lease) {
-        this(s, plan, roundId, params, pipelineId, lease, 0, 0L);
-    }
+    /** writeVersion = roundSeq * VERSION_RADIX + attempt, so a run attempt must stay below VERSION_RADIX. */
+    public static final int VERSION_RADIX = 1000;
 
-    /** attempt: the run attempt this processor works for; roundSeq: RoundRecord.seq. writeVersion = roundSeq * 1000 + attempt. */
+    /**
+     * The lease supplies the resolved source and runner (own runner when the pipeline is perThread). attempt: the run attempt this
+     * processor works for (must be < {@link #VERSION_RADIX}); roundSeq: RoundRecord.seq.
+     */
     public ChunkProcessor(Services s, ExecutionPlan plan, String roundId, Map<String, String> params, String pipelineId, PipelineInstance.Lease lease,
                           int attempt, long roundSeq) {
+        if (attempt < 0 || attempt >= VERSION_RADIX)
+            throw new PipelinerException("run attempt " + attempt + " of pipeline " + pipelineId + " in round " + roundId + " is out of range [0, "
+                    + VERSION_RADIX + "): the write version (roundSeq * " + VERSION_RADIX + " + attempt) would collide with the next round's versions; "
+                    + "cancel this round and submit a new one");
         this.attempt = attempt;
-        this.writeVersion = roundSeq * 1000L + attempt;
+        this.writeVersion = roundSeq * VERSION_RADIX + attempt;
         this.s = s;
         this.plan = plan;
         this.roundId = roundId;
@@ -96,6 +101,9 @@ public final class ChunkProcessor {
             }
             res.rowsOut.put(edgeId, n);
         }
+        java.util.Set<String> used = new java.util.HashSet<>(spec.getSinks().keySet());
+        used.addAll(pp.getPortToEdge().keySet());
+        for (String port : used) { List<Row> l = byPort.get(port); if (l != null) res.rowsOutTotal += l.size(); }
         res.costMillis = (System.nanoTime() - t0) / 1_000_000;
         return res;
     }
@@ -126,6 +134,7 @@ public final class ChunkProcessor {
 
     private static final class Buffer implements Collector {
         final Map<String, List<Row>> byPort = new LinkedHashMap<>();
+        private final java.util.Set<Row> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Row, Boolean>());
         private final java.util.Set<String> ports;
         private final String pipelineId;
 
@@ -137,7 +146,7 @@ public final class ChunkProcessor {
             if (!ports.contains(port)) throw new PipelinerException("pipeline " + pipelineId + " emitted to undeclared port '" + port + "'");
             List<Row> l = byPort.get(port);
             if (l == null) { l = new ArrayList<>(); byPort.put(port, l); }
-            l.add(row);
+            l.add(seen.add(row) ? row : row.copy());   // one row object per port entry, as after a cluster round trip
         }
     }
 }

@@ -20,5 +20,7 @@ public final class ChunkResult {
     /** Edge id or "sink:&lt;port&gt;" to rows. */
     public final Map<String, Long> rowsOut = new LinkedHashMap<>();
     public final List<EdgeChunk> outputs = new ArrayList<>();
+    /** Rows leaving the pipeline: every emitted row of a port that feeds a sink and/or an edge, counted once per port. */
+    public long rowsOutTotal;
     public long costMillis;
 }

@@ -21,14 +21,16 @@ public final class PipelineInstance {
     private final PipelineSpec spec;
     private final PipelineContext ctx;
     private final ComponentFactory factory;
+    private final SharedLifecycles shared;
     private final List<Lifecycle> opened = new ArrayList<>();
     private Object runner;
     private boolean runnerFromFactory;
 
-    PipelineInstance(PipelineSpec spec, PipelineContext ctx, ComponentFactory factory) {
+    PipelineInstance(PipelineSpec spec, PipelineContext ctx, ComponentFactory factory, SharedLifecycles shared) {
         this.spec = spec;
         this.ctx = ctx;
         this.factory = factory;
+        this.shared = shared;
     }
 
     public SplitSource source() { return spec.getSource(); }
@@ -37,7 +39,10 @@ public final class PipelineInstance {
 
     String runnerClass() { return spec.runnerClassName(); }
 
-    /** Resolves the shared runner and opens runner, source and sinks; on failure closes what was opened. */
+    /**
+     * Resolves the shared runner and opens runner, source and sinks (through the pod-wide reference counts: a component that another instance
+     * already holds is not opened again). On failure releases what was acquired; a component whose open() failed is never closed.
+     */
     void open() throws Exception {
         try {
             if (!spec.isPerThread()) {
@@ -53,9 +58,9 @@ public final class PipelineInstance {
         }
     }
 
-    /** Closes (reverse order) and destroys; exceptions are logged. */
+    /** Releases (reverse order; the last holder of a component closes it) and destroys; exceptions are logged. */
     void close() {
-        for (int i = opened.size() - 1; i >= 0; i--) closeComponent(opened.get(i));
+        for (int i = opened.size() - 1; i >= 0; i--) shared.release(opened.get(i));
         opened.clear();
         if (runner != null && runnerFromFactory) destroy(runner);
         runner = null;
@@ -76,7 +81,7 @@ public final class PipelineInstance {
 
     private void openComponent(Object c) throws Exception {
         if (!(c instanceof Lifecycle)) return;
-        ((Lifecycle) c).open(ctx);
+        shared.acquire((Lifecycle) c, ctx);
         opened.add((Lifecycle) c);
     }
 
@@ -108,8 +113,7 @@ public final class PipelineInstance {
             try {
                 if (r instanceof Lifecycle) ((Lifecycle) r).open(instance.context());
             } catch (Throwable t) {
-                instance.closeComponent(r);
-                instance.destroy(r);
+                if (r != null) instance.destroy(r);   // open() failed: close() is not called on a component that never opened
                 throw t;
             }
             ownRunner = r;

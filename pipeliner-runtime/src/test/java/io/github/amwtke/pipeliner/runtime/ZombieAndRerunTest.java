@@ -88,7 +88,7 @@ class ZombieAndRerunTest {
             h.store.resetRuns(round, Collections.singletonList("R1"), Collections.<String>emptyList(), h.plane.currentEpoch());
             // a late journal event of the old attempt must not leak into the new one
             h.plane.appendJournal(round, ChunkEvent.builder().type("DONE").roundId(round).runId("R1").pipelineId("p").chunkId("S0099")
-                    .inputEdge("split").owner("zombie").rowsIn(3L).rowsOut(new HashMap<String, Long>()).attempt(0).runAttempt(0).ts(1L).build());
+                    .inputEdge("split").owner("zombie").rowsIn(3L).rowsOut(new HashMap<String, Long>()).attempt(0).ts(1L).build());
             assertEquals(RoundStatus.RUNNING, h.store.loadRoundRecord(round).getStatus());
             h.plane.addActiveRound(round);
 
@@ -137,7 +137,7 @@ class ZombieAndRerunTest {
                 .pipeline("p", p -> p.source(new RangeSource(4, 3)).row((row, out, ctx) -> {
                     if (ctx.attempt() == 0 && row.getLong("id") == 0) { entered.countDown(); hold.await(); }   // the frozen worker
                     out.emit(row);
-                }).sink(sink))
+                }).parallelism(1).sink(sink))   // one attempt-0 thread: it is the frozen one, so no attempt-0 write can happen before it resumes
                 .build();
         try (Harness h = new Harness(g, Collections.<String, ExecMode>emptyMap())) {
             DefaultPipelinerEngine e = h.pod("pod");
@@ -151,9 +151,11 @@ class ZombieAndRerunTest {
             assertEquals(1, e.view(round).getRuns().get(0).getAttempt());
             assertEquals(0, h.plane.streamLength(oldChannelOrQueue), "attempt 0's keys are gone");
 
+            assertTrue(sink.writes.stream().noneMatch(w -> w[1] == 0), "nothing of attempt 0 was written before the zombie resumed");
+            long conflictsBefore = h.plane.conflictCount.get();
             hold.countDown();   // the zombie resumes: runs the sink, then fails to commit
             assertTrue(waitFor(() -> sink.writes.stream().anyMatch(w -> w[1] == 0), 10000), "the zombie did write");
-            Thread.sleep(300);
+            assertTrue(waitFor(() -> h.plane.conflictCount.get() > conflictsBefore, 10000), "the zombie's commit was rejected");
             for (Map.Entry<String, Long> en : sink.latest.entrySet())
                 assertEquals(seq * 1000 + 1, (long) en.getValue(), "chunk " + en.getKey() + " keeps the attempt-1 version");
             for (long[] w : sink.writes) assertEquals(seq * 1000 + w[1], w[0]);

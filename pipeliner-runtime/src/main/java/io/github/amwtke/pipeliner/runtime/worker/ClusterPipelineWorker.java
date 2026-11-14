@@ -18,6 +18,7 @@ import io.github.amwtke.pipeliner.runtime.Services;
 import io.github.amwtke.pipeliner.runtime.instance.PipelineInstance;
 import io.github.amwtke.pipeliner.runtime.process.ChunkProcessor;
 import io.github.amwtke.pipeliner.runtime.process.ChunkResult;
+import io.github.amwtke.pipeliner.runtime.process.ChunkRetryLoop;
 import io.github.amwtke.pipeliner.runtime.process.Events;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -93,6 +94,14 @@ public final class ClusterPipelineWorker implements Runnable {
 
     public boolean alive() { return thread != null && thread.isAlive(); }
 
+    /** Waits up to {@code millis} for the thread to end; true when it ended (or never started). */
+    public boolean join(long millis) {
+        Thread t = thread;
+        if (t == null) return true;
+        try { t.join(Math.max(1, millis)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return !t.isAlive();
+    }
+
     @Override public void run() {
         long lastClaim = 0;
         try {
@@ -161,34 +170,21 @@ public final class ClusterPipelineWorker implements Runnable {
             deadLetter(entry, inputEdge, "exceeded max deliveries (" + entry.getDeliveryCount() + " > " + cfg.getMaxDeliveries() + ")");
             return;
         }
-        String error = null;
-        for (int attempt = 1; attempt <= cfg.getMaxAttempts(); attempt++) {
-            try {
-                Chunk in = load(entry);
-                ChunkResult res = processor.process(in);
-                commit(entry, inputEdge, in, res);
-                return;
-            } catch (InterruptedException ie) {
-                throw ie;
-            } catch (Throwable e) {   // Errors (e.g. StackOverflowError, NoClassDefFoundError) count as failed attempts too
-                if (killed || stopRequested) throw new InterruptedException("worker stopping");
-                if (isNoGroup(e)) { // the master deleted the (finished) round's streams: nothing left to process or dead-letter
+        ChunkRetryLoop.Outcome<Void> o = ChunkRetryLoop.run(cfg, s.metrics, roundId, pp.getPipelineId(), entry.getEntryId(),
+                () -> killed || stopRequested,
+                e -> {
+                    if (!isNoGroup(e)) return false;   // the master deleted the (finished) round's streams: nothing left to process or dead-letter
                     log.debug("worker {}: stream {} gone while handling {}", consumer, entry.getStreamKey(), entry.getEntryId());
-                    return;
-                }
-                error = Events.describe(e);
-                log.warn("chunk {} attempt {}/{} failed in {}: {}", entry.getEntryId(), attempt, cfg.getMaxAttempts(), pp.getPipelineId(), error);
-                if (e instanceof VirtualMachineError) {   // the JVM is unreliable: record the failure if possible, then die
-                    try { deadLetter(entry, inputEdge, error); } catch (Throwable ignored) { /* best effort */ }
-                    throw (VirtualMachineError) e;
-                }
-                if (attempt < cfg.getMaxAttempts()) {
-                    s.metrics.chunkRetried(roundId, pp.getPipelineId());
-                    Thread.sleep(cfg.getRetryBackoffMillis() * attempt);
-                }
-            }
-        }
-        deadLetter(entry, inputEdge, error);
+                    return true;
+                },
+                () -> {
+                    Chunk in = load(entry);
+                    ChunkResult res = processor.process(in);
+                    commit(entry, inputEdge, in, res);
+                    return null;
+                });
+        if (o.abandoned) return;
+        if (!o.ok()) deadLetter(entry, inputEdge, Events.describe(o.failure));
     }
 
     private Chunk load(StreamEntry entry) throws Exception {
@@ -210,7 +206,7 @@ public final class ClusterPipelineWorker implements Runnable {
         while (true) {
             CommitResult r = s.plane.commit(req);
             if (r == CommitResult.OK) {
-                s.metrics.chunkProcessed(roundId, pp.getRunId(), pp.getPipelineId(), res.rowsIn, totalOut(res), res.costMillis);
+                s.metrics.chunkProcessed(roundId, pp.getRunId(), pp.getPipelineId(), res.rowsIn, res.rowsOutTotal, res.costMillis);
                 return;
             }
             if (r == CommitResult.CONFLICT) {
@@ -248,12 +244,6 @@ public final class ClusterPipelineWorker implements Runnable {
         } else {
             log.info("chunk {} of {} not dead-lettered: already committed or claimed elsewhere ({})", chunkId, pp.getPipelineId(), error);
         }
-    }
-
-    private static long totalOut(ChunkResult r) {
-        long n = 0;
-        for (Long v : r.rowsOut.values()) n += v;
-        return n;
     }
 
     /** True when the exception (or a cause) is a Redis NOGROUP / missing-stream error. */

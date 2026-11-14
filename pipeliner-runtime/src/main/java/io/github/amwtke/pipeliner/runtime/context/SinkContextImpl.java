@@ -14,10 +14,6 @@ public final class SinkContextImpl implements SinkContext {
     private final int attempt;
     private final long writeVersion;
 
-    public SinkContextImpl(String roundId, String runId, String pipelineId, Map<String, String> params, DataSourceRegistry dataSources) {
-        this(roundId, runId, pipelineId, params, dataSources, 0, 0L);
-    }
-
     public SinkContextImpl(String roundId, String runId, String pipelineId, Map<String, String> params, DataSourceRegistry dataSources,
                            int attempt, long writeVersion) {
         this.attempt = attempt;

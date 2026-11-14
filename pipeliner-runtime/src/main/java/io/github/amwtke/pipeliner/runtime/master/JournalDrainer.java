@@ -47,8 +47,8 @@ final class JournalDrainer {
         List<ChunkEvent> out = new ArrayList<>(events.size());
         for (ChunkEvent e : events) {
             RunRecord run = ("DONE".equals(e.getType()) || "DEAD".equals(e.getType())) ? d.run(e.getRunId()) : null;
-            if (run != null && e.getRunAttempt() != null && e.getRunAttempt() != run.getAttempt()) {
-                log.debug("dropping {} event of {}/{} from attempt {} (current attempt {})", e.getType(), d.roundId(), e.getRunId(), e.getRunAttempt(), run.getAttempt());
+            if (run != null && e.getAttempt() != run.getAttempt()) {
+                log.debug("dropping {} event of {}/{} from attempt {} (current attempt {})", e.getType(), d.roundId(), e.getRunId(), e.getAttempt(), run.getAttempt());
                 continue;
             }
             if (run != null && run.getStatus() == RunStatus.PENDING) {

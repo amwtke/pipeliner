@@ -26,8 +26,10 @@ public class ChunkEvent {
     private Map<String, Long> rowsOut;
     private Integer costMs;
     private String error;
+    /**
+     * The RUN attempt (generation) that produced the event; the master drops events whose attempt differs from the run's current one.
+     * It is not the per-chunk retry counter (chunk retries happen inside one run attempt and are not recorded).
+     */
     private int attempt;
-    /** Attempt of the run that produced the event; null = unknown (never filtered). */
-    private Integer runAttempt;
     private long ts;
 }

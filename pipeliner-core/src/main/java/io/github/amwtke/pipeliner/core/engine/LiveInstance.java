@@ -16,8 +16,4 @@ public final class LiveInstance {
     private final String runner;
     /** Run attempt the instance belongs to. */
     private final int attempt;
-
-    public LiveInstance(String roundId, String pipelineId, int threads, boolean perThread, String runner) {
-        this(roundId, pipelineId, threads, perThread, runner, 0);
-    }
 }

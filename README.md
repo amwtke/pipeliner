@@ -170,7 +170,7 @@ runner 有两种声明方式：
 .pipeline("grade", p -> p.row(CoreGradeRunner.class).runnerPerThread().sink(...))
 ```
 
-**`Lifecycle`**（runner、source、sink 均可选实现）：`open(PipelineContext)` 在 pipeline 于本 pod 激活时、第一个 chunk 之前调用；`close()` 在本 pod 上该 pipeline 的最后一个线程退出时调用。`PipelineContext` 提供 `roundId()`、`runId()`、`pipelineId()`、`podId()`、`params()`、`dataSources()`，适合在 `open` 里一次性预加载只读数据（示例的 `CapAllocRunner` 在 `open` 里加载全部站点产能）。`open` 抛异常按处理失败对待：记录日志、退避、稍后重试，不会拖垮 agent；`close` 抛异常只记日志。注意：实例形式的组件虽是共享单例，每次激活仍会 `open`/`close`，有状态的组件请用类型形式。source/sink 仍是急切创建的配置对象（master 枚举 split 用的就是这个 source 实例），只应在 `read`/`write` 或自己的 `open`/`close` 里占用资源。
+**`Lifecycle`**（runner、source、sink 均可选实现）：`open(PipelineContext)` 在 pipeline 于本 pod 激活时、第一个 chunk 之前调用；`close()` 在本 pod 上该 pipeline 的最后一个线程退出时调用。`PipelineContext` 提供 `roundId()`、`runId()`、`pipelineId()`、`podId()`、`params()`、`dataSources()`，适合在 `open` 里一次性预加载只读数据（示例的 `CapAllocRunner` 在 `open` 里加载全部站点产能）。`open` 抛异常按处理失败对待：CLUSTER 模式记录日志、退避、稍后重试；INLINE / LOCAL 的 run 对每个 pipeline 最多按 `max-attempts` 次退避重试 `open`，仍失败才让 run 失败；都不会拖垮 agent。`close` 抛异常只记日志，`open` 失败的组件不会被 `close`（用 `ComponentFactory` 创建的会被 `destroy`）。用户的 `open`/`close` 代码不在 pod 级锁内执行（同一 key 的并发获取者等同一次 `open`），慢的 `open` 不会阻塞心跳。注意：实例形式的 source、sink 和 runner 是共享单例，按 pod 引用计数：第一次被某个 pipeline 实例（任意 round、attempt）获取时 `open`，最后一个释放时 `close`，期间其他实例不再重复 `open`；有状态的 runner 请用类型形式（每个 pipeline 实例各有自己的对象）。INLINE / LOCAL 的每次 chunk 重试都用输入行的全新拷贝，同一行发到多个输出口时每个口各得一份拷贝，原地修改行的结果与 CLUSTER 一致。source/sink 仍是急切创建的配置对象（master 枚举 split 用的就是这个 source 实例），只应在 `read`/`write` 或自己的 `open`/`close` 里占用资源。
 
 **`ComponentFactory`**：`create(Class)` 创建，`destroy(Object)` 在 `close()` 之后销毁。默认 `ReflectionComponentFactory`（public 无参构造）；Spring Boot 下自动配置的 `SpringComponentFactory` 用 `createBean`/`destroyBean`，类型形式的 runner 可直接用构造器/字段注入和 `@Value`，不必注册成 bean；自定义 `ComponentFactory` bean 可替换它。非 Spring 场景：`new DefaultPipelinerEngine(cfg, store, plane, dataSources, metrics, factory)`。
 
@@ -202,9 +202,9 @@ runner 有两种声明方式：
 | `pipeliner.runtime.claim-idle-millis` | `60000` | chunk 空闲多久后被 autoclaim |
 | `pipeliner.runtime.renew-interval-millis` | `20000` | chunk 续租间隔 |
 | `pipeliner.runtime.auto-claim-interval-millis` | `10000` | autoclaim 扫描间隔 |
-| `pipeliner.runtime.high-watermark` / `low-watermark` | `64` / `32` | 通道水位，达到高水位上游提交返回 BUSY |
+| `pipeliner.runtime.high-watermark` / `low-watermark` | `64` / `32` | 通道水位，达到高水位上游提交返回 BUSY；要求 `0 < low-watermark ≤ high-watermark`。引擎启动时校验 `RuntimeConfig`（上述水位、`max-attempts ≥ 1`、各类超时/间隔 > 0、并行度 > 0 等），不合法立即抛出带明确信息的 `PipelinerException`；`stop-join-millis`（默认 10000）：`engine.stop()` 最多等待 worker / 本地 run 线程这么久 |
 | `pipeliner.runtime.master-tick-mode` · `external-tick-interval-millis` | `local` · `2000` | master 推进由本地线程或外部触发，见「外部触发 master 推进」 |
-| `pipeliner.runtime.max-attempts` | `3` | chunk 最大重试次数 |
+| `pipeliner.runtime.max-attempts` | `3` | 每个 chunk 的总尝试次数（含第一次，必须 ≥ 1；`1` 表示不重试）。三种模式用同一套重试逻辑：任何 `Throwable`（含 `StackOverflowError`）算一次失败尝试，`OutOfMemoryError` 直接抛出、不重试也不进死信 |
 | `pipeliner.runtime.max-deliveries` | `5` | autoclaim 投递超过此值直接进死信 |
 | `pipeliner.runtime.autoscale` | `true` | 按积压自动扩并行度 |
 | `pipeliner.runtime.max-parallelism` | `8` | 自动扩容上限 |
@@ -326,7 +326,7 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 
 ## 多 pod 正确性模型（fencing / attempt / 版本化 sink）
 
-**Attempt**：`RunRecord.attempt` 是 run 的"代"。`rerunFrom` / `retryRun`（本地 run）通过一次原子的 `store.resetRuns`（MySQL 单事务 / Redis 单个 Lua）把 run、pipeline、chunk 记录、下游闸门（含其 signal）和 round 状态一起复位，attempt+1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态为 `并行度|attempt`。Worker 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例：attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例（`open()` 会重新执行）。journal 事件带 `runAttempt`，attempt 不符的事件被 master 丢弃。数据面清理由 master 幂等重放：RunStarter 启动第 n 次 attempt 前先（带 fence）删除该 run 所有 <n 的 key；run 成功后删除当前 attempt 的 key。
+**Attempt**：`RunRecord.attempt` 是 run 的"代"。`rerunFrom` / `retryRun`（本地 run）通过一次原子的 `store.resetRuns`（MySQL 单事务 / Redis 单个 Lua）把 run、pipeline、chunk 记录、下游闸门（含其 signal）和 round 状态一起复位，attempt+1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态为 `并行度|attempt`。Worker 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例：attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例（`open()` 会重新执行）。journal 事件带 `attempt`（run 的代，不是 chunk 重试次数），attempt 不符的事件被 master 丢弃；`ChunkRecord.attempt` 同样是 run 的代。run 的 attempt 必须 < 1000（`writeVersion = seq × 1000 + attempt`，更大会撞到下一个 round 的版本区间）：达到 1000 的 run 不再执行，报明确错误，请取消该 round 并重新提交。INLINE / LOCAL run 的完成事件（DONE / FAILED，只会写其中一个）会带退避重试直到成功或 run 被取消；被取消的 executor 不再写 journal。数据面清理由 master 幂等重放：RunStarter 启动第 n 次 attempt 前先（带 fence）删除该 run 所有 <n 的 key；run 成功后删除当前 attempt 的 key。
 
 **Epoch 下限与持久预留**：master 每次取新 epoch：`floor = store.maxMasterEpoch()`，`e = plane.nextEpoch(floor)`（Lua 里若 `pg:epoch` 小于下限先置为下限再 `INCR`，所以 `e > floor`），再 `store.reserveMasterEpoch(e)`：在控制面存储里原子地"当且仅当 `e` 高于已预留的最大值和所有 round 的 epoch 时写入"，返回 false 就**不当 leader**（本 tick 返回，下一 tick 重新检查租约并取新 epoch）。`maxMasterEpoch` 是已预留 epoch 与所有 round epoch 的最大值：MySQL 是单行表 `pg_master_epoch`（条件 `UPDATE`，影响行数为 1 即拥有）与 `MAX(pg_round.master_epoch)`；Redis 控制面是 `pg:store:maxepoch`（Lua compare-and-set，`fenceRound` 只在 round epoch 真正升高时才顺带抬高它，`init()` 从已有 round 回填）。两层作用：Redis 数据丢失（`pg:epoch` 被清）后新 epoch 仍高于已用过的所有 epoch；一个已取得 epoch 但在写任何 round 之前冻结的 master，它的 epoch 不会在计数器丢失后发给第二个 master。接口方法都有默认实现（`maxMasterEpoch()`→0，`reserveMasterEpoch`→true 即无持久预留，`nextEpoch(floor)`→`nextEpoch()`），自定义的旧实现仍可编译运行。master 取得租约后若存储调用失败，会先释放租约再抛出；`stop()` 在本 pod 持有租约时一律释放。master / worker 的循环线程捕获 `Throwable`，记录日志后退避重试，线程不会因为一个 Error 消失。
 

@@ -350,7 +350,7 @@ slave 每 5 秒上报心跳。某个 pod 挂掉后，它名下没提交的 chunk
 
 ### 8.4 run attempt 与 attempt 作用域的 key
 
-`RunRecord.attempt` 是 run 的"代"。重跑（见 11.3）让 attempt 加 1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态写成 `并行度|attempt`。slave 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例，attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例；journal 事件带 `runAttempt`，与当前 attempt 不符的事件被 master 丢弃。数据面清理由 master 幂等重放：启动第 n 次 attempt 前先（带 fence）删除该 run 所有小于 n 的 key；run 成功后删除当前 attempt 的 key。
+`RunRecord.attempt` 是 run 的"代"。重跑（见 11.3）让 attempt 加 1。数据面 key 带 attempt：`pg:{r}:ch:<edge>:<attempt>`、`split|splitidx|dlq:<pipeline>:<attempt>`；期望状态写成 `并行度|attempt`。slave 按 `(round, pipeline, attempt)` 管理线程和 pipeline 实例，attempt 变化后旧线程做完当前 chunk 即退出，新线程用全新的实例；journal 事件带 `attempt`（run 的代），与当前 attempt 不符的事件被 master 丢弃；attempt 必须 < 1000（`writeVersion = seq × 1000 + attempt`），超过则拒绝执行。数据面清理由 master 幂等重放：启动第 n 次 attempt 前先（带 fence）删除该 run 所有小于 n 的 key；run 成功后删除当前 attempt 的 key。
 
 ### 8.5 管理操作走 leader 命令队列
 

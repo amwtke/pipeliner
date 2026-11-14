@@ -281,7 +281,6 @@ class RedisDataPlaneTest {
         dp.setDesiredParallelism(R, "p1", 3, 4, E);
         dp.setDesiredParallelism(R, "p2", 2, 4, E);
         dp.setDesiredParallelism(R, "p2", 0, 4, E);
-        assertEquals(Collections.singletonMap("p1", 3), dp.desiredParallelism(R));
         assertEquals(Collections.singletonMap("p1", new DesiredState(3, 4)), dp.desiredState(R));
         dp.assignLocalRun(R, "run1", "podA", 2, E);
         assertEquals(Collections.singletonMap("run1", "podA|2"), dp.localRunAssignments(R));
