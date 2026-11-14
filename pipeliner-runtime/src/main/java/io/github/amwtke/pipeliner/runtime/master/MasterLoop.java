@@ -32,6 +32,8 @@ public final class MasterLoop implements Runnable {
     private volatile long lastGapWarn;
     private static final long GAP_WARN_EVERY_MILLIS = 60_000;
     private Thread thread;
+    private Thread leaseKeeper;
+    private int resumeIndex;   // fair rotation: where the next tick starts after a slow-tick abort
     private final ReentrantLock tickLock = new ReentrantLock();
     private int roundsTicked;
     private int commandsExecuted;
@@ -51,7 +53,11 @@ public final class MasterLoop implements Runnable {
             if (ttl < 3 * iv)
                 log.warn("master-tick-mode=external but leaderTtlMillis ({}) < 3 x externalTickIntervalMillis ({}): the lease may expire between "
                         + "triggers and leadership will flap; use leaderTtlMillis >= {}", ttl, iv, 3 * iv);
-            log.info("{} master is driven externally (no pg-master thread); call engine.tick() / POST /pg/master/tick every ~{} ms", s.podId(), iv);
+            log.info("{} master is driven externally (no pg-master thread); call engine.tick() / POST /pg/master/tick every ~{} ms; "
+                    + "a local lease keeper renews the lease (and the throttle flag) of a leading pod every ~{} ms", s.podId(), iv, leaseKeeperPeriod());
+            leaseKeeper = new Thread(this::leaseKeeperLoop, "pg-lease-keeper");
+            leaseKeeper.setDaemon(true);
+            leaseKeeper.start();
             return;
         }
         thread = new Thread(this, "pg-master");
@@ -64,11 +70,12 @@ public final class MasterLoop implements Runnable {
     /** Stops the loop; releases leadership only when {@code release} (false simulates a crash). */
     public void stop(boolean release) {
         stopped = true;
-        Thread t;
-        synchronized (this) { t = thread; }
-        if (t != null) {
-            t.interrupt();
-            try { t.join(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        Thread t, k;
+        synchronized (this) { t = thread; k = leaseKeeper; }
+        for (Thread x : new Thread[] {t, k}) {
+            if (x == null) continue;
+            x.interrupt();
+            try { x.join(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
         boolean locked = false;
         try { locked = tickLock.tryLock(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }   // wait out an external tick
@@ -101,6 +108,14 @@ public final class MasterLoop implements Runnable {
             } catch (StaleEpochException e) {
                 stepDown("fenced: " + e.getMessage());
                 return TickResult.skipped("deposed", false, ctx.epoch(), System.currentTimeMillis() - t0);
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Error e) {
+                // never keep claiming leadership while the pass is broken: give the lease away so a healthy pod can lead
+                log.error("{}: master tick died with {}; stepping down and releasing the lease", s.podId(), e.toString(), e);
+                if (leader) stepDown("tick failed with " + e);
+                releaseLease();
+                throw e;
             }
             long took = System.currentTimeMillis() - t0;
             if (leader) s.metrics.masterTick(took);
@@ -133,7 +148,7 @@ public final class MasterLoop implements Runnable {
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable e) {   // incl. Errors (e.g. AbstractMethodError from an old custom store): the master thread must never die
-                log.warn("master tick failed: {}", e.toString());
+                log.error("master tick failed: {}", e.toString(), e);
                 try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
             }
         }
@@ -187,31 +202,74 @@ public final class MasterLoop implements Runnable {
 
     /** Makes sure the tick keeps the lease: renews, and aborts (false) if deposed. */
     private boolean keepLease() {
-        return !stopped && renew();
+        if (stopped) return false;
+        // time-gated: every master write is epoch-fenced, so a renewal only has to happen well inside the TTL
+        if (leader && System.currentTimeMillis() - lastRenew <= s.cfg.getLeaderTtlMillis() / 4) return true;
+        return renew();
+    }
+
+    private long leaseKeeperPeriod() { return Math.max(50, s.cfg.getLeaderTtlMillis() / 3); }
+
+    /**
+     * EXTERNAL mode only: while this pod leads, renews just the leader lease and the global throttle flag every ~ttl/3, so neither depends on
+     * how often (or on which pod) the scheduler fires. It never acquires leadership (external ticks do) and never ticks rounds or runs commands.
+     */
+    private void leaseKeeperLoop() {
+        long period = leaseKeeperPeriod();
+        while (!stopped) {
+            try {
+                Thread.sleep(period);
+                keepAlive();
+            } catch (InterruptedException e) {
+                return;
+            } catch (Throwable e) {
+                log.warn("lease keeper failed: {}", e.toString());
+            }
+        }
+    }
+
+    private void keepAlive() {
+        if (!leader || stopped) return;
+        if (!s.podId().equals(s.plane.currentLeader())) return;   // lost it (the next tick steps down); never re-acquire from here
+        if (stopped) return;
+        if (s.plane.tryAcquireOrRenewLeadership(s.podId(), s.cfg.getLeaderTtlMillis())) lastRenew = System.currentTimeMillis();
+        master.refreshThrottleFlag();
     }
 
     private void tickAll() {
         syncActiveRounds();
         executeCommands();
-        java.util.Set<String> active = s.plane.activeRounds();
+        java.util.Set<String> activeSet = s.plane.activeRounds();
+        java.util.List<String> active = new java.util.ArrayList<>(activeSet);
+        java.util.Collections.sort(active);
         s.metrics.activeRounds(active.size());
-        for (String roundId : active) {
+        master.retain(activeSet);
+        master.memoryThrottle();   // every tick, before the rounds: a slow round must not let the throttle flag lapse
+        int n = active.size(), start = n == 0 ? 0 : resumeIndex % n;
+        boolean aborted = false;
+        for (int k = 0; k < n; k++) {
+            String roundId = active.get((start + k) % n);
             if (stopped || !leader || !keepLease()) return;
             try {
                 master.tick(roundId);
                 roundsTicked++;
             } catch (StaleEpochException e) {
                 throw e;
-            } catch (RuntimeException e) {
+            } catch (OutOfMemoryError e) {
+                throw e;
+            } catch (RuntimeException | Error e) {   // an Error from user code (gate condition, enumerate) must not take the master down or starve the other rounds
                 log.error("master tick for round {} failed", roundId, e);
             }
             if (System.currentTimeMillis() - lastRenew > s.cfg.getLeaderTtlMillis() / 2) {
-                log.warn("master tick is slow (lease renewed {} ms ago); aborting it", System.currentTimeMillis() - lastRenew);
-                return;
+                log.warn("master tick is slow (lease renewed {} ms ago); aborting it, the next tick resumes after round {}",
+                        System.currentTimeMillis() - lastRenew, roundId);
+                resumeIndex = (start + k + 1) % n;   // fairness: the rounds behind a slow one get their turn next tick
+                aborted = true;
+                break;
             }
         }
-        master.memoryThrottle();
-        janitor.runIfDue(System.currentTimeMillis());
+        if (!aborted) resumeIndex = 0;
+        if (leader && keepLease()) janitor.runIfDue(System.currentTimeMillis());   // within its own small budget, also after a slow-tick abort
     }
 
     /** The active set lives in Redis only: re-add every non-terminal round of the store on gaining leadership and every 30 s. */

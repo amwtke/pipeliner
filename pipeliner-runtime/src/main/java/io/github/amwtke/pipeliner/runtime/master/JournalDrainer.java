@@ -18,25 +18,45 @@ final class JournalDrainer {
 
     JournalDrainer(MasterContext c) { this.c = c; }
 
+    /** Outcome of a drain: {@code data} is a fresh view of the round that is still valid (null: none loaded, or local-run events changed it). */
+    static final class Drained {
+        final RoundData data;
+        final boolean localApplied;
+        Drained(RoundData data, boolean localApplied) { this.data = data; this.localApplied = localApplied; }
+    }
+
+    /** Drains with a freshly loaded round record (for callers that did not just load it). */
+    Drained drain(String roundId, ExecutionPlan plan) {
+        return drain(roundId, plan, c.s.store.loadRoundRecord(roundId));
+    }
+
     /**
      * Drains the journal completely, batch by batch: local-run events first (their CAS writes are idempotent), then the chunk
      * events together with the new offset, then the trim. A failure in a later batch therefore never loses an earlier one.
+     * {@code rr} is the caller's just-loaded round record (its journal offset is the start); the RoundData is loaded once per drain and only
+     * reloaded after a batch that applied local-run events (chunk events never touch run, gate or pipeline records).
      */
-    void drain(String roundId, ExecutionPlan plan) {
-        RoundRecord rr = c.s.store.loadRoundRecord(roundId);
-        if (rr == null) return;
+    Drained drain(String roundId, ExecutionPlan plan, RoundRecord rr) {
+        if (rr == null) return new Drained(null, false);
         String offset = rr.getJournalOffset() == null ? "0-0" : rr.getJournalOffset();
+        RoundData d = null;
+        boolean localApplied = false;
         while (true) {
             List<ChunkEvent> events = c.s.plane.readJournal(roundId, offset, c.s.cfg.getJournalBatch());
             if (events.isEmpty()) break;
             String last = events.get(events.size() - 1).getEventId();
-            RoundData d = RoundData.load(c, roundId, plan);
-            if (d == null) return;
-            handleLocalEvents(roundId, d, events);
+            if (d == null) d = RoundData.load(c, roundId, plan);
+            if (d == null) return new Drained(null, localApplied);
+            boolean applied = handleLocalEvents(roundId, d, events);
+            if (applied) { localApplied = true; d = null; }
+            RoundData view = d != null ? d : RoundData.load(c, roundId, plan);   // withoutStale needs the post-local-event view
+            if (view == null) return new Drained(null, localApplied);
+            d = view;
             c.s.store.applyChunkEvents(roundId, withoutStale(d, events), last, c.epoch());   // throws StaleEpochException when deposed
             c.s.plane.trimJournal(roundId, last, c.epoch());
             offset = last;
         }
+        return new Drained(localApplied ? null : d, localApplied);
     }
 
     /**
@@ -60,8 +80,10 @@ final class JournalDrainer {
         return out;
     }
 
-    private void handleLocalEvents(String roundId, RoundData d, List<ChunkEvent> events) {
+    /** Returns whether any local-run event was applied (the round view is then stale). */
+    private boolean handleLocalEvents(String roundId, RoundData d, List<ChunkEvent> events) {
         ExecutionPlan plan = d.plan;
+        boolean applied = false;
         for (ChunkEvent e : events) {
             if (!"LOCAL_RUN_DONE".equals(e.getType()) && !"LOCAL_RUN_FAILED".equals(e.getType())) continue;
             RunRecord run = d.run(e.getRunId());
@@ -70,20 +92,25 @@ final class JournalDrainer {
                 log.debug("ignoring stale local event {} for {}/{} attempt {}", e.getType(), roundId, e.getRunId(), e.getAttempt());
                 continue;
             }
+            applied = true;
             if ("LOCAL_RUN_DONE".equals(e.getType())) {
                 for (String p : pr.getPipelineIds())
                     c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, PipelineStatus.SUCCEEDED, null, c.epoch());
                 // the run itself is finished by CompletionChecker (row reconciliation first)
             } else {
                 String msg = e.getError() == null ? "local run failed" : e.getError();
-                for (String p : pr.getPipelineIds())
-                    if (e.getPipelineId() == null || e.getPipelineId().equals(p))
-                        c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, PipelineStatus.FAILED, msg, c.epoch());
+                for (String p : pr.getPipelineIds()) {
+                    boolean named = e.getPipelineId() == null || e.getPipelineId().equals(p);
+                    String m = named ? msg : "sibling pipeline " + e.getPipelineId() + " failed";   // the run is FAILED: no pipeline may stay non-terminal
+                    if (!c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, PipelineStatus.FAILED, m, c.epoch()))
+                        c.s.store.casPipelineStatus(roundId, p, PipelineStatus.PENDING, PipelineStatus.FAILED, m, c.epoch());
+                }
                 if (c.s.store.casRunStatus(roundId, e.getRunId(), RunStatus.RUNNING, RunStatus.FAILED, msg, c.epoch()))
                     c.s.metrics.runFinished(roundId, e.getRunId(), "FAILED", elapsed(run));
             }
             c.s.plane.clearLocalRun(roundId, e.getRunId(), c.epoch());
         }
+        return applied;
     }
 
     static long elapsed(RunRecord r) { return r.getStartedAt() == null ? 0 : System.currentTimeMillis() - r.getStartedAt(); }

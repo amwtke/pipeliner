@@ -2,6 +2,7 @@ package io.github.amwtke.pipeliner.runtime.master;
 
 import io.github.amwtke.pipeliner.core.engine.RuntimeConfig;
 import io.github.amwtke.pipeliner.runtime.Services;
+import io.github.amwtke.pipeliner.core.store.RoundRecord;
 import java.util.List;
 import java.util.function.BooleanSupplier;
 import lombok.extern.slf4j.Slf4j;
@@ -16,6 +17,10 @@ public final class RetentionJanitor {
     private final Services s;
     private final BooleanSupplier leader;
     private long lastRun;
+    /** Rounds already gone from the control plane whose data-plane keys still have to be purged (retried every pass until it succeeds). */
+    private final java.util.Set<String> pendingPurge = new java.util.LinkedHashSet<>();
+    /** Rounds compactRound refused with a negative code (e.g. old Redis rounds without finishedAt): not retried every pass. */
+    private final java.util.Set<String> uncompactable = new java.util.HashSet<>();
 
     public RetentionJanitor(Services s, BooleanSupplier leader) {
         this.s = s;
@@ -35,13 +40,22 @@ public final class RetentionJanitor {
             int batch = Math.max(1, cfg.getRetentionBatch());
             List<String> gone = s.store.purgeRounds(now - cfg.getRoundRetentionMillis(), batch);
             purged = gone.size();
-            if (purged > 0) s.plane.purgeRoundData(gone);
+            pendingPurge.addAll(gone);   // the records are gone for good: the data plane purge must not depend on this pass finishing
+            if (!pendingPurge.isEmpty()) {
+                List<String> todo = new java.util.ArrayList<>(pendingPurge);
+                s.plane.purgeRoundData(todo);
+                pendingPurge.removeAll(todo);
+            }
             if (System.currentTimeMillis() < deadline) {
                 long cutoff = now - cfg.getChunkRetentionMillis();
-                for (String id : s.store.findTerminalRounds(cutoff, batch)) {
+                if (uncompactable.size() > 10_000) uncompactable.clear();
+                for (String id : s.store.findTerminalRounds(cutoff, batch + uncompactable.size())) {
                     if (!leader.getAsBoolean()) break;
+                    if (uncompactable.contains(id)) continue;
                     int n = s.store.compactRound(id, cutoff);
-                    if (n >= 0) { compacted++; chunks += n; }
+                    // 0 = nothing removed: either not eligible any more (revived) or compacted with no chunk records; only the latter counts
+                    if (n > 0 || n == 0 && isCompacted(id)) { compacted++; chunks += n; }
+                    else if (n < 0) { uncompactable.add(id); log.warn("retention: round {} cannot be compacted (code {}); skipping it from now on", id, n); }
                     if (System.currentTimeMillis() >= deadline) break;
                 }
             }
@@ -53,5 +67,10 @@ public final class RetentionJanitor {
         if (purged + compacted + pruned > 0)
             log.info("retention: purged {} rounds, compacted {} rounds ({} chunk records), pruned {} stale workers", purged, compacted, chunks, pruned);
         return true;
+    }
+
+    private boolean isCompacted(String roundId) {
+        RoundRecord r = s.store.loadRoundRecord(roundId);
+        return r != null && r.isCompacted();
     }
 }

@@ -1,16 +1,14 @@
 package io.github.amwtke.pipeliner.runtime.master;
 
-import io.github.amwtke.pipeliner.core.dataplane.Keys;
+import io.github.amwtke.pipeliner.runtime.RunKeys;
 import io.github.amwtke.pipeliner.core.dataplane.PendingSummary;
 import io.github.amwtke.pipeliner.core.graph.ExecMode;
 import io.github.amwtke.pipeliner.core.plan.PlanPipeline;
 import io.github.amwtke.pipeliner.core.plan.PlanRun;
 import io.github.amwtke.pipeliner.core.store.PipelineStatus;
 import io.github.amwtke.pipeliner.core.store.RunStatus;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
@@ -42,9 +40,7 @@ final class StalledChunkMonitor {
             for (String p : pr.getPipelineIds()) {
                 if (d.pipe(p).getStatus() != PipelineStatus.RUNNING) continue;
                 PlanPipeline pp = d.plan.pipeline(p);
-                List<String> streams = new ArrayList<>();
-                if (pp.isSource()) streams.add(Keys.splitQueue(roundId, p, attempt));
-                else for (String e : pp.getInputEdgeIds()) streams.add(Keys.channel(roundId, e, attempt));
+                java.util.Collection<String> streams = RunKeys.inputStreams(roundId, pp, attempt).keySet();
                 PendingSummary worst = null;
                 String worstStream = null;
                 for (String st : streams) {
@@ -63,6 +59,12 @@ final class StalledChunkMonitor {
                 }
             }
         }
+    }
+
+    /** Forgets the state of every round that is no longer active (finished, admin-cancelled or purged). */
+    void retain(Set<String> active) {
+        lastSample.keySet().retainAll(active);
+        alerted.removeIf(k -> !active.contains(k.substring(0, k.indexOf('|'))));
     }
 
     /** Forgets the round's sampling state (round finished). */

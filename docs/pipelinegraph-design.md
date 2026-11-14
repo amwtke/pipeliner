@@ -316,7 +316,7 @@ public interface GateCondition {
 
 ### 8.1.1 外部触发 master 推进
 
-master 的一次推进是显式、幂等的 `engine.tick()`（续租 / 抢主、执行管理命令、推进活跃 round、保留清理、内存限流）。默认由每个 pod 内部线程按 tick 周期调用；也可以配置为 `external`，由 xxl-job 之类的外部调度器触发（或 `POST /pg/master/tick`），此时不起 master 线程，leader 语义（租约、epoch、fencing）不变，非 leader 的 tick 返回 `skipped`。worker 心跳始终是本地线程。细节见 README。
+master 的一次推进是显式、幂等的 `engine.tick()`（续租 / 抢主、执行管理命令、推进活跃 round、保留清理、内存限流）。默认由每个 pod 内部线程按 tick 周期调用；也可以配置为 `external`，由 xxl-job 之类的外部调度器触发（或 `POST /pg/master/tick`），此时不起 master 线程，leader 语义（租约、epoch、fencing）不变，非 leader 的 tick 返回 `skipped`。worker 心跳始终是本地线程。leader 租约和全局限流标志的续期也不依赖触发节奏：`external` 模式下每个 pod 有一个本地 lease-keeper 线程，仅当本 pod 是 leader 时每约 `leaderTtl / 3` 续租约（限流生效时同时刷新限流标志 TTL），不抢主、不推进 round、不执行命令；抢主仍由外部 tick 触发。路由建议不变（触发间隔 < `leaderTtl / 3`，且要能到达存活 pod 以便 leader 宕机后接管）。细节见 README。
 
 ### 8.2 master 的推进循环
 

@@ -225,9 +225,13 @@ public final class WorkerAgent implements Runnable {
         }
     }
 
-    private boolean isMine(String assignment) { return assignment.substring(0, assignment.lastIndexOf('|')).equals(s.podId()); }
+    private boolean isMine(String assignment) { return s.podId().equals(io.github.amwtke.pipeliner.core.dataplane.LocalRunAssignment.podOf(assignment)); }
 
-    private static int attemptOf(String assignment) { return Integer.parseInt(assignment.substring(assignment.lastIndexOf('|') + 1)); }
+    /** Only called for assignments that passed {@link #isMine} (well formed); -1 for a malformed value. */
+    private static int attemptOf(String assignment) {
+        io.github.amwtke.pipeliner.core.dataplane.LocalRunAssignment a = io.github.amwtke.pipeliner.core.dataplane.LocalRunAssignment.parse(assignment);
+        return a == null ? -1 : a.attempt;
+    }
 
     private static String roundOf(String key) { return key.substring(0, key.indexOf('|')); }
 }

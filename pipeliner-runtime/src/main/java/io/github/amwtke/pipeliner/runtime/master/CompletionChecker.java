@@ -46,9 +46,12 @@ final class CompletionChecker {
                 PlanPipeline pp = d.plan.pipeline(p);
                 boolean ready = pp.isSource() ? d.pipe(p).isEnumDone() : upstreamDone(pp, status);
                 if (!ready || !inputsEmpty(roundId, pp, run.getAttempt())) continue;
-                drainer.drain(roundId, d.plan);
+                if (drainer.drain(roundId, d.plan).localApplied) d.touch();   // local-run events changed run/pipeline records
                 // a source is done only when every split chunk record left PENDING (DONE, or DEAD/SKIPPED): never on an empty queue alone
-                if (pp.isSource() && c.s.store.countChunks(roundId, p, ChunkStatus.PENDING) > 0) continue;
+                if (pp.isSource() && c.s.store.countChunks(roundId, p, ChunkStatus.PENDING) > 0) {
+                    if (dataPlaneLost(roundId, p, run.getAttempt())) failLost(d, pr, run, p, status);
+                    continue;
+                }
                 boolean failed = c.s.store.countChunks(roundId, p, ChunkStatus.DEAD) > 0;
                 PipelineStatus target = failed ? PipelineStatus.FAILED : PipelineStatus.SUCCEEDED;
                 String err = failed ? "dead-lettered chunks in " + p : null;
@@ -74,9 +77,27 @@ final class CompletionChecker {
     }
 
     private boolean inputsEmpty(String roundId, PlanPipeline pp, int attempt) {
-        if (pp.isSource()) return c.s.plane.streamLength(Keys.splitQueue(roundId, pp.getPipelineId(), attempt)) == 0;
-        for (String e : pp.getInputEdgeIds()) if (c.s.plane.streamLength(Keys.channel(roundId, e, attempt)) > 0) return false;
+        for (String stream : RunKeys.inputStreams(roundId, pp, attempt).keySet()) if (c.s.plane.streamLength(stream) > 0) return false;
         return true;
+    }
+
+    /**
+     * A source whose enumeration is done, whose split queue is empty (checked by the caller after a complete journal drain) and still has
+     * PENDING chunk records lost its data plane (e.g. Redis was flushed): the splits were enqueued once and the split index (kept for the whole
+     * attempt) is gone too. Nothing will ever deliver those chunks.
+     */
+    private boolean dataPlaneLost(String roundId, String pipelineId, int attempt) {
+        return c.s.plane.streamLength(Keys.splitIndex(roundId, pipelineId, attempt)) == 0;
+    }
+
+    private void failLost(RoundData d, PlanRun pr, RunRecord run, String p, Map<String, PipelineStatus> status) {
+        String msg = "data plane lost (split queue and index of " + p + " are gone while its chunks are PENDING); rerunFrom required";
+        log.error("round {} pipeline {}: {}", d.roundId(), p, msg);
+        if (c.s.store.casPipelineStatus(d.roundId(), p, PipelineStatus.RUNNING, PipelineStatus.FAILED, msg, c.epoch())) {
+            status.put(p, PipelineStatus.FAILED);
+            d.touch();
+            c.s.plane.setDesiredParallelism(d.roundId(), p, 0, run.getAttempt(), c.epoch());
+        }
     }
 
     private void failRun(RoundData d, PlanRun pr, RunRecord run, String msg) {

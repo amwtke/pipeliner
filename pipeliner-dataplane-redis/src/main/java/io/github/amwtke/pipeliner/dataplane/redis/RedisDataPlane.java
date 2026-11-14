@@ -201,7 +201,7 @@ public class RedisDataPlane implements DataPlane {
     }
 
     @Override public void assignLocalRun(String roundId, String runId, String podId, int attempt, long epoch) {
-        fencedCmd(roundId, epoch, "HSET", new String[] {Keys.assign(roundId)}, runId, podId + "|" + attempt);
+        fencedCmd(roundId, epoch, "HSET", new String[] {Keys.assign(roundId)}, runId, io.github.amwtke.pipeliner.core.dataplane.LocalRunAssignment.format(podId, attempt));
     }
 
     @Override public Map<String, String> localRunAssignments(String roundId) {
