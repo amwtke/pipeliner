@@ -64,4 +64,30 @@ class NamedSqlTest {
         assertEquals(new java.math.BigDecimal("1.5"), NamedSql.convert(Double.valueOf(1.5)));
         assertEquals(new java.math.BigDecimal("18446744073709551615"), NamedSql.convert(new java.math.BigInteger("18446744073709551615")));
     }
+
+    @Test void commentsAndEscapesAreSkipped() {
+        Map<String, Object> p = new HashMap<>();
+        p.put("day", 3);
+        NamedSql q = NamedSql.parse("-- don't touch :nope\nSELECT 1 WHERE d = :day", p);
+        assertEquals("-- don't touch :nope\nSELECT 1 WHERE d = ?", q.getSql());
+        assertEquals(Arrays.<Object>asList(3), q.getArgs());
+        assertEquals("SELECT /* filter by :region */ ?", NamedSql.parse("SELECT /* filter by :region */ :day", p).getSql());
+        assertEquals("SELECT ? # it's :x\n, ?", NamedSql.parse("SELECT :day # it's :x\n, :day", p).getSql());
+        assertEquals("SELECT 'it\\'s :x', ?", NamedSql.parse("SELECT 'it\\'s :x', :day", p).getSql());
+        assertEquals("SELECT 5-- 1\n, ?", NamedSql.parse("SELECT 5-- 1\n, :day", p).getSql());
+        assertEquals("SELECT 5 /* unterminated :x", NamedSql.parse("SELECT 5 /* unterminated :x", p).getSql());
+    }
+
+    @Test void convertDriverTypes() {
+        assertEquals(Arrays.asList(1L, 2L), NamedSql.convert(new Object[] {1, 2}));
+        assertEquals(Arrays.asList(1L, 2L), NamedSql.convert(new long[] {1, 2}));
+        assertEquals(Arrays.asList("a", null), NamedSql.convert(new String[] {"a", null}));
+        assertEquals("2024-01-02T10:00:00", NamedSql.convert(java.time.LocalDateTime.of(2024, 1, 2, 10, 0)));
+        assertEquals("2024-01-02T10:00:00", NamedSql.convert(java.sql.Timestamp.valueOf(java.time.LocalDateTime.of(2024, 1, 2, 10, 0))));
+        assertEquals("2024-01-02", NamedSql.convert(java.time.LocalDate.of(2024, 1, 2)));
+        assertEquals("2024-01-02T08:00:00", NamedSql.convert(java.time.OffsetDateTime.of(2024, 1, 2, 10, 0, 0, 0, java.time.ZoneOffset.ofHours(2))));
+        assertEquals(null, NamedSql.convert(Double.NaN));
+        assertEquals(null, NamedSql.convert(Float.POSITIVE_INFINITY));
+        assertThrows(io.github.amwtke.pipeliner.api.PipelinerException.class, () -> NamedSql.convert(new Object()));
+    }
 }

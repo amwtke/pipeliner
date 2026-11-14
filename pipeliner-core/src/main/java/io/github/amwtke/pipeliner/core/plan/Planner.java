@@ -17,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -76,9 +77,13 @@ public final class Planner {
         }
         for (Map.Entry<String, Set<String>> e : writers.entrySet()) {
             if (e.getValue().isEmpty()) continue;
+            // a pipeline that writes the dataset itself must not wait for its own barrier (it would be on both sides)
+            Set<String> before = new LinkedHashSet<>(readers.get(e.getKey()));
+            before.removeAll(e.getValue());
+            if (before.isEmpty()) continue;
             G x = new G();
             x.id = "barrier:" + e.getKey(); x.type = GateType.BARRIER; x.auto = true; x.dataset = e.getKey();
-            x.after = sortedByDecl(e.getValue(), idx); x.before = sortedByDecl(readers.get(e.getKey()), idx);
+            x.after = sortedByDecl(e.getValue(), idx); x.before = sortedByDecl(before, idx);
             x.timeout = 0; x.policy = TimeoutPolicy.FAIL;
             if (!gateIds.add(x.id)) throw new PlanException("gate id collides with auto gate: " + x.id);
             gates.add(x);
@@ -271,7 +276,33 @@ public final class Planner {
             if (p.getSource().datasetName() != null) d.add(p.getSource().datasetName());
             if (p.getSource() instanceof ReadsDatasets) d.addAll(((ReadsDatasets) p.getSource()).readDatasets());
         }
+        // runner: an instance is asked directly; a type-based runner is never instantiated here, it must expose a
+        // public static readDatasets() (or the planner fails loudly instead of silently planning no barrier)
+        Object inst = p.getRowRunner() != null ? p.getRowRunner() : p.getBatchRunner();
+        if (inst instanceof ReadsDatasets) {
+            d.addAll(((ReadsDatasets) inst).readDatasets());
+        } else {
+            Class<?> t = p.getRowRunnerType() != null ? p.getRowRunnerType() : p.getBatchRunnerType();
+            if (t != null && ReadsDatasets.class.isAssignableFrom(t)) d.addAll(staticReadDatasets(p.getId(), t));
+        }
         return d;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Collection<String> staticReadDatasets(String pid, Class<?> t) {
+        try {
+            java.lang.reflect.Method m = t.getMethod("readDatasets");
+            if (!Modifier.isStatic(m.getModifiers())) throw new NoSuchMethodException();
+            m.setAccessible(true);
+            Object r = m.invoke(null);
+            return r == null ? Collections.<String>emptyList() : (Collection<String>) r;
+        } catch (NoSuchMethodException e) {
+            throw new PlanException("pipeline " + pid + ": runner type " + t.getName() + " implements ReadsDatasets but is declared by type, "
+                    + "so the planner cannot call the instance method; add a public static Collection<String> readDatasets() "
+                    + "or declare the runner as an instance");
+        } catch (Exception e) {
+            throw new PlanException("pipeline " + pid + ": static readDatasets() of " + t.getName() + " failed: " + e);
+        }
     }
 
     private static boolean writesDataset(PipelineSpec p, String d) {
@@ -322,14 +353,27 @@ public final class Planner {
         return out;
     }
 
+    /**
+     * forceMode overrides everything. Otherwise per-pipeline .mode() hints apply to their own pipeline, unhinted members
+     * contribute the estimate-based mode of the unhinted members, and the run takes the heaviest effective mode.
+     */
     private ExecMode selectMode(List<String> members, Map<String, PipelineSpec> specs, Map<String, Integer> inCount, Map<String, Integer> outCount) {
-        ExecMode hint = null;
+        if (options.getForceMode() != null) return options.getForceMode();
+        ExecMode best = null;
+        List<String> unhinted = new ArrayList<>();
         for (String m : members) {
             ExecMode h = specs.get(m).getMode();
-            if (h != null && (hint == null || h.ordinal() > hint.ordinal())) hint = h;
+            if (h == null) unhinted.add(m);
+            else if (best == null || h.ordinal() > best.ordinal()) best = h;
         }
-        if (hint != null) return hint;
-        if (options.getForceMode() != null) return options.getForceMode();
+        if (!unhinted.isEmpty()) {
+            ExecMode e = estimateMode(unhinted, specs, inCount, outCount);
+            if (best == null || e.ordinal() > best.ordinal()) best = e;
+        }
+        return best;
+    }
+
+    private ExecMode estimateMode(List<String> members, Map<String, PipelineSpec> specs, Map<String, Integer> inCount, Map<String, Integer> outCount) {
         long rows = 0;
         boolean linear = true;
         for (String m : members) {
@@ -354,9 +398,19 @@ public final class Planner {
         return o == null ? null : stripLambda(o.getClass().getName());
     }
 
-    private static String stripLambda(String n) {
-        int i = n.indexOf("$$Lambda");
-        return i >= 0 ? n.substring(0, i) + "$$Lambda" : n;
+    /**
+     * Normalizes generated class names to the user class so plan hashes match across pods: everything from the first
+     * "$$" on is cut (Spring CGLIB "$$EnhancerBySpringCGLIB$$hex", "$$FastClassBy...", JDK lambdas "$$Lambda$17/0x..."),
+     * as is a ByteBuddy "$ByteBuddy$" suffix. Lambdas keep a "$$Lambda" marker to stay distinguishable from their host class.
+     */
+    static String stripLambda(String n) {
+        int l = n.indexOf("$$Lambda");
+        if (l >= 0) return n.substring(0, l) + "$$Lambda";
+        int i = n.indexOf("$$");
+        if (i > 0) n = n.substring(0, i);
+        int bb = n.indexOf("$ByteBuddy$");
+        if (bb > 0) n = n.substring(0, bb);
+        return n;
     }
 
     private static Map<String, Object> condition(GateCondition c) {
@@ -434,7 +488,7 @@ public final class Planner {
             byte[] json = CANON.writeValueAsString(root).getBytes(StandardCharsets.UTF_8);
             byte[] d = MessageDigest.getInstance("SHA-256").digest(json);
             StringBuilder sb = new StringBuilder();
-            for (byte b : d) sb.append(String.format("%02x", b));
+            for (byte b : d) sb.append(String.format(java.util.Locale.ROOT, "%02x", b));
             return sb.substring(0, 32);
         } catch (Exception e) {
             throw new PipelinerException("cannot hash plan", e);

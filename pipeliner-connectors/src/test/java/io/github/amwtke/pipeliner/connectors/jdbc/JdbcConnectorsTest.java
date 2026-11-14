@@ -350,4 +350,80 @@ class JdbcConnectorsTest {
         assertEquals("t", JdbcSources.mysql("x").table("t").build().datasetName());
         assertEquals("d", JdbcSinks.mysql("x").table("t").dataset("d").build().datasetName());
     }
+
+    // ---- review round 2: NULL hash bucket, typed distinct values ----
+
+    private void hashNullRows(HikariDataSource ds, boolean isCh) throws Exception {
+        String t = "t_hash_null";
+        exec(ds, "DROP TABLE IF EXISTS " + t);
+        exec(ds, isCh ? "CREATE TABLE " + t + " (id Int32, k Nullable(String)) ENGINE=MergeTree ORDER BY id"
+                      : "CREATE TABLE " + t + " (id INT PRIMARY KEY, k VARCHAR(40) NULL)");
+        for (int i = 0; i < 200; i++) exec(ds, "INSERT INTO " + t + " VALUES (" + i + ", " + (i % 10 == 0 ? "NULL" : "'key-" + i + "'") + ")");
+        JdbcSplitSource src = (isCh ? JdbcSources.clickhouse(isCh ? "ch" : "my") : JdbcSources.mysql("my")).table(t).hashSplit("k", 4).orderBy("id").build();
+        List<Row> all = readAll(src, new HashMap<String, String>());
+        assertEquals(200, all.size());   // NULL rows used to fall in no bucket
+        Set<Long> ids = new HashSet<>();
+        for (Row r : all) assertTrue(ids.add(r.getLong("id")));
+        List<Row> first = src.read(src.enumerate(sctx(new HashMap<String, String>())).get(0), sctx(new HashMap<String, String>()));
+        int nulls = 0;
+        for (Row r : first) if (r.get("k") == null) nulls++;
+        assertEquals(20, nulls);   // all NULL rows are in bucket 0
+    }
+
+    @Test void hashSplitCoversNullMysql() throws Exception { need(myUp); hashNullRows(my, false); }
+    @Test void hashSplitCoversNullClickhouse() throws Exception { need(chUp); hashNullRows(ch, true); }
+
+    @Test void distinctSplitRoundTripsTypedValuesMysql() throws Exception {
+        need(myUp);
+        String t = "t_distinct_typed";
+        exec(my, "DROP TABLE IF EXISTS " + t);
+        exec(my, "CREATE TABLE " + t + " (id INT AUTO_INCREMENT PRIMARY KEY, f FLOAT, d DOUBLE, flag TINYINT(1), b BOOLEAN, ts TIMESTAMP NULL, dt DATETIME, dec_ DECIMAL(10,2), dd DATE, s VARCHAR(10))");
+        exec(my, "SET time_zone = '+00:00'");
+        exec(my, "INSERT INTO " + t + " (f, d, flag, b, ts, dt, dec_, dd, s) VALUES "
+                + "(0.1, 0.1, 1, 1, '2024-03-10 01:02:03', '2024-03-10 01:02:03', 1.10, '2024-03-10', 'a'),"
+                + "(0.1, 0.1, 1, 1, '2024-03-10 01:02:03', '2024-03-10 01:02:03', 1.10, '2024-03-10', 'a'),"
+                + "(0.2, 0.2, 0, 0, '2024-03-11 04:00:00', '2024-03-11 04:00:00', 2.20, '2024-03-11', 'b')");
+        java.util.TimeZone old = java.util.TimeZone.getDefault();
+        try {
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Tokyo"));   // JVM zone differs from the session's UTC
+            for (String col : Arrays.asList("f", "d", "flag", "b", "ts", "dt", "dec_", "dd", "s")) {
+                JdbcSplitSource src = JdbcSources.mysql("my").table(t).distinctSplit(col).orderBy("id").build();
+                List<Split> sp = src.enumerate(sctx(new HashMap<String, String>()));
+                assertEquals(2, sp.size(), col);
+                int total = 0;
+                for (Split s : sp) {
+                    List<Row> part = src.read(s, sctx(new HashMap<String, String>()));
+                    assertFalse(part.isEmpty(), col + " split read nothing: " + s);
+                    total += part.size();
+                }
+                assertEquals(3, total, col);   // every row exactly once
+            }
+        } finally {
+            java.util.TimeZone.setDefault(old);
+        }
+    }
+
+    @Test void distinctValueEncodingIsTyped() {
+        Map<String, String> m = new java.util.LinkedHashMap<>();
+        JdbcSplitSource.encodeValue(0.1f, m);
+        assertEquals("double", m.get("vtype"));
+        assertEquals(Double.valueOf((double) 0.1f), JdbcSplitSource.decodeValue(m));
+        m.clear();
+        JdbcSplitSource.encodeValue(Boolean.TRUE, m);
+        assertEquals(Boolean.TRUE, JdbcSplitSource.decodeValue(m));
+        m.clear();
+        java.sql.Timestamp ts = java.sql.Timestamp.valueOf("2024-03-10 01:02:03.5");
+        JdbcSplitSource.encodeValue(ts, m);
+        assertEquals(ts, JdbcSplitSource.decodeValue(m));
+        m.clear();
+        JdbcSplitSource.encodeValue(new BigDecimal("1.10"), m);
+        assertEquals(new BigDecimal("1.10"), JdbcSplitSource.decodeValue(m));
+        m.clear();
+        JdbcSplitSource.encodeValue(42L, m);
+        assertEquals(42L, JdbcSplitSource.decodeValue(m));
+        m.clear();
+        JdbcSplitSource.encodeValue("x", m);
+        assertEquals("x", JdbcSplitSource.decodeValue(m));
+        assertThrows(io.github.amwtke.pipeliner.api.PipelinerException.class, () -> JdbcSplitSource.encodeValue(Double.NaN, new java.util.LinkedHashMap<String, String>()));
+    }
 }

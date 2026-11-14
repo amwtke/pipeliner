@@ -124,4 +124,21 @@ class GraphYamlTest {
         assertThrows(PipelinerException.class, () -> load("graph: g\npipelines:\n  - {id: a, source: src, runner: {type: row, class: '" + Run.class.getName() + "'}}\n"));
         assertThrows(PipelinerException.class, () -> load("graph: g\npipelines:\n  - {id: a, source: src, runner: {type: batch, bean: run, perThread: true}}\n"));
     }
+
+    @Test void sexagesimalIsNotADuration() {
+        String y = "graph: g\npipelines:\n  - {id: a, source: src}\n  - {id: b, source: src}\n"
+                + "gates:\n  - {id: m, type: manual, after: [a], before: [b], timeout: 1:30:00}\n";
+        assertThrows(PipelinerException.class, () -> load(y));
+        assertEquals(Duration.ofMinutes(90), GraphYaml.duration("1h30m"));
+    }
+
+    @Test void unsafeGlobalTagsAreRejected() {
+        String y = "graph: g\npipelines:\n  - {id: a, source: src}\nx: !!javax.script.ScriptEngineManager []\n";
+        assertThrows(RuntimeException.class, () -> load(y));
+    }
+
+    @Test void parallelismMustBePositive() {
+        assertThrows(PipelinerException.class, () -> load("graph: g\npipelines:\n  - {id: a, source: src, parallelism: 0}\n"));
+        assertEquals(2, (int) load("graph: g\npipelines:\n  - {id: a, source: src, parallelism: 2}\n").getPipelines().get("a").getParallelism());
+    }
 }

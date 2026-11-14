@@ -8,7 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 
-/** Ordered column-to-value record with lenient typed getters. */
+/** Ordered column-to-value record with lenient typed getters. Values are normalized to canonical types on set, see {@link RowValues}. */
 public final class Row implements Serializable {
     private static final long serialVersionUID = 1L;
     private final LinkedHashMap<String, Object> values = new LinkedHashMap<>();
@@ -16,14 +16,14 @@ public final class Row implements Serializable {
     public Row() {}
 
     public Row(Map<String, ?> values) {
-        if (values != null) this.values.putAll(values);
+        if (values != null) for (Map.Entry<String, ?> e : values.entrySet()) this.values.put(e.getKey(), RowValues.normalize(e.getValue()));
     }
 
     /** Builds a row from alternating column/value arguments. */
     public static Row of(Object... kv) {
         if (kv.length % 2 != 0) throw new IllegalArgumentException("Row.of needs an even number of arguments");
         Row r = new Row();
-        for (int i = 0; i < kv.length; i += 2) r.values.put(String.valueOf(kv[i]), kv[i + 1]);
+        for (int i = 0; i < kv.length; i += 2) r.values.put(String.valueOf(kv[i]), RowValues.normalize(kv[i + 1]));
         return r;
     }
 
@@ -86,7 +86,7 @@ public final class Row implements Serializable {
     }
 
     public Row set(String col, Object value) {
-        values.put(col, value);
+        values.put(col, RowValues.normalize(value));
         return this;
     }
 
@@ -97,7 +97,11 @@ public final class Row implements Serializable {
     /** Unmodifiable view in insertion order. */
     public Map<String, Object> asMap() { return Collections.unmodifiableMap(values); }
 
-    public Row copy() { return new Row(values); }
+    public Row copy() {
+        Row r = new Row();
+        r.values.putAll(values);   // already canonical
+        return r;
+    }
 
     @Override public boolean equals(Object o) { return o instanceof Row && values.equals(((Row) o).values); }
 
