@@ -23,8 +23,13 @@
   </dependencies>
 
   <build>
-    <plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId>
+    <plugins>
+      <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId>
+        <!-- tests never touch the demo's own ClickHouse/MySQL database (pipeliner_demo): Demo.DB reads this property -->
+        <configuration><systemPropertyVariables><demo.ch-db>pipeliner_demo_test</demo.ch-db></systemPropertyVariables></configuration></plugin>
+      <plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId>
       <configuration><mainClass>io.github.amwtke.pipeliner.example.ExampleApplication</mainClass></configuration>
-      <executions><execution><goals><goal>repackage</goal></goals></execution></executions></plugin></plugins>
+      <executions><execution><goals><goal>repackage</goal></goals></execution></executions></plugin>
+    </plugins>
   </build>
 </project>

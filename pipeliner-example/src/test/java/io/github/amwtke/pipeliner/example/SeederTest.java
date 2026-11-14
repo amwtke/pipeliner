@@ -34,25 +34,44 @@ class SeederTest {
         return new HikariDataSource(c);
     }
 
+    /** Own databases, never the app's pipeliner_demo: MySQL via the JDBC URL, ClickHouse via Demo.DB (surefire sets demo.ch-db). */
+    private static final String MYSQL_DB = "pipeliner_demo_test";
+
     @Test
     void seedingTwiceIsIdentical() throws Exception {
         Assumptions.assumeTrue(reachable(3306) && reachable(8123));
-        DataSource my = ds("jdbc:mysql://127.0.0.1:3306/pipeliner_demo?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC", "com.mysql.cj.jdbc.Driver");
+        assertNotEquals("pipeliner_demo", Demo.DB, "tests must not use the demo's ClickHouse database; run through surefire (demo.ch-db)");
+        DataSource my = ds("jdbc:mysql://127.0.0.1:3306/" + MYSQL_DB + "?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true&serverTimezone=UTC", "com.mysql.cj.jdbc.Driver");
         DataSource ch = ds("jdbc:clickhouse:http://127.0.0.1:8123/default?compress=0", "com.clickhouse.jdbc.ClickHouseDriver");
         Map<String, DataSource> m = new HashMap<>();
         m.put("mysql", my);
         m.put("ch", ch);
-        Seeder seeder = new Seeder(new SimpleDataSourceRegistry(m));
-        Map<String, Object> c1 = seeder.seed(60, 42);
-        String h1 = fingerprint(my);
-        Map<String, Object> c2 = seeder.seed(60, 42);
-        assertEquals(c1, c2);
-        assertEquals(h1, fingerprint(my));
-        assertEquals(60, c1.get("ex_material"));
-        assertEquals(60 * 5, c1.get("ex_inventory"));
-        assertEquals(48, c1.get("ex_bom"));
-        seeder.seed(60, 7);
-        assertNotEquals(h1, fingerprint(my));
+        try {
+            Seeder seeder = new Seeder(new SimpleDataSourceRegistry(m));
+            Map<String, Object> c1 = seeder.seed(60, 42);
+            String h1 = fingerprint(my);
+            Map<String, Object> c2 = seeder.seed(60, 42);
+            assertEquals(c1, c2);
+            assertEquals(h1, fingerprint(my));
+            assertEquals(60, c1.get("ex_material"));
+            assertEquals(60 * 5, c1.get("ex_inventory"));
+            assertEquals(48, c1.get("ex_bom"));
+            seeder.seed(60, 7);
+            assertNotEquals(h1, fingerprint(my));
+        } finally {
+            dropQuietly(ch, "DROP DATABASE IF EXISTS " + Demo.DB);
+            dropQuietly(my, "DROP DATABASE IF EXISTS " + MYSQL_DB);
+            ((HikariDataSource) my).close();
+            ((HikariDataSource) ch).close();
+        }
+    }
+
+    private static void dropQuietly(DataSource ds, String sql) {
+        try (Connection c = ds.getConnection(); java.sql.Statement st = c.createStatement()) {
+            st.execute(sql);
+        } catch (Exception ignored) {
+            // best effort cleanup of the test database
+        }
     }
 
     private static String fingerprint(DataSource ds) throws Exception {

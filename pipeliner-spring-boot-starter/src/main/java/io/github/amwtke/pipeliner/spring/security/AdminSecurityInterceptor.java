@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.spring.security;
 
+import io.github.amwtke.pipeliner.spring.PipelinerAdminController;
 import io.github.amwtke.pipeliner.spring.security.PipelinerSecurityProperties.Role;
 import io.github.amwtke.pipeliner.spring.security.PipelinerSecurityProperties.TokenEntry;
 import java.io.IOException;
@@ -7,22 +8,24 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
-import javax.servlet.FilterChain;
-import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.util.UrlPathHelper;
 
 /**
- * Token filter for /pg/*. GET/HEAD are open unless readRequiresToken; all other methods need an ADMIN token.
+ * Token check for the admin API, applied as a Spring MVC interceptor so it does not depend on URL patterns that change with
+ * {@code spring.mvc.servlet.path} / the context path: it guards every handler of {@link PipelinerAdminController} and anything mapped under
+ * /pg within the DispatcherServlet. GET/HEAD are open unless readRequiresToken; all other methods need an ADMIN token.
  * The authenticated token name is exposed as request attribute {@link #PRINCIPAL_ATTR}.
  */
-public class AdminSecurityFilter extends OncePerRequestFilter {
+public class AdminSecurityInterceptor implements HandlerInterceptor {
     public static final String PRINCIPAL_ATTR = "pipeliner.admin.principal";
     public static final String ALT_HEADER = "X-PG-Token";
-    private static final Logger log = LoggerFactory.getLogger(AdminSecurityFilter.class);
+    private static final Logger log = LoggerFactory.getLogger(AdminSecurityInterceptor.class);
     private static final Logger AUDIT = LoggerFactory.getLogger("pipeliner.audit");
 
     private static final class Cred {
@@ -34,18 +37,29 @@ public class AdminSecurityFilter extends OncePerRequestFilter {
         }
     }
 
+    private static final java.util.regex.Pattern WHITESPACE = java.util.regex.Pattern.compile("\\s");
+    private static final UrlPathHelper PATHS = new UrlPathHelper();
+
     private final List<Cred> creds = new ArrayList<>();
     private final boolean readRequiresToken;
     private final String header;
 
-    public AdminSecurityFilter(PipelinerSecurityProperties p) {
+    public AdminSecurityInterceptor(PipelinerSecurityProperties p) {
         this.readRequiresToken = p.isReadRequiresToken();
         this.header = p.getHeader() == null || p.getHeader().trim().isEmpty() ? "Authorization" : p.getHeader().trim();
         for (TokenEntry t : p.getTokens()) {
-            if (t.getToken() == null || t.getToken().isEmpty()) continue;
+            if (t.getToken() == null) continue;
+            String token = t.getToken().trim();
+            if (token.isEmpty()) continue;
             String name = t.getName() == null || t.getName().isEmpty() ? "token" : t.getName();
-            creds.add(new Cred(name, t.getToken(), t.getRole() == null ? Role.VIEWER : t.getRole()));
-            if (t.getToken().length() < 16) {
+            if (!token.equals(t.getToken())) {
+                log.warn("pipeliner admin token '{}' had leading/trailing whitespace (e.g. a newline from a secret file); it was trimmed", name);
+            }
+            if (WHITESPACE.matcher(token).find()) {
+                log.warn("pipeliner admin token '{}' contains inner whitespace; clients trim what they send, so it can never match", name);
+            }
+            creds.add(new Cred(name, token, t.getRole() == null ? Role.VIEWER : t.getRole()));
+            if (token.length() < 16) {
                 log.warn("pipeliner admin token '{}' is shorter than 16 characters; use a longer random secret", name);
             }
         }
@@ -54,9 +68,16 @@ public class AdminSecurityFilter extends OncePerRequestFilter {
         }
     }
 
+    /** True when the request is dispatched to the admin controller or to a path under /pg (relative to the servlet mapping). */
+    static boolean guards(HttpServletRequest req, Object handler) {
+        if (handler instanceof HandlerMethod && PipelinerAdminController.class.isAssignableFrom(((HandlerMethod) handler).getBeanType())) return true;
+        String path = PATHS.getPathWithinServletMapping(req);
+        return path.equals("/pg") || path.startsWith("/pg/");
+    }
+
     @Override
-    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
-            throws ServletException, IOException {
+    public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) throws IOException {
+        if (!guards(req, handler)) return true;
         String m = req.getMethod();
         boolean read = "GET".equalsIgnoreCase(m) || "HEAD".equalsIgnoreCase(m);
         boolean optionsOrTrace = "OPTIONS".equalsIgnoreCase(m);
@@ -64,22 +85,22 @@ public class AdminSecurityFilter extends OncePerRequestFilter {
         Cred c = presented == null ? null : match(presented);
         if (c != null) req.setAttribute(PRINCIPAL_ATTR, c.name);
 
-        if (optionsOrTrace) { chain.doFilter(req, res); return; }
-        if (read && !readRequiresToken) { chain.doFilter(req, res); return; }
+        if (optionsOrTrace) return true;
+        if (read && !readRequiresToken) return true;
         if (!read && creds.isEmpty()) {
             reject(req, res, null, HttpServletResponse.SC_FORBIDDEN, "admin API is read-only: no tokens configured", false);
-            return;
+            return false;
         }
         if (c == null) {
             reject(req, res, null, HttpServletResponse.SC_UNAUTHORIZED,
                     presented == null ? "authentication required" : "invalid token", true);
-            return;
+            return false;
         }
         if (!read && c.role != Role.ADMIN) {
             reject(req, res, c.name, HttpServletResponse.SC_FORBIDDEN, "ADMIN role required", false);
-            return;
+            return false;
         }
-        chain.doFilter(req, res);
+        return true;
     }
 
     /** Rejected mutating calls are audited too (same logger as the controller's audit lines); the token is never logged. */

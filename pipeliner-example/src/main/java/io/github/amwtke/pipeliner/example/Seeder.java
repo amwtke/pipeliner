@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class Seeder {
     private static final List<String> MYSQL_TABLES = Arrays.asList("ex_material", "ex_inventory", "ex_in_transit", "ex_safety_stock",
-            "ex_bom", "ex_site_capacity", "ex_nd1_big", "ex_nd_final", "ex_publish_log", "ex_fault");
+            "ex_bom", "ex_site_capacity", "ex_nd1_big", "ex_nd_final", "ex_publish_log", "ex_fault", "ex_algo_request");
     private static final String[] MYSQL_DDL = {
         "create table ex_material(material_id varchar(16) primary key, group_id varchar(16) not null, kind varchar(8) not null, eol_month int not null)",
         "create table ex_inventory(material_id varchar(16), node varchar(8), qty decimal(18,4) not null, primary key(material_id,node))",
@@ -61,6 +61,7 @@ public class Seeder {
             try (Statement st = c.createStatement()) {
                 for (String t : MYSQL_TABLES) st.execute("drop table if exists " + t);
                 for (String ddl : MYSQL_DDL) st.execute(ddl);
+                st.execute(FakeAlgoService.REQUEST_DDL);
             }
             generate(c, materials, new Random(seed), counts);
         }

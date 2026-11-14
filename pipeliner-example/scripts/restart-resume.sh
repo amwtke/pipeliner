@@ -3,8 +3,13 @@
 # restart them, let V2 resume to SUCCEEDED, compare V1/V2 checksums.
 # Env: MATERIALS (default 600), STORE_PROFILE (default: none = Redis store; e.g. mysql-store), SKIP_BUILD=1, TIMEOUT_SEC (per round, default 600)
 set -uo pipefail
+if [ "${MASTER_TICK:-local}" = external ]; then
+  echo "RESTART-RESUME: MASTER_TICK=external is not supported here (nothing would tick the pods; rounds would stay CREATED). Unset MASTER_TICK, or use e2e.sh which starts tick-loop.sh." >&2
+  exit 2
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+. "$HERE/lib.sh"   # LOGS (honours PIPELINER_LOGS), pod_pid, kill_pod
 REPO="$(cd "$ROOT/.." && pwd)"
 MATERIALS="${MATERIALS:-600}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-600}"
@@ -30,7 +35,8 @@ wait_up() { for _ in $(seq 1 120); do [ "$(api -o /dev/null -w '%{http_code}' "h
 
 if [ -z "${SKIP_BUILD:-}" ]; then
   echo "== building"
-  (cd "$REPO" && mvn -o -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example package || mvn -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example package) || die "build"
+  # -am builds the framework modules of this tree too, so the jar under test contains this tree's code (never `install`: ~/.m2 is shared)
+  (cd "$REPO" && mvn -o -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example -am package || mvn -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example -am package) || die "build"
 fi
 
 trap '"$HERE/stop-pods.sh" >/dev/null 2>&1' EXIT
@@ -86,7 +92,7 @@ print(''.join(r['status'] for r in d.get('runs',[]) if r['runId']=='R2'))" 2>/de
 done
 [ "$rs" = RUNNING ] || die "run R2 never became RUNNING"
 sleep 2
-for p in "${PODS[@]}"; do kill -9 "$(cat "$ROOT/logs/$p.pid")" 2>/dev/null; done
+for p in "${PODS[@]}"; do kill_pod "$p" || die "could not kill pod $p"; done
 echo "killed all pods; sleeping 5s"
 sleep 5
 T1=$SECONDS

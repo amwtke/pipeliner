@@ -12,9 +12,10 @@ JAR="${PIPELINER_JAR:-$(ls "$ROOT"/target/pipeliner-example-*.jar 2>/dev/null | 
 LOGS="${PIPELINER_LOGS:-$ROOT/logs}"   # override to keep a test run's logs/pids separate
 mkdir -p "$LOGS"
 PIDFILE="$LOGS/$NAME.pid"
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-  echo "pod $NAME already running (pid $(cat "$PIDFILE"))"; exit 0
-fi
+. "$HERE/lib.sh"
+if pid=$(pod_pid "$NAME"); then
+  echo "pod $NAME already running (pid $pid)"; exit 0
+fi   # a pid file whose pid is not this pod's java process (stale, reused pid) is ignored and overwritten below
 # MASTER_TICK=external: no pg-master thread; an external trigger (tick-loop.sh simulating xxl-job) must POST /pg/master/tick
 TICK_ARGS=()
 if [ "${MASTER_TICK:-local}" = external ]; then

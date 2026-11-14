@@ -67,7 +67,8 @@ const state = {
   graphs: [], graph: null, plan: null,
   rounds: [], roundId: null, view: null, bp: null, workers: null,
   sel: null,                 // {kind: 'pipeline'|'run'|'gate', id}
-  auto: true, busy: false,
+  auto: true, busy: false, busyRound: null,
+  seq: 0,                    // bumped on every selection change and refresh: responses of an older sequence are dropped
   panelHtml: '', summarySig: '',
   dead: {},                  // pipelineId -> {loading, items, err}
 };
@@ -79,7 +80,7 @@ async function api(path, opts) {
   opts = opts || {};
   const headers = { Accept: 'application/json' };
   const t = $('tokenInp').value.trim();
-  if (t) headers.Authorization = 'Bearer ' + t;
+  if (t) headers['X-PG-Token'] = t;   // always honoured by the server, whatever pipeliner.admin.security.header is
   const res = await fetch(API + path, { method: opts.method || 'GET', headers, cache: 'no-store' });
   const txt = await res.text();
   let body = null;
@@ -153,28 +154,33 @@ function renderRoundSel() {
 }
 async function refreshRound() {
   if (!state.roundId) return;
-  if (state.busy) return;
-  state.busy = true;
+  const rid = state.roundId;
+  if (state.busy && state.busyRound === rid) return;   // one in-flight refresh per selection; a new selection always loads
+  const tok = ++state.seq;
+  state.busy = true; state.busyRound = rid;
   try {
-    const id = encodeURIComponent(state.roundId);
+    const id = encodeURIComponent(rid);
     const [view, bp, workers] = await Promise.all([
       api('/rounds/' + id),
       api('/rounds/' + id + '/backpressure').catch(() => null),
       api('/cluster/workers').catch(() => null),
     ]);
+    if (tok !== state.seq || rid !== state.roundId) return;   // selection changed while in flight: drop the stale response
     state.view = view; state.bp = bp; state.workers = workers;
     showBanner(null);
     $('updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
   } catch (e) {
+    if (tok !== state.seq || rid !== state.roundId) return;
     showBanner(describeError(e));
     if (e.status === 404) { state.view = null; state.bp = null; }
   } finally {
-    state.busy = false;
+    if (tok === state.seq) state.busy = false;
   }
   updateAll();
 }
 function clearRoundData() {
   state.view = null; state.bp = null; state.workers = null; state.dead = {};
+  state.seq++; state.busy = false; state.busyRound = null;   // invalidates in-flight refreshes / loadDead of the previous selection
 }
 async function selectRound(id) {
   state.roundId = id || null;
@@ -545,6 +551,12 @@ function currentStage() {
 }
 
 function updateAll() {
+  if (!state.plan) {   // graphs/plan failed to load (e.g. 401 before the token was entered): nothing to draw yet
+    const em = $('emptyMsg');
+    em.hidden = false;
+    em.textContent = state.graphs.length ? '拓扑尚未加载，请在右上角填写 token 后点击刷新' : '没有已注册的 PipelineGraph（或加载失败，请填写 token 后刷新）';
+    return;
+  }
   updateTopology();
   updateSummary();
   updatePanel();
@@ -913,13 +925,17 @@ function sinkLines(p) {
   return s;
 }
 async function loadDead(pid) {
-  state.dead[pid] = { loading: true };
+  const rid = state.roundId, seq = state.seq, dead = state.dead;
+  dead[pid] = { loading: true };
   state.panelHtml = '';
   updatePanel();
+  let res;
   try {
-    const items = await api('/rounds/' + encodeURIComponent(state.roundId) + '/chunks?pipeline=' + encodeURIComponent(pid) + '&status=DEAD&limit=50');
-    state.dead[pid] = { items };
-  } catch (e) { state.dead[pid] = { err: describeError(e) }; }
+    const items = await api('/rounds/' + encodeURIComponent(rid) + '/chunks?pipeline=' + encodeURIComponent(pid) + '&status=DEAD&limit=50');
+    res = { items };
+  } catch (e) { res = { err: describeError(e) }; }
+  if (state.roundId !== rid || state.seq !== seq || state.dead !== dead) return;   // another round was selected meanwhile: do not show its DEAD chunks here
+  state.dead[pid] = res;
   state.panelHtml = '';
   updatePanel();
 }
@@ -1088,15 +1104,11 @@ async function init() {
   window.addEventListener('resize', () => { /* keep the user's view */ });
 
   state.graph = q.get('graph');
+  urlHadGraph = !!state.graph;
   state.roundId = q.get('round');
   try {
     await loadGraphs();
-    if (state.roundId && !q.get('graph')) {
-      try {
-        const v = await api('/rounds/' + encodeURIComponent(state.roundId));
-        if (v && v.round && state.graphs.indexOf(v.round.graphName) >= 0) { state.graph = v.round.graphName; $('graphSel').value = state.graph; }
-      } catch (e) { /* handled below */ }
-    }
+    if (state.roundId && !urlHadGraph) await resolveGraphFromRound();
     if (state.graph) {
       await loadPlan();
       await loadRounds();
@@ -1114,14 +1126,39 @@ async function init() {
   setInterval(async () => {
     if (!state.auto) return;
     n++;
-    const active = state.roundId && state.view && !TERMINAL[state.view.round.status];
+    if ((!state.graphs.length || !state.plan) && !missingBusy) {   // initial load failed: keep retrying (also recovers once a token is entered)
+      missingBusy = true;
+      try { await loadMissing(); updateAll(); } catch (e) { /* banner already shows the first failure */ } finally { missingBusy = false; }
+    }
+    // poll while a round is selected and its view is not loaded yet (failed first fetch) or not terminal
+    const active = state.roundId && (!state.view || !TERMINAL[state.view.round.status]);
     if (active) await refreshRound();
     if (n % 3 === 0) await loadRounds();
   }, 2000);
   setInterval(tickClocks, 1000);
 }
+let urlHadGraph = false;
+async function resolveGraphFromRound() {
+  try {
+    const v = await api('/rounds/' + encodeURIComponent(state.roundId));
+    if (v && v.round && state.graphs.indexOf(v.round.graphName) >= 0) { state.graph = v.round.graphName; $('graphSel').value = state.graph; }
+  } catch (e) { /* the plan load / refresh below reports it */ }
+}
+/** Reloads whatever is still missing (graph list, plan) after a failed first load, e.g. the 401 before a token was entered. */
+async function loadMissing() {
+  if (!state.graphs.length) await loadGraphs();
+  if (!state.plan && state.roundId && !urlHadGraph) await resolveGraphFromRound();
+  if (state.graph && !state.plan) { await loadPlan(); syncUrl(); }
+  const sp = (new URLSearchParams(window.location.search).get('sel') || '').split(':');
+  if (!state.sel && sp.length === 2 && ['pipeline', 'run', 'gate'].indexOf(sp[0]) >= 0) state.sel = { kind: sp[0], id: sp[1] };
+}
+let missingBusy = false;
 async function refreshAll() {
-  try { await loadRounds(); if (state.roundId) await refreshRound(); else updateAll(); } catch (e) { showBanner(describeError(e)); }
+  try {
+    await loadMissing();
+    await loadRounds();
+    if (state.roundId) await refreshRound(); else updateAll();
+  } catch (e) { showBanner(describeError(e)); updateAll(); }
 }
 function tickClocks() {
   document.querySelectorAll('[data-since]').forEach((n) => {

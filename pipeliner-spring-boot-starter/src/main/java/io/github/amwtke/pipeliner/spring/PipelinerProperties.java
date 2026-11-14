@@ -80,6 +80,7 @@ public class PipelinerProperties {
 
     /** Builds the engine's RuntimeConfig from these properties. */
     public RuntimeConfig toRuntimeConfig() {
+        rejectShadowedRuntimeKeys();
         RuntimeConfig cfg = runtime.toBuilder().build();
         cfg.setPodId(resolvePodId());
         cfg.setMasterEnabled(masterEnabled);
@@ -91,6 +92,28 @@ public class PipelinerProperties {
         cfg.setRetentionIntervalMillis(java.util.concurrent.TimeUnit.MINUTES.toMillis(retention.getIntervalMinutes()));
         cfg.setRetentionBatch(retention.getBatch());
         return cfg;
+    }
+
+    /**
+     * pipeliner.runtime.* binds the whole RuntimeConfig, but these fields are owned by dedicated properties and would be silently
+     * overwritten. A runtime.* value that differs from the RuntimeConfig default fails fast instead, naming the property to use.
+     */
+    private void rejectShadowedRuntimeKeys() {
+        RuntimeConfig d = new RuntimeConfig();
+        java.util.List<String> bad = new java.util.ArrayList<>();
+        if (!java.util.Objects.equals(runtime.getPodId(), d.getPodId())) bad.add("runtime.pod-id -> pipeliner.pod-id");
+        if (runtime.isMasterEnabled() != d.isMasterEnabled()) bad.add("runtime.master-enabled -> pipeliner.master-enabled");
+        if (runtime.isWorkerEnabled() != d.isWorkerEnabled()) bad.add("runtime.worker-enabled -> pipeliner.worker-enabled");
+        if (runtime.getPlanOptions() != null) bad.add("runtime.plan-options.* -> pipeliner.plan.*");
+        if (runtime.isRetentionEnabled() != d.isRetentionEnabled()) bad.add("runtime.retention-enabled -> pipeliner.retention.enabled");
+        if (runtime.getChunkRetentionMillis() != d.getChunkRetentionMillis()) bad.add("runtime.chunk-retention-millis -> pipeliner.retention.chunk-days");
+        if (runtime.getRoundRetentionMillis() != d.getRoundRetentionMillis()) bad.add("runtime.round-retention-millis -> pipeliner.retention.round-days");
+        if (runtime.getRetentionIntervalMillis() != d.getRetentionIntervalMillis())
+            bad.add("runtime.retention-interval-millis -> pipeliner.retention.interval-minutes");
+        if (runtime.getRetentionBatch() != d.getRetentionBatch()) bad.add("runtime.retention-batch -> pipeliner.retention.batch");
+        if (!bad.isEmpty())
+            throw new IllegalStateException("pipeliner.runtime.* keys that are overridden by dedicated properties and would be ignored; use the dedicated property instead: "
+                    + String.join("; ", bad));
     }
 
     String resolvePodId() {

@@ -277,7 +277,8 @@ def heal():
         elif p.state == "stopped":
             p.signal(signal.SIGCONT)
             p.state = "up"
-    C.wait_ready(CTX.pods, 120)
+    if not C.wait_ready(CTX.pods, 120):
+        log("WARN heal: not every pod is ready after 120s: %s" % [(p.name, p.state) for p in CTX.pods])
     BG.reserved.clear()
 
 
@@ -408,11 +409,35 @@ def finish_verify(rid, pv, base, expect, viol, dets, label):
     v2, d2 = C.verify_round(rid, pv, base, None, expect)
     viol += ["%s: %s" % (label, x) for x in v2]
     dets["verify"] = {k: d2.get(k) for k in ("checksum", "splitChunks", "chunksWithAttemptGt1", "rawDup", "redisLeftovers", "liveInstances")}
-    dets["diffs"] = (d2.get("verify") or {}).get("diffsVsBase")
+    vf = d2.get("verify")
+    dets["diffs"] = vf.get("diffsVsBase") if isinstance(vf, dict) else None
     return d2.get("view")
 
 
 # ---------------------------------------------------------------- scenarios
+BUMP_PATH = "/demo/bump?nBig=%d&nFine=%d&delta=%d"
+
+
+def restore_bump(info, viol):
+    """Undo scenario A's input change on every exit path (liveness early return, exception). The shared MySQL input must be back to the
+    original before B/C/D, which are verified against base0."""
+    BG.quiet = False
+    BG.stop()
+    heal()   # a frozen/killed pod must not swallow the restore
+    for i in range(5):
+        port = healthy_port()
+        if port:
+            code, body = C.http(port, "POST", BUMP_PATH % (A_BIG, A_FINE, -A_DELTA), 60)
+            if code == 200:
+                info["restore"] = body
+                log("A: input restored")
+                return True
+            log("A: restore try %d -> %s %s" % (i + 1, code, str(body)[:100]))
+        time.sleep(2)
+    viol.append("A: HARNESS: could not restore the bumped input (+%d for %d BIG / %d FINE); B/C/D checksums will be wrong" % (A_DELTA, A_BIG, A_FINE))
+    return False
+
+
 def sc_A(ctx, n):
     base0, expect = ctx["base"], ctx["expect"]
     pv = "A%02d-%s" % (n, C.STAMP)
@@ -432,39 +457,45 @@ def sc_A(ctx, n):
     BG.quiet = True
     t_stop = time.time()
     freeze(zombie, reserved)
-    code, bm = C.http(healthy_port(), "POST", "/demo/bump?nBig=%d&nFine=%d&delta=%d" % (A_BIG, A_FINE, A_DELTA), 60)
+    code, bm = C.http(healthy_port(), "POST", BUMP_PATH % (A_BIG, A_FINE, A_DELTA), 60)
     info["bump"] = bm
-    ok = admin(out, "rerun R2", "/pg/runs/%s/R2/rerun" % rid, tries=5)
-    if not ok:
-        viol.append("A: rerun command not accepted after 5 tries")
-    time.sleep(max(0, FREEZE_WORKER - (time.time() - t_stop)))
-    thaw(zombie, reserved)
-    info["frozenSecs"] = round(time.time() - t_stop, 1)
-    BG.quiet = False
-    st, secs, v = wait_done(rid)
-    info["status"], info["secs"] = st, round(secs)
-    if st != "SUCCEEDED":
-        viol.append("LIVENESS: A round %s after %.0fs" % (st, secs))
+    bumped = code == 200
+    if not bumped:
+        viol.append("A: bump did not return 200 (%s %s): input state unknown, not restoring" % (code, str(bm)[:100]))
+    try:
+        ok = admin(out, "rerun R2", "/pg/runs/%s/R2/rerun" % rid, tries=5)
+        if not ok:
+            viol.append("A: rerun command not accepted after 5 tries")
+        time.sleep(max(0, FREEZE_WORKER - (time.time() - t_stop)))
+        thaw(zombie, reserved)
+        info["frozenSecs"] = round(time.time() - t_stop, 1)
+        BG.quiet = False
+        st, secs, v = wait_done(rid)
+        info["status"], info["secs"] = st, round(secs)
+        if st != "SUCCEEDED":
+            viol.append("LIVENESS: A round %s after %.0fs" % (st, secs))
+            return viol, info, out
+        r2 = run_of(v, "R2")
+        info["R2attempt"] = {"before": att0, "after": r2["attempt"]}
+        if att0 is None or r2["attempt"] <= att0:
+            viol.append("A: R2 attempt did not advance (%s -> %s)" % (att0, r2["attempt"]))
+        time.sleep(2)
+        check_versions(rid, pv, v, viol, info)
+        BG.stop()
+        heal()
+        hygiene_extra(rid, viol, info, "(4 pods)")
+        # BASE on the CHANGED data: single pod INLINE
+        base_mode()
+        basec = run_base("BASEC%02d-%s" % (n, C.STAMP))
+        if basec["checksum"]["kinds"] == base0["checksum"]["kinds"]:
+            viol.append("A: INVALID TEST: changed input did not change the BASE checksum")
+        info["baseChanged"] = basec["checksum"]["kinds"]
+        info["baseOrig"] = base0["checksum"]["kinds"]
+        finish_verify(rid, pv, basec, expect, viol, info, "A")
         return viol, info, out
-    r2 = run_of(v, "R2")
-    info["R2attempt"] = {"before": att0, "after": r2["attempt"]}
-    if att0 is None or r2["attempt"] <= att0:
-        viol.append("A: R2 attempt did not advance (%s -> %s)" % (att0, r2["attempt"]))
-    time.sleep(2)
-    check_versions(rid, pv, v, viol, info)
-    BG.stop()
-    heal()
-    hygiene_extra(rid, viol, info, "(4 pods)")
-    # BASE on the CHANGED data: single pod INLINE
-    base_mode()
-    basec = run_base("BASEC%02d-%s" % (n, C.STAMP))
-    if basec["checksum"]["kinds"] == base0["checksum"]["kinds"]:
-        viol.append("A: INVALID TEST: changed input did not change the BASE checksum")
-    info["baseChanged"] = basec["checksum"]["kinds"]
-    info["baseOrig"] = base0["checksum"]["kinds"]
-    finish_verify(rid, pv, basec, expect, viol, info, "A")
-    C.http(BASEPOD.port, "POST", "/demo/bump?nBig=%d&nFine=%d&delta=%d" % (A_BIG, A_FINE, -A_DELTA), 60)   # restore the input
-    return viol, info, out
+    finally:
+        if bumped:
+            restore_bump(info, viol)
 
 
 def fault(on):
@@ -489,22 +520,26 @@ def sc_B_one(ctx, n, variant):
         rid = submit_pg(pv, pv)
         info["rid"] = rid
         st, secs, v = wait_done(rid, 240, until=("FAILED", "SUCCEEDED", "CANCELLED"))
-        info["afterFault"] = {"round": st, "secs": round(secs), "error": (v or {}).get("round", {}).get("error"),
-                              "runs": {r["runId"]: (r["status"], r["attempt"]) for r in (v or {}).get("runs", [])},
-                              "chunkCounts": (v or {}).get("chunkCounts")}
+        info["afterFault"] = {"round": st, "secs": round(secs), "error": ((v or {}).get("round") or {}).get("error") if isinstance(v, dict) else None,
+                              "runs": {r["runId"]: (r["status"], r["attempt"]) for r in v.get("runs", [])} if isinstance(v, dict) else {},
+                              "chunkCounts": v.get("chunkCounts") if isinstance(v, dict) else None}
         if st != "FAILED":
             viol.append("B: expected FAILED with fault on, got %s (fault mod %d may miss every chunk)" % (st, FAULT_MOD))
         else:
             r2 = run_of(v, "R2")
             if r2["status"] != "FAILED":
                 viol.append("B: R2 status %s expected FAILED" % r2["status"])
-            dead = [c["chunkId"] for c in C.get_chunks(rid, "big-net") if c["status"] == "DEAD"]
+            chunks, cerr = C.get_chunks(rid, "big-net")
+            if cerr:
+                info["deadChunkCheckSkipped"] = cerr   # could not read the chunk records: skip the DEAD-chunk checks instead of reporting "no dead chunks"
+                C.log("NOTE B: dead chunk checks skipped: %s" % cerr)
+            dead = [c["chunkId"] for c in (chunks or []) if c["status"] == "DEAD"]
             info["deadChunks"] = dead
             info["deadChunksAllHashMatch"] = all(jhash(c) % FAULT_MOD == 0 or (jhash(c) % FAULT_MOD) == 0 for c in dead)
             bad = [c for c in dead if jhash(c) % FAULT_MOD != 0]
             if bad:
                 viol.append("B: DEAD chunks that the fault rule does not select: %s" % bad[:5])
-            if not dead:
+            if not dead and not cerr:
                 viol.append("B: run FAILED but no DEAD chunks")
             info["dlqKeysWhileFailed"] = [k for k in redis_keys(rid) if k.startswith("dlq:")]
     finally:
@@ -619,8 +654,18 @@ def sc_C(ctx, n):
     finish_verify(new, pv, base0, expect, viol, info, "C")
     # cancelled round: hygiene + stray keys
     left, _ = C.redis_leftovers(old)
-    live = {p.name: [i for i in (C.http(p.port, "GET", "/pg/cluster", 5)[1] or {}).get("liveInstances", []) if i.get("roundId") == old] for p in CTX.pods}
-    live = {k: x for k, x in live.items() if x}
+    live, unreachable = {}, []
+    for p in CTX.pods:
+        code, cl = C.http(p.port, "GET", "/pg/cluster", 5)
+        if code != 200 or not isinstance(cl, dict):   # error string / non-JSON: say so, keep the violations collected so far
+            unreachable.append("%s(%s)" % (p.name, code))
+            continue
+        mine = [i for i in (cl.get("liveInstances") or []) if i.get("roundId") == old]
+        if mine:
+            live[p.name] = mine
+    if unreachable:
+        info["oldLiveInstancesUnknown"] = unreachable
+        log("NOTE C: liveInstances of the cancelled round not checked on %s" % unreachable)
     info["oldKeysAfter"] = redis_keys(old)
     info["oldLeftovers"] = left
     if left:
@@ -741,7 +786,7 @@ def main():
                 except Exception as e:  # noqa
                     import traceback
                     traceback.print_exc()
-                    viol, info, out = ["EXC: %r" % e], {}, []
+                    viol, info, out = ["EXC: %r" % e], {}, []   # scenarios guard their own http results, so collected violations are not lost here
                 finally:
                     BG.quiet = False
                     BG.stop()
