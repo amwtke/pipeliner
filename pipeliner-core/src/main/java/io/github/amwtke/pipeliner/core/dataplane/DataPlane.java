@@ -70,6 +70,11 @@ public interface DataPlane extends AutoCloseable {
     void pushCommand(String commandJson);
     /** LPOP up to max commands (oldest first). */
     List<String> popCommands(int max);
+    /**
+     * Atomically removes a still-queued command (LREM of the exact json). True if it was removed, i.e. it will never be executed; false if
+     * it was already popped by a leader (its result will appear). Used by the client when it times out. Default false (no withdrawal).
+     */
+    default boolean withdrawCommand(String commandJson) { return false; }
     /** SET with a 10 minute expiry. */
     void putCommandResult(String commandId, String resultJson);
     /** Null while the command has not finished. */

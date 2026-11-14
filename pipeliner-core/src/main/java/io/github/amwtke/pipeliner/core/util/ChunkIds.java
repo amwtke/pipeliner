@@ -28,6 +28,24 @@ public final class ChunkIds {
         return k.substring(k.lastIndexOf(':') + 1);
     }
 
+    /** The {@code <attempt>} of a signal key ending in {@code @<n>}, or -1 when it has none (or it is not a number). */
+    public static int attemptOfSignalKey(String signalKey) {
+        int at = signalKey.lastIndexOf('@');
+        if (at < 0) return -1;
+        try { return Integer.parseInt(signalKey.substring(at + 1)); } catch (NumberFormatException e) { return -1; }
+    }
+
+    /** The pipeline id inside a {@code <round>:<pipeline>:<chunk>[@n]} key (the segment before the chunk id), or null when the key has no such part. */
+    public static String pipelineOfSignalKey(String signalKey) {
+        int at = signalKey.lastIndexOf('@');
+        String k = at < 0 ? signalKey : signalKey.substring(0, at);
+        int last = k.lastIndexOf(':');
+        if (last <= 0) return null;
+        int prev = k.lastIndexOf(':', last - 1);
+        if (prev < 0) return null;
+        return k.substring(prev + 1, last);
+    }
+
     /** Chunk id passed to Sink.write. */
     public static String sinkChunk(String inputChunkId, String port) { return inputChunkId + "#" + port; }
 }
