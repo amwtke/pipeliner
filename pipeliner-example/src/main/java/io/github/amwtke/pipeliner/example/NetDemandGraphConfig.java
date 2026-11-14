@@ -21,6 +21,15 @@ public class NetDemandGraphConfig {
     @Value("${demo.chunk-rows:0}")
     private int chunkRowsOverride;
 
+    @Value("${demo.cap-alloc-mode:LOCAL}")
+    private ExecMode capAllocMode;
+
+    @Value("${demo.cap-alloc-parallelism:3}")
+    private int capAllocParallelism;
+
+    @Value("${demo.algo-callback-timeout:10m}")
+    private Duration algoCallbackTimeout;
+
     private int rows(int dflt) { return chunkRowsOverride > 0 ? chunkRowsOverride : dflt; }
 
     @Bean
@@ -45,13 +54,15 @@ public class NetDemandGraphConfig {
                         .row(CoreGradeRunner.class)
                         .sink(JdbcSinks.clickhouse("ch").table(CH + "ex_grade_result").versionColumn("pg_version").dataset("grade_result").build())
                         .chunkRows(rows(5000)))
-                .pipeline("cap-alloc", p -> p
+                .pipeline("cap-alloc", p -> { p
                         .source(JdbcSources.clickhouse("ch").table(CH + "ex_grade_result").dataset("grade_result").useFinal()
                                 .where("plan_version = :planVersion").distinctSplit("site").orderBy("month, material_id, node").build())
                         .batch(CapAllocRunner.class).ports("scrap")
                         .sink(JdbcSinks.clickhouse("ch").table(CH + "ex_refurb_plan").versionColumn("pg_version").dataset("refurb_plan").build())
                         .sink("scrap", JdbcSinks.clickhouse("ch").table(CH + "ex_scrap").versionColumn("pg_version").dataset("scrap").build())
-                        .mode(ExecMode.LOCAL))
+                        .mode(capAllocMode);
+                    if (capAllocMode == ExecMode.CLUSTER) p.parallelism(capAllocParallelism);
+                })
                 .pipeline("big-final", p -> p
                         .source(JdbcSources.mysql("mysql").table("ex_nd1_big").dataset("nd1_big")
                                 .where("plan_version = :planVersion").hashSplit("material_id", 8).orderBy("material_id, node, month").build())
@@ -76,7 +87,7 @@ public class NetDemandGraphConfig {
                 .edge("gd-fix.big", "big-net")
                 .edge("big-net", "core-grade")
                 .gate("algo-callback", Gates.externalCountOf("algo-submit"),
-                        g -> g.after("algo-submit").before("gd-fix").timeout(Duration.ofMinutes(10), TimeoutPolicy.FAIL))
+                        g -> g.after("algo-submit").before("gd-fix").timeout(algoCallbackTimeout, TimeoutPolicy.FAIL))
                 .gate("refurb-ready", Gates.barrier(), g -> g.after("cap-alloc").before("big-final", "fine-net"))
                 .gate("conserve-check", Gates.condition(new ConserveCheckGate()), g -> g.after("big-final", "fine-net").before("publish"))
                 .gate("approve", Gates.manual(), g -> g.after("big-final", "fine-net").before("publish"))
