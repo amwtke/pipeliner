@@ -57,7 +57,7 @@ public class PipelinerAutoConfiguration {
         } else {
             throw new IllegalArgumentException("pipeliner.store.type must be mysql or redis, got " + type);
         }
-        store.init();
+        // no init() here: DefaultPipelinerEngine.start() initializes the store exactly once per startup
         return store;
     }
 

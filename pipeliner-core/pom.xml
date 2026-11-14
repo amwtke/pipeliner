@@ -19,4 +19,17 @@
     <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
     <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><scope>test</scope></dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- the shared ControlPlaneStore contract test is consumed by the store modules and the runtime (in-memory fake) -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution><goals><goal>test-jar</goal></goals></execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>

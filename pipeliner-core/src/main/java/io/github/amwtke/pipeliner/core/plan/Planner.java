@@ -80,6 +80,8 @@ public final class Planner {
             x.id = "barrier:" + e.getKey(); x.type = GateType.BARRIER; x.auto = true; x.dataset = e.getKey();
             x.after = sortedByDecl(e.getValue(), idx); x.before = sortedByDecl(readers.get(e.getKey()), idx);
             x.timeout = 0; x.policy = TimeoutPolicy.FAIL;
+            if (x.id.length() > io.github.amwtke.pipeliner.core.store.ControlPlaneStore.MAX_GATE_ID_LENGTH)
+                throw new PlanException("auto gate id longer than " + io.github.amwtke.pipeliner.core.store.ControlPlaneStore.MAX_GATE_ID_LENGTH + " characters (dataset name too long): " + x.id);
             if (!gateIds.add(x.id)) throw new PlanException("gate id collides with auto gate: " + x.id);
             gates.add(x);
         }

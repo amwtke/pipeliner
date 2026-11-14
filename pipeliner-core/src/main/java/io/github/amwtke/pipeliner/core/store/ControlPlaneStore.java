@@ -12,18 +12,21 @@ public interface ControlPlaneStore {
     /** Creates schema/indices if absent (idempotent). */
     void init();
 
-    /** If (graphName, bizKey) exists, returns the existing round unchanged. */
+    /**
+     * If (graphName, bizKey) exists, returns the existing round unchanged.
+     * @throws DuplicateRoundIdException when {@code round.roundId} is already used by another round (nothing is written); callers retry with a fresh id
+     */
     RoundRecord createRound(RoundRecord round, List<RunRecord> runs, List<GateRecord> gates, List<PipelineRecord> pipelines);
 
     RoundRecord findRoundByBizKey(String graphName, String bizKey);
 
-    /** Null if absent. */
+    /** The round without {@code planJson} (always null here: it is large and no hot path reads it; {@link #loadRound} carries it). Null if absent. */
     RoundRecord loadRoundRecord(String roundId);
 
-    /** Null if absent. */
+    /** Full view including {@code planJson}. Null if absent. */
     RoundView loadRound(String roundId);
 
-    /** Round, runs, gates and pipelines only (chunk stats empty): cheap enough for every master tick. Null if absent. */
+    /** Round (without planJson), runs, gates and pipelines only (chunk stats empty): cheap enough for every master tick, one round trip. Null if absent. */
     RoundView loadRoundState(String roundId);
 
     /** Sets round.masterEpoch = epoch iff stored &lt;= epoch. False if a higher epoch holds the round (or it is missing). */
@@ -49,6 +52,17 @@ public interface ControlPlaneStore {
      */
     default long maxRoundSeq() { return 0L; }
 
+    /**
+     * Identifier limits. The MySQL columns are sized for them (every primary key stays below InnoDB's 3072 bytes under utf8mb4), and
+     * {@code PipelineGraph.build()} enforces them. A round id is {@code <graph>-<yyyyMMdd-HHmmss>-<12 hex>}.
+     */
+    int MAX_GRAPH_NAME_LENGTH = 64;
+    int ROUND_ID_SUFFIX_LENGTH = 29;
+    int MAX_ROUND_ID_LENGTH = MAX_GRAPH_NAME_LENGTH + ROUND_ID_SUFFIX_LENGTH;
+    /** Gate ids, including the auto {@code barrier:<dataset>} ones. */
+    int MAX_GATE_ID_LENGTH = 128;
+    int MAX_PIPELINE_ID_LENGTH = 128;
+
     /** Longest accepted gate signal key (characters); {@link #saveGateSignal} throws IllegalArgumentException above it, never truncates. */
     int MAX_SIGNAL_KEY_LENGTH = 512;
 
@@ -61,12 +75,15 @@ public interface ControlPlaneStore {
      */
     List<RoundRecord> listRecentRounds(String graphName, int limit);
 
-    /** Sets startedAt on -&gt;RUNNING (if null), finishedAt on terminal. */
+    /**
+     * Sets startedAt on -&gt;RUNNING (kept if already set), finishedAt on terminal. A null {@code error} keeps the stored error, except on
+     * FAILED -&gt;RUNNING (a revive), which clears error and finishedAt. The same holds for {@link #casRunStatus} and {@link #casPipelineStatus}.
+     */
     boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch);
 
     void setRoundIncomplete(String roundId);
 
-    /** startedAt/finishedAt likewise. */
+    /** startedAt/finishedAt/error likewise (see {@link #casRoundStatus}). */
     boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch);
 
     boolean updateRunAssignment(String roundId, String runId, String assignee, int attempt, long epoch);
@@ -83,16 +100,13 @@ public interface ControlPlaneStore {
 
     void markGateAlerted(String roundId, String gateId);
 
-    /** To CLOSED; clears armed/deadline/opened/context/alerted (signals kept; resetRuns also deletes them). */
-    void resetGate(String roundId, String gateId, long epoch);
-
-    /** Idempotent per key. @throws IllegalArgumentException when the key is longer than {@link #MAX_SIGNAL_KEY_LENGTH} (or null/empty) */
+    /** Idempotent per key: the first payload is kept. @throws IllegalArgumentException when the key is longer than {@link #MAX_SIGNAL_KEY_LENGTH} (or null/empty) */
     void saveGateSignal(String roundId, String gateId, String signalKey, String payload);
 
     Map<String, String> loadGateSignals(String roundId, String gateId);
 
-    /** Insert if absent; never overwrites an existing record. */
-    void savePendingChunks(String roundId, List<ChunkRecord> chunks);
+    /** Insert if absent; never overwrites an existing record. Fenced by the round epoch like every master write: a deposed master's call is a no-op. */
+    void savePendingChunks(String roundId, List<ChunkRecord> chunks, long epoch);
 
     /**
      * Applies journal events idempotently and persists the new journal offset (atomically where supported).
@@ -101,29 +115,24 @@ public interface ControlPlaneStore {
      */
     void applyChunkEvents(String roundId, List<ChunkEvent> events, String newJournalOffset, long epoch);
 
-    /** DEAD to SKIPPED for the run. */
+    /** DEAD to SKIPPED for the run (fenced: a deposed master's call is a no-op). */
     void markChunksSkipped(String roundId, String runId, long epoch);
 
     /**
      * Atomic rerun reset (one transaction / one script), fenced by the round epoch: every run to PENDING with attempt+1,
      * assignee/error null; its pipelines to PENDING enumDone=false; its chunk records and counters deleted; every gate to CLOSED with
-     * armed/deadline/opened/context/alerted cleared AND its signals deleted; a FAILED/SUCCEEDED round back to RUNNING (finishedAt/error cleared).
-     * @throws StaleEpochException when the round is fenced by a higher epoch (nothing is applied)
+     * armed/deadline/opened/context/alerted cleared AND its signals deleted; a FAILED/SUCCEEDED round back to RUNNING (finishedAt/error cleared);
+     * the round's {@code incomplete} flag, its compacted mark and the reset pipelines' summaries cleared.
+     * A run id that does not exist is skipped (the plan may have grown since the round was created). If the round, or any existing listed run,
+     * was written by a higher epoch, NOTHING is applied.
+     * @throws StaleEpochException when the round (or an existing listed run) is fenced by a higher epoch
      */
     void resetRuns(String roundId, List<String> runIds, List<String> gateIds, long epoch);
-
-    /** Compatibility: resets one run (see {@link #resetRuns}); a fenced call is a no-op. */
-    default void resetRun(String roundId, String runId, long epoch) {
-        try {
-            resetRuns(roundId, java.util.Collections.singletonList(runId), java.util.Collections.<String>emptyList(), epoch);
-        } catch (StaleEpochException e) {
-            // fenced: nothing applied
-        }
-    }
 
     /** Ordered by pipelineId, chunkId. */
     List<ChunkRecord> queryChunks(ChunkQuery q);
 
+    /** A null {@code pipelineId} or {@code status} means all. */
     long countChunks(String roundId, String pipelineId, ChunkStatus status);
 
     /**

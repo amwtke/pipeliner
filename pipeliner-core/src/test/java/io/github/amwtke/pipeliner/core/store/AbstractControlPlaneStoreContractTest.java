@@ -1,18 +1,22 @@
-package io.github.amwtke.pipeliner.store.redis;
+package io.github.amwtke.pipeliner.core.store;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.amwtke.pipeliner.core.graph.ExecMode;
 import io.github.amwtke.pipeliner.core.graph.GateType;
-import io.github.amwtke.pipeliner.core.store.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
-/** Behavioural contract every ControlPlaneStore must satisfy. */
-abstract class AbstractControlPlaneStoreContractTest {
+/**
+ * Behavioural contract every ControlPlaneStore must satisfy. Published once as pipeliner-core's test-jar and run against the MySQL store, the
+ * Redis store and the runtime's in-memory fake (each module subclasses it and sets {@link #store}).
+ */
+public abstract class AbstractControlPlaneStoreContractTest {
     protected ControlPlaneStore store;
+
+    private void savePending(String rid, List<ChunkRecord> chunks) { store.savePendingChunks(rid, chunks, 1); }
 
     private static int seq = 0;
     private static synchronized int next() { return ++seq; }
@@ -69,7 +73,7 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals(RoundStatus.CREATED, r.getStatus());
         assertEquals("0-0", r.getJournalOffset());
         assertEquals("2024-01-01", r.getParams().get("dt"));
-        assertEquals("{\"x\":1}", r.getPlanJson());
+        assertEquals("{\"x\":1}", store.loadRound(rid).getRound().getPlanJson(), "the full view carries the plan");
         assertEquals(1000L, r.getCreatedAt());
         assertFalse(r.isIncomplete());
         assertEquals(rid, store.findRoundByBizKey("g-" + tag, "biz-create").getRoundId());
@@ -82,6 +86,21 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals(rid, other.getRoundId());
         assertNull(store.loadRoundRecord(rid("create2")));
         assertEquals(2, store.loadRound(rid).getRuns().size());
+    }
+
+    @Test
+    void createRoundRefusesAnExistingRoundIdAndKeepsTheLiveRound() {
+        String rid = mk("dupid");
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 3));
+        RoundRecord clash = newRound(rid, "biz-dupid-other");
+        assertThrows(DuplicateRoundIdException.class, () -> store.createRound(clash, Collections.singletonList(run(rid, "runZ", 0)),
+                Collections.<GateRecord>emptyList(), Collections.<PipelineRecord>emptyList()));
+        RoundRecord live = store.loadRoundRecord(rid);
+        assertEquals("biz-dupid", live.getBizKey(), "the live round is untouched");
+        assertEquals(RoundStatus.RUNNING, live.getStatus());
+        assertEquals(3, live.getMasterEpoch());
+        assertEquals(2, store.loadRound(rid).getRuns().size());
+        assertNull(store.findRoundByBizKey("g-" + tag, "biz-dupid-other"), "no biz key entry was left behind");
     }
 
     @Test
@@ -183,7 +202,7 @@ abstract class AbstractControlPlaneStoreContractTest {
             final String run = "run" + (round % 2 + 1);
             final RunStatus from = RunStatus.PENDING;
             final long epoch = 1000 + round * 10;
-            if (round >= 2) store.resetRun(rid, run, 1000 + round * 10 - 5); // back to PENDING
+            if (round >= 2) store.resetRuns(rid, Collections.singletonList(run), Collections.<String>emptyList(), 1000 + round * 10 - 5); // back to PENDING
             AtomicInteger wins = new AtomicInteger();
             CountDownLatch go = new CountDownLatch(1);
             ExecutorService ex = Executors.newFixedThreadPool(2);
@@ -229,6 +248,7 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertFalse(store.casRunStatus(rid, "run1", RunStatus.RUNNING, RunStatus.SUCCEEDED, null, 2));
         assertFalse(store.updateRunAssignment(rid, "run1", "w9", 1, 2));
         assertTrue(store.updateRunAssignment(rid, "run1", "w9", 1, 3));
+        assertTrue(store.updateRunAssignment(rid, "run1", "w9", 1, 3), "writing the same values again is not 'fenced'");
         assertTrue(store.casRunStatus(rid, "run1", RunStatus.RUNNING, RunStatus.FAILED, "bad", 3));
         r = store.loadRound(rid).getRuns().stream().filter(x -> x.getRunId().equals("run1")).findFirst().get();
         assertEquals("w9", r.getAssignee());
@@ -276,15 +296,18 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals("v", g.getContext().get("k"));
 
         store.saveGateSignal(rid, "gate1", "s1", "payload1");
-        store.saveGateSignal(rid, "gate1", "s1", "payload1");
+        store.saveGateSignal(rid, "gate1", "s1", "other-payload");   // idempotent per key: the first payload is kept
+        assertEquals("payload1", store.loadGateSignals(rid, "gate1").get("s1"));
         store.saveGateSignal(rid, "gate1", "s2", "payload2");
         assertEquals(2, store.loadGateSignals(rid, "gate1").size());
         assertEquals("payload2", store.loadGateSignals(rid, "gate1").get("s2"));
         assertTrue(store.loadGateSignals(rid, "nogate").isEmpty());
 
-        store.resetGate(rid, "gate1", 1); // fenced
+        assertTrue(store.fenceRound(rid, 3));
+        assertThrows(StaleEpochException.class, () -> store.resetRuns(rid, Collections.<String>emptyList(), Collections.singletonList("gate1"), 1)); // fenced
         assertEquals(GateStatus.OPEN, store.loadRound(rid).getGates().get(0).getStatus());
-        store.resetGate(rid, "gate1", 3);
+        assertEquals(2, store.loadGateSignals(rid, "gate1").size());
+        store.resetRuns(rid, Collections.<String>emptyList(), Collections.singletonList("gate1"), 3);
         g = store.loadRound(rid).getGates().get(0);
         assertEquals(GateStatus.CLOSED, g.getStatus());
         assertNull(g.getArmedAt());
@@ -293,30 +316,30 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertNull(g.getOpenedAt());
         assertTrue(g.getContext() == null || g.getContext().isEmpty());
         assertFalse(g.isAlerted());
-        assertEquals(2, store.loadGateSignals(rid, "gate1").size());
+        assertTrue(store.loadGateSignals(rid, "gate1").isEmpty(), "a gate reset deletes its signals");
         assertTrue(store.casGateStatus(rid, "gate1", GateStatus.CLOSED, GateStatus.TIMEOUT, null, null, 3));
     }
 
     @Test
     void savePendingNeverOverwrites() {
         String rid = mk("pend");
-        store.savePendingChunks(rid, Arrays.asList(pending(rid, "p1", "S0000", "run1"), pending(rid, "p1", "S0001", "run1")));
+        savePending(rid, Arrays.asList(pending(rid, "p1", "S0000", "run1"), pending(rid, "p1", "S0001", "run1")));
         assertEquals(2, store.countChunks(rid, "p1", ChunkStatus.PENDING));
         store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("e1", 10))), "1-0", 1);
-        store.savePendingChunks(rid, Arrays.asList(pending(rid, "p1", "S0000", "run1"), pending(rid, "p1", "S0002", "run1")));
+        savePending(rid, Arrays.asList(pending(rid, "p1", "S0000", "run1"), pending(rid, "p1", "S0002", "run1")));
         List<ChunkRecord> all = store.queryChunks(ChunkQuery.builder().roundId(rid).build());
         assertEquals(3, all.size());
         assertEquals(ChunkStatus.DONE, all.get(0).getStatus());
         assertEquals(10L, all.get(0).getRowsIn());
         assertEquals("{\"a\":1}", all.get(1).getSplitSpec());
         assertEquals(ChunkStatus.PENDING, all.get(2).getStatus());
-        store.savePendingChunks(rid, Collections.<ChunkRecord>emptyList());
+        savePending(rid, Collections.<ChunkRecord>emptyList());
     }
 
     @Test
     void applyEventsIdempotentDeadRulesAndOffset() {
         String rid = mk("apply");
-        store.savePendingChunks(rid, Arrays.asList(pending(rid, "p1", "S0000", "run1"), pending(rid, "p1", "S0001", "run1"), pending(rid, "p1", "S0003", "run1")));
+        savePending(rid, Arrays.asList(pending(rid, "p1", "S0000", "run1"), pending(rid, "p1", "S0001", "run1"), pending(rid, "p1", "S0003", "run1")));
         List<ChunkEvent> batch = Arrays.asList(
                 ev(rid, "DONE", "p1", "S0000", "run1", "split", 100, m("e1", 90, "sink:main", 5)),
                 ev(rid, "DEAD", "p1", "S0001", "run1", "split", 0, null),
@@ -365,7 +388,7 @@ abstract class AbstractControlPlaneStoreContractTest {
     @Test
     void skippedResetQueryCountAndSums() {
         String rid = mk("misc");
-        store.savePendingChunks(rid, Arrays.asList(pending(rid, "p1", "S0004", "run1"), pending(rid, "p3", "S0000", "run2")));
+        savePending(rid, Arrays.asList(pending(rid, "p1", "S0004", "run1"), pending(rid, "p3", "S0000", "run2")));
         store.applyChunkEvents(rid, Arrays.asList(
                 ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("e1", 8, "e2", 2)),
                 ev(rid, "DONE", "p1", "S0001", "run1", "split", 20, m("e1", 15, "sink:main", 4)),
@@ -418,9 +441,9 @@ abstract class AbstractControlPlaneStoreContractTest {
         store.casPipelineStatus(rid, "p1", PipelineStatus.PENDING, PipelineStatus.RUNNING, null, 4);
         store.setPipelineEnumDone(rid, "p1", true, 4);
         store.updateRunAssignment(rid, "run1", "w1", 2, 4);
-        store.resetRun(rid, "run1", 3); // fenced
+        assertThrows(StaleEpochException.class, () -> store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 3)); // run1 was written by epoch 4
         assertEquals(2, store.countChunks(rid, "p1", ChunkStatus.DONE));
-        store.resetRun(rid, "run1", 5);
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 5);
         assertEquals(0, store.queryChunks(ChunkQuery.builder().roundId(rid).runId("run1").build()).size());
         assertEquals(2, store.queryChunks(ChunkQuery.builder().roundId(rid).runId("run2").build()).size());
         v = store.loadRound(rid);
@@ -446,6 +469,8 @@ abstract class AbstractControlPlaneStoreContractTest {
     @Test
     void fenceRoundFencesEveryMasterWrite() {
         String rid = mk("fence");
+        // a DEAD chunk the deposed master must not be able to skip
+        store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DEAD", "p1", "S0009", "run1", "split", 0, null)), "0-0", 1);
         assertFalse(store.fenceRound("missing-" + tag, 1), "unknown round");
         assertTrue(store.fenceRound(rid, 5));
         assertEquals(5, store.loadRoundRecord(rid).getMasterEpoch());
@@ -460,9 +485,10 @@ abstract class AbstractControlPlaneStoreContractTest {
         store.setPipelineParallelism(rid, "p1", 9, 4);
         store.armGate(rid, "gate1", 111L, null, 4);
         assertFalse(store.casGateStatus(rid, "gate1", GateStatus.CLOSED, GateStatus.OPEN, "x", new HashMap<String, String>(), 4));
-        store.resetGate(rid, "gate1", 4);
-        store.resetRun(rid, "run1", 4);
+        assertThrows(StaleEpochException.class, () -> store.resetRuns(rid, Collections.singletonList("run1"), Collections.singletonList("gate1"), 4));
         store.markChunksSkipped(rid, "run1", 4);
+        savePending(rid, Collections.singletonList(pending(rid, "p1", "S0007", "run1")));   // epoch 1 < 5: fenced
+        store.savePendingChunks(rid, Collections.singletonList(pending(rid, "p1", "S0008", "run1")), 4);
         assertThrows(StaleEpochException.class, () -> store.applyChunkEvents(rid,
                 Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 1, m("e1", 1))), "1-0", 4));
         RoundView v = store.loadRoundState(rid);
@@ -474,7 +500,10 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertEquals(2, p1.getParallelism());
         assertFalse(p1.isEnumDone());
         assertNull(v.getGates().get(0).getArmedAt());
-        assertEquals(0, store.countChunks(rid, "p1", null));
+        assertEquals(GateStatus.CLOSED, v.getGates().get(0).getStatus());
+        assertEquals(1, store.countChunks(rid, "p1", null), "the fenced saves stored nothing");
+        assertEquals(1, store.countChunks(rid, "p1", ChunkStatus.DEAD), "the deposed master's skip did not flip DEAD to SKIPPED");
+        assertEquals(0, store.countChunks(rid, "p1", ChunkStatus.SKIPPED));
 
         // the current master works, and a newer one deposes it
         assertTrue(store.casRunStatus(rid, "run1", RunStatus.PENDING, RunStatus.RUNNING, null, 5));
@@ -610,7 +639,7 @@ abstract class AbstractControlPlaneStoreContractTest {
     }
 
     private void fill(String rid) {
-        store.savePendingChunks(rid, Arrays.asList(pending(rid, "p1", "c1", "run1"), pending(rid, "p1", "c2", "run1"), pending(rid, "p1", "c3", "run1"),
+        savePending(rid, Arrays.asList(pending(rid, "p1", "c1", "run1"), pending(rid, "p1", "c2", "run1"), pending(rid, "p1", "c3", "run1"),
                 pending(rid, "p2", "c1", "run1")));
         store.applyChunkEvents(rid, Arrays.asList(
                 ev(rid, "DONE", "p1", "c1", "run1", "split", 10, m("e1", 7, "sink:out", 3)),
@@ -787,7 +816,7 @@ abstract class AbstractControlPlaneStoreContractTest {
     void countSinkChunksCountsOnlyDoneChunksThatWroteSinkRows() {
         String rid = mk("sinkchunks");
         assertEquals(0, store.countSinkChunks(rid, "p1"));
-        store.savePendingChunks(rid, Collections.singletonList(pending(rid, "p1", "S0004", "run1")));
+        savePending(rid, Collections.singletonList(pending(rid, "p1", "S0004", "run1")));
         store.applyChunkEvents(rid, Arrays.asList(
                 ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("sink:out", 10)),                 // wrote rows
                 ev(rid, "DONE", "p1", "S0001", "run1", "split", 5, m("e1", 5, "sink:out", 0)),          // empty sink output: sink never called
@@ -831,5 +860,148 @@ abstract class AbstractControlPlaneStoreContractTest {
         assertThrows(IllegalArgumentException.class, () -> store.saveGateSignal(rid, "gate1", tooLong, "x"));
         assertThrows(IllegalArgumentException.class, () -> store.saveGateSignal(rid, "gate1", "", "x"));
         assertEquals(2, store.loadGateSignals(rid, "gate1").size(), "nothing was stored for the rejected keys");
+    }
+
+    // ------------------------------------------------------------------ round 2: atomic reset, revive, paging
+
+    private RunRecord runOf(String rid, String runId) {
+        return store.loadRound(rid).getRuns().stream().filter(x -> x.getRunId().equals(runId)).findFirst().get();
+    }
+
+    @Test
+    void resetRunsRejectedByALaterRunAppliesNothing() {
+        String rid = mk("resetatomic");
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 5));
+        assertTrue(store.casRunStatus(rid, "run1", RunStatus.PENDING, RunStatus.RUNNING, null, 5));
+        assertTrue(store.casRunStatus(rid, "run2", RunStatus.PENDING, RunStatus.RUNNING, null, 8));   // run2 was written by a newer epoch; the round's stays 5
+        store.setPipelineEnumDone(rid, "p1", true, 5);
+        store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 3, m("e1", 3))), "1-0", 5);
+        store.saveGateSignal(rid, "gate1", "k", "v");
+        store.setRoundIncomplete(rid);
+        assertEquals(5, store.loadRoundRecord(rid).getMasterEpoch());
+
+        // run1 passes, run2 is rejected: the whole reset (including run1, the gate and the round epoch bump) is rolled back
+        assertThrows(StaleEpochException.class, () -> store.resetRuns(rid, Arrays.asList("run1", "run2"), Collections.singletonList("gate1"), 6));
+        RoundView v = store.loadRound(rid);
+        assertEquals(5, v.getRound().getMasterEpoch(), "the fence bump was rolled back");
+        assertTrue(v.getRound().isIncomplete());
+        assertEquals(RunStatus.RUNNING, runOf(rid, "run1").getStatus());
+        assertEquals(0, runOf(rid, "run1").getAttempt(), "no attempt was bumped");
+        assertEquals(RunStatus.RUNNING, runOf(rid, "run2").getStatus());
+        assertTrue(v.getPipelines().stream().filter(x -> x.getPipelineId().equals("p1")).findFirst().get().isEnumDone());
+        assertEquals(1, store.countChunks(rid, "p1", ChunkStatus.DONE), "chunk records survive");
+        assertEquals(1, store.loadGateSignals(rid, "gate1").size(), "signals survive");
+    }
+
+    @Test
+    void resetRunsSkipsAnUnknownRunLikeEveryStore() {
+        String rid = finished("resetunknown", RoundStatus.FAILED);
+        store.saveGateSignal(rid, "gate1", "k", "v");
+        store.resetRuns(rid, Arrays.asList("run1", "runX"), Arrays.asList("gate1", "gateX"), 6);   // runX / gateX do not exist: skipped
+        assertEquals(RunStatus.PENDING, runOf(rid, "run1").getStatus());
+        assertEquals(1, runOf(rid, "run1").getAttempt());
+        assertEquals(RoundStatus.RUNNING, store.loadRoundRecord(rid).getStatus());
+        assertEquals(6, store.loadRoundRecord(rid).getMasterEpoch());
+        assertTrue(store.loadGateSignals(rid, "gate1").isEmpty());
+        assertEquals(2, store.loadRound(rid).getRuns().size(), "no run was created for the unknown id");
+    }
+
+    @Test
+    void resetRunsClearsTheIncompleteFlag() {
+        String rid = mk("resetincomplete");
+        store.setRoundIncomplete(rid);
+        assertTrue(store.loadRoundRecord(rid).isIncomplete());
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 2);
+        assertFalse(store.loadRoundRecord(rid).isIncomplete());
+    }
+
+    @Test
+    void failedToRunningReviveClearsErrorAndFinishedAtButKeepsStartedAt() {
+        String rid = mk("revive");
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRunStatus(rid, "run1", RunStatus.PENDING, RunStatus.RUNNING, null, 1));
+        assertTrue(store.casPipelineStatus(rid, "p1", PipelineStatus.PENDING, PipelineStatus.RUNNING, null, 1));
+        Long roundStart = store.loadRoundRecord(rid).getStartedAt();
+        Long runStart = runOf(rid, "run1").getStartedAt();
+        Long plStart = store.loadRound(rid).getPipelines().get(0).getStartedAt();
+        assertNotNull(roundStart);
+        assertTrue(store.casRunStatus(rid, "run1", RunStatus.RUNNING, RunStatus.FAILED, "run boom", 1));
+        assertTrue(store.casPipelineStatus(rid, "p1", PipelineStatus.RUNNING, PipelineStatus.FAILED, "pl boom", 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.FAILED, "failed runs: [run1]", 1));
+        assertNotNull(store.loadRoundRecord(rid).getFinishedAt());
+
+        assertTrue(store.casRoundStatus(rid, RoundStatus.FAILED, RoundStatus.RUNNING, null, 2));
+        assertTrue(store.casRunStatus(rid, "run1", RunStatus.FAILED, RunStatus.RUNNING, null, 2));
+        assertTrue(store.casPipelineStatus(rid, "p1", PipelineStatus.FAILED, PipelineStatus.RUNNING, null, 2));
+        RoundRecord r = store.loadRoundRecord(rid);
+        assertNull(r.getError());
+        assertNull(r.getFinishedAt());
+        assertEquals(roundStart, r.getStartedAt(), "startedAt is kept");
+        RunRecord run = runOf(rid, "run1");
+        assertNull(run.getError());
+        assertNull(run.getFinishedAt());
+        assertEquals(runStart, run.getStartedAt());
+        PipelineRecord p = store.loadRound(rid).getPipelines().stream().filter(x -> x.getPipelineId().equals("p1")).findFirst().get();
+        assertNull(p.getError());
+        assertNull(p.getFinishedAt());
+        assertEquals(plStart, p.getStartedAt());
+    }
+
+    @Test
+    void aNullErrorKeepsTheStoredErrorOnOtherTransitions() {
+        String rid = mk("keeperror");
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.PAUSED, "warn", 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.PAUSED, RoundStatus.RUNNING, null, 1));
+        assertEquals("warn", store.loadRoundRecord(rid).getError());
+    }
+
+    @Test
+    void queryChunksPagesAcrossPipelinesWithFilters() {
+        String rid = mk("page");
+        savePending(rid, Arrays.asList(pending(rid, "p1", "c00", "run1"), pending(rid, "p1", "c01", "run1"), pending(rid, "p1", "c02", "run1"),
+                pending(rid, "p1", "c03", "run1"), pending(rid, "p1", "c04", "run1"), pending(rid, "p2", "d00", "run1"), pending(rid, "p2", "d01", "run1"),
+                pending(rid, "p2", "d02", "run1"), pending(rid, "p2", "d03", "run1"), pending(rid, "p3", "e00", "run2"), pending(rid, "p3", "e01", "run2"),
+                pending(rid, "p3", "e02", "run2")));
+        store.applyChunkEvents(rid, Arrays.asList(ev(rid, "DONE", "p1", "c01", "run1", "split", 1, m("e1", 1)), ev(rid, "DONE", "p1", "c03", "run1", "split", 1, m("e1", 1)),
+                ev(rid, "DONE", "p2", "d00", "run1", "split", 1, m("e1", 1)), ev(rid, "DONE", "p2", "d02", "run1", "split", 1, m("e1", 1)),
+                ev(rid, "DONE", "p2", "d03", "run1", "split", 1, m("e1", 1)), ev(rid, "DONE", "p3", "e01", "run2", "split", 1, m("e9", 1))), "1-0", 1);
+        assertEquals(12, store.queryChunks(ChunkQuery.builder().roundId(rid).limit(1000).build()).size());
+        assertEquals(Arrays.asList("c03", "c04", "d00", "d01", "d02"), ids(store.queryChunks(ChunkQuery.builder().roundId(rid).limit(5).offset(3).build())));
+        assertEquals(Arrays.asList("c01", "c03", "d00", "d02", "d03", "e01"), ids(store.queryChunks(ChunkQuery.builder().roundId(rid).status(ChunkStatus.DONE).limit(100).build())));
+        assertEquals(Arrays.asList("d00", "d02", "d03"), ids(store.queryChunks(ChunkQuery.builder().roundId(rid).status(ChunkStatus.DONE).limit(3).offset(2).build())));
+        assertEquals(Arrays.asList("e00", "e01", "e02"), ids(store.queryChunks(ChunkQuery.builder().roundId(rid).runId("run2").limit(100).build())));
+        assertEquals(Arrays.asList("c00", "c02", "c04", "d01"), ids(store.queryChunks(ChunkQuery.builder().roundId(rid).runId("run1").status(ChunkStatus.PENDING).limit(100).build())));
+        assertEquals(Arrays.asList("d00", "d01", "d02", "d03"), ids(store.queryChunks(ChunkQuery.builder().roundId(rid).pipelineId("p2").runId("run1").limit(100).build())));
+        assertTrue(store.queryChunks(ChunkQuery.builder().roundId(rid).pipelineId("p2").runId("run2").limit(100).build()).isEmpty());
+        assertTrue(store.queryChunks(ChunkQuery.builder().roundId(rid).limit(0).build()).isEmpty());
+        assertTrue(store.queryChunks(ChunkQuery.builder().roundId(rid).limit(10).offset(500).build()).isEmpty());
+    }
+
+    @Test
+    void edgeSumsFollowReplacedRecordsAndResets() {
+        String rid = mk("edges");
+        store.applyChunkEvents(rid, Arrays.asList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("e1", 8, "sink:x", 2)),
+                ev(rid, "DONE", "p2", "S0000>1.0", "run1", "e1", 8, m("sink:out", 8))), "1-0", 1);
+        assertEquals(m("e1", 8), store.sumRowsOutByEdge(rid, "run1"));
+        assertEquals(m("e1", 8), store.sumRowsInByEdge(rid, "run1"));
+        store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 10, m("e1", 5))), "2-0", 1);   // replaced by a retry
+        assertEquals(5L, store.sumRowsOutByEdge(rid, "run1").get("e1"));
+        store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DEAD", "p1", "S0000", "run1", "split", 0, null)), "3-0", 1);   // DEAD never replaces DONE
+        assertEquals(5L, store.sumRowsOutByEdge(rid, "run1").get("e1"));
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 2);
+        assertTrue(store.sumRowsOutByEdge(rid, "run1").values().stream().allMatch(v -> v == 0));
+        assertTrue(store.sumRowsInByEdge(rid, "run1").values().stream().allMatch(v -> v == 0));
+    }
+
+    @Test
+    void resetRunsAtTheRoundsOwnEpochIsNotFenced() {
+        String rid = mk("resetsame");
+        assertTrue(store.fenceRound(rid, 7));
+        assertTrue(store.fenceRound(rid, 7));
+        store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 7);   // same epoch: allowed, even though nothing about the epoch changes
+        assertEquals(1, runOf(rid, "run1").getAttempt());
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 7));
+        assertTrue(store.casRunStatus(rid, "run1", RunStatus.PENDING, RunStatus.RUNNING, null, 7));
     }
 }

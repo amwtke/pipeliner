@@ -19,6 +19,7 @@ import io.github.amwtke.pipeliner.core.plan.PlanRun;
 import io.github.amwtke.pipeliner.core.store.ChunkQuery;
 import io.github.amwtke.pipeliner.core.store.ChunkRecord;
 import io.github.amwtke.pipeliner.core.store.ControlPlaneStore;
+import io.github.amwtke.pipeliner.core.store.DuplicateRoundIdException;
 import io.github.amwtke.pipeliner.core.store.GateRecord;
 import io.github.amwtke.pipeliner.core.store.GateStatus;
 import io.github.amwtke.pipeliner.core.store.PipelineRecord;
@@ -38,6 +39,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
@@ -87,11 +89,30 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
             if (!existing.getStatus().terminal()) s.plane.addActiveRound(existing.getRoundId());   // active set lives in Redis only
             return existing.getRoundId();
         }
-        String roundId = graphName + "-" + new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date()) + "-"
-                + UUID.randomUUID().toString().substring(0, 4);
         Map<String, String> p = new LinkedHashMap<>();
         if (params != null) p.putAll(params);
         p.put("bizKey", bizKey);
+        RoundRecord created = null;
+        for (int attempt = 1; created == null; attempt++) {
+            try {
+                created = createRound(plan, graphName, bizKey, p, newRoundId(graphName));
+            } catch (DuplicateRoundIdException e) {   // an id collision (not expected with 48 random bits): retry with a fresh id
+                if (attempt >= 5) throw e;
+                log.warn("round id collision for graph {}, retrying: {}", graphName, e.getMessage());
+            }
+        }
+        s.plane.addActiveRound(created.getRoundId());
+        log.info("round {} submitted for graph {} bizKey {}", created.getRoundId(), graphName, bizKey);
+        return created.getRoundId();
+    }
+
+    /** {@code <graph>-<yyyyMMdd-HHmmss>-<12 hex>}: at most {@link ControlPlaneStore#MAX_ROUND_ID_LENGTH} characters for a graph name within its limit. */
+    static String newRoundId(String graphName) {
+        return graphName + "-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date()) + "-"
+                + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+    }
+
+    private RoundRecord createRound(ExecutionPlan plan, String graphName, String bizKey, Map<String, String> p, String roundId) {
         long now = System.currentTimeMillis();
         RoundRecord round = RoundRecord.builder().roundId(roundId).graphName(graphName).bizKey(bizKey).planHash(plan.getHash())
                 .planJson(planJson(plan)).params(p).status(RoundStatus.CREATED).createdAt(now).seq(s.plane.nextRoundSeq(s.store.maxRoundSeq())).build();
@@ -106,10 +127,7 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
         for (PlanPipeline pp : plan.getPipelines().values())
             pipes.add(PipelineRecord.builder().roundId(roundId).pipelineId(pp.getPipelineId()).runId(pp.getRunId())
                     .status(PipelineStatus.PENDING).parallelism(pp.getParallelism()).build());
-        RoundRecord created = s.store.createRound(round, runs, gates, pipes);
-        s.plane.addActiveRound(created.getRoundId());
-        log.info("round {} submitted for graph {} bizKey {}", created.getRoundId(), graphName, bizKey);
-        return created.getRoundId();
+        return s.store.createRound(round, runs, gates, pipes);
     }
 
     private static String planJson(ExecutionPlan plan) {
