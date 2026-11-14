@@ -205,7 +205,7 @@ public final class ClusterPipelineWorker implements Runnable {
             if (!outKeys.contains(key)) outKeys.add(key);
         }
         CommitRequest req = CommitRequest.builder().roundId(roundId).inputStreamKey(entry.getStreamKey()).inputEntryId(entry.getEntryId())
-                .highWatermark(cfg.getHighWatermark()).outputs(outputs)
+                .highWatermark(cfg.getHighWatermark()).outputs(outputs).consumer(consumer)
                 .event(Events.done(roundId, pp.getRunId(), pp.getPipelineId(), in.getChunkId(), inputEdge, consumer, res, attempt)).build();
         while (true) {
             CommitResult r = s.plane.commit(req);
@@ -238,12 +238,16 @@ public final class ClusterPipelineWorker implements Runnable {
         String chunkId = entry.getEntryId();
         try { chunkId = pp.isSource() ? ChunkCodec.decodeSplit(entry.getFields().get("s")).getSplitId() : ChunkCodec.decodeChunk(entry.getFields().get("c")).getChunkId(); }
         catch (RuntimeException ignored) { /* keep entry id */ }
-        s.plane.deadLetter(DeadLetterRequest.builder().roundId(roundId).pipelineId(pp.getPipelineId()).attempt(attempt)
+        boolean moved = s.plane.deadLetter(DeadLetterRequest.builder().roundId(roundId).pipelineId(pp.getPipelineId()).attempt(attempt)
                 .inputStreamKey(entry.getStreamKey()).inputEntryId(entry.getEntryId())
-                .inputFields(new HashMap<>(entry.getFields())).error(error)
+                .inputFields(new HashMap<>(entry.getFields())).error(error).consumer(consumer)
                 .event(Events.dead(roundId, pp.getRunId(), pp.getPipelineId(), chunkId, inputEdge, consumer, error, attempt)).build());
-        s.metrics.deadLetter(roundId, pp.getPipelineId());
-        log.error("chunk {} of {} dead-lettered: {}", chunkId, pp.getPipelineId(), error);
+        if (moved) {
+            s.metrics.deadLetter(roundId, pp.getPipelineId());
+            log.error("chunk {} of {} dead-lettered: {}", chunkId, pp.getPipelineId(), error);
+        } else {
+            log.info("chunk {} of {} not dead-lettered: already committed or claimed elsewhere ({})", chunkId, pp.getPipelineId(), error);
+        }
     }
 
     private static long totalOut(ChunkResult r) {

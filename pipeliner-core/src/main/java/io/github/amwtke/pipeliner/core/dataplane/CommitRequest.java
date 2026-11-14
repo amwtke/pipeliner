@@ -15,4 +15,6 @@ public class CommitRequest {
     private long highWatermark;
     private List<OutputChunk> outputs;
     private ChunkEvent event;
+    /** Committing consumer: the commit succeeds only while this consumer still owns the pending entry (null = no ownership check). */
+    private String consumer;
 }

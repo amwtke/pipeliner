@@ -89,12 +89,13 @@ public interface DataPlane extends AutoCloseable {
     long streamLength(String streamKey);
     /** XREADGROUP with ">"; blocking reads use a per-thread dedicated connection. */
     List<StreamEntry> read(String consumer, List<String> streamKeys, int count, long blockMillis);
-    /** XAUTOCLAIM from 0-0. */
+    /** XAUTOCLAIM; the scan cursor is kept per stream across calls so entries behind many renewed ones are reached; claims at most {@code count} entries. */
     List<StreamEntry> autoClaim(String consumer, String streamKey, long minIdleMillis, int count);
-    /** XCLAIM with min-idle 0 to reset the idle clock. Returns false when the entry is no longer pending (acked or deleted). */
+    /** XCLAIM with min-idle 0 to reset the idle clock, only if the entry is still pending for {@code consumer}. Returns false when it is no longer pending (acked or deleted) or was claimed by another consumer. */
     boolean renew(String consumer, String streamKey, String entryId);
     CommitResult commit(CommitRequest req);
-    void deadLetter(DeadLetterRequest req);
+    /** Moves the entry to the DLQ; true only if it was actually moved (false: already committed/dead-lettered, or owned by another consumer). */
+    boolean deadLetter(DeadLetterRequest req);
     /** Moves every entry of the attempt's DLQ back to its source stream; returns the count. Fenced. */
     int requeueDeadLetters(String roundId, String pipelineId, int attempt, long epoch);
     /** Fenced. */

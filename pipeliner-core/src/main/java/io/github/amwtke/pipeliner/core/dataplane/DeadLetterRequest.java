@@ -18,4 +18,6 @@ public class DeadLetterRequest {
     private Map<String, String> inputFields;
     private String error;
     private ChunkEvent event;
+    /** Dead-lettering consumer: only done while this consumer still owns the pending entry (null = no ownership check). */
+    private String consumer;
 }
