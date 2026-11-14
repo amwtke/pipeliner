@@ -9,7 +9,7 @@
 本文描述的是**已实现的 v1**，已按代码修订；运维、配置、接口清单以 [README](../README.md) 为准，这里只讲设计。阅读时注意：
 
 - 文中的 Java 接口、Lua 脚本、DDL 是说明设计用的骨架，名字和签名与代码不完全一致（例如 puller / pusher 在代码里是 `SplitSource` / 上游通道 与 `Sink` / 输出口；实际 Builder 与 YAML 语法见 README「定义一个图」）。
-- 没有实现的内容标为"未来工作"：`KafkaPuller`、`HttpPusher`、按 chunk 批量拉取（`pullBatch`）、ClickHouse 最小批量写入；以及 Redis Cluster 支持（v1 只支持单机 Redis，见 10.5）、MySQL 租约行形式的选主（v1 租约在 Redis，见 8.1）、自动检测 Redis 数据面丢失并重置受影响的 run（v1 需要人工 `rerunFrom`，见 10.3 / 11.2）、`LOCAL` 模式 run 的多 pod 分片执行（v1 一个 run 只在一个 pod 上跑）。
+- 没有实现的内容标为"未来工作"：`KafkaPuller`、`HttpPusher`、按 chunk 批量拉取（`pullBatch`）、ClickHouse 最小批量写入；以及 Redis Cluster 支持（v1 只支持单机 Redis，见 10.5）、MySQL 租约行形式的选主（v1 租约在 Redis，见 8.1）、自动**重置**受 Redis 数据面丢失影响的 run（v1 只检测并让 run 失败，错误指明需要人工 `rerunFrom`，见 10.3 / 11.2）、`LOCAL` 模式 run 的多 pod 分片执行（v1 一个 run 只在一个 pod 上跑）。
 - 与原始设计稿相比，v1 在正确性上做了加强，集中在 8.1（epoch 与 fencing）、10.2（journal 位点）、11.1（版本化写入与外部批次号）、11.3（原子重跑）。
 
 ## 1. 先记住这八句话
@@ -292,13 +292,13 @@ public interface GateCondition {
 
 条件返回 `REJECT`、或超时策略为 `FAIL` 时，闸门置 `REJECTED` / `TIMEOUT`，它的 before-runs 立即置为失败；之后没有能启动的 run 时 round 失败。条件函数抛异常按 `WAIT` 处理。
 
-`external` 闸门的信号按 round + gate 存储，键是外部批次号（最长 512 个字符，更长的键在 `signalGate` 时被拒绝，不会截断）。`Gates.externalCountOf(pipelineId)` 只统计无 `@` 的键，或以 `@<上游 run 当前 attempt>` 结尾的键，所以重跑之前的旧 attempt 的回调不会放行闸门；它按 **chunk id 去重** 计数（新旧两种键格式对应同一个 chunk 只算一次，滚动发布期间不会因此提前放行），期望值是该 pipeline 里**真正调用过 sink 的** DONE chunk 数——输出为空的 chunk（哈希 split 为空、行被过滤光）不调用 sink，也就不会有回调，所以不计入期望。这个数来自 chunk 记录里 sink 的写出行数（MySQL 列 `pg_chunk.sink_rows`，Redis 控制面的计数器 `_sink`）。重跑时闸门连同它的信号一起被清掉（见 11.3）。
+`external` 闸门的信号按 round + gate 存储，键是外部批次号（最长 512 个字符，更长的键在 `signalGate` 时被拒绝，不会截断）。`Gates.externalCountOf(pipelineId)` 只统计无 `@` 的键，或以 `@<上游 run 当前 attempt>` 结尾的键，所以重跑之前的旧 attempt 的回调不会放行闸门，而且 `engine.signalGate` 会在写入前就拒绝过时回调（key 的 `@<attempt>` 低于它所指 pipeline / 闸门 after-pipeline 所在 run 的当前 attempt 时返回 false、不落库；无法判断时宁可接受）；它按 **chunk id 去重** 计数（新旧两种键格式对应同一个 chunk 只算一次，滚动发布期间不会因此提前放行），期望值是该 pipeline 里**真正调用过 sink 的** DONE chunk 数——输出为空的 chunk（哈希 split 为空、行被过滤光）不调用 sink，也就不会有回调，所以不计入期望。这个数来自 chunk 记录里 sink 的写出行数（MySQL 列 `pg_chunk.sink_rows`，Redis 控制面的计数器 `_sink`）。重跑时闸门连同它的信号一起被清掉（见 11.3）。
 
 ## 8. 多 pod 执行：master 与 slave
 
 ### 8.1 选主
 
-所有 pod 启动后都尝试 `SET pg:leader <podId> NX PX 15000`，成功者成为 master。租约**只在 master tick 里续期**（`MasterLoop.renew()`：local 模式每个 tick，默认 1 秒；external 模式只有触发时才续），worker 的 5 秒心跳不碰它；所以 external 模式下触发间隔必须小于 `leader-ttl-millis` / 3，运行期若相邻两次 tick 的间隔超过 TTL 的一半会打 WARN。每次（重新）获得 leadership，或发现全局 epoch 已被别人推进时，master 取新的任期号：`e = plane.nextEpoch(store.maxMasterEpoch())`，再 `store.reserveMasterEpoch(e)`，预留失败就不当 leader（见下）。
+所有 pod 启动后都尝试 `SET pg:leader <podId> NX PX 15000`，成功者成为 master。租约**只在 master tick 里续期**（`MasterLoop.renew()`：local 模式每个 tick，默认 1 秒；external 模式下抢主与推进仍只在触发时发生，但每个 pod 有一个本地 `pg-lease-keeper` 线程，仅当本 pod 是 leader 时每约 `leader-ttl-millis / 3` 续一次租约（和限流标志的 TTL），它不抢主、不推进 round、不执行命令），worker 的 5 秒心跳不碰它；所以 leader 一旦产生就不会因触发间隔抖动或路由落到别的 pod 而丢租约，但 external 模式下触发间隔仍应小于 `leader-ttl-millis` / 3（leader 宕机后需要一次落到其他 pod 的 tick 来接管），运行期若相邻两次 tick 的间隔超过 TTL 的一半会打 WARN。每次（重新）获得 leadership，或发现全局 epoch 已被别人推进时，master 取新的任期号：`e = plane.nextEpoch(store.maxMasterEpoch())`，再 `store.reserveMasterEpoch(e)`，预留失败就不当 leader（见下）。
 
 **epoch 下限**。数据面用 Lua 原子地执行"若 `pg:epoch` 小于下限则置为下限，再 `INCR`"，所以新 epoch 一定大于控制面里已记录的最大 round epoch。控制面存储提供 `maxMasterEpoch()`（已预留的最大 epoch 与所有 round epoch 的最大值：MySQL 是单行表 `pg_master_epoch` 与有索引的 `MAX(master_epoch)`；Redis 是 `pg:store:maxepoch`，`fenceRound` 在 round epoch 升高时顺带抬高它，`init()` 从已有 round 回填）。这是为了 Redis 数据丢失（MySQL 控制面支持的恢复场景）：`pg:epoch` 从 1 重新计数，而存储里的 round epoch 更高，所有 `fenceRound` 都会被拒绝，master 一直退位、所有活跃 round 停摆。有下限之后新 master 的 epoch 总是高于存储里的值。
 
@@ -354,7 +354,7 @@ slave 每 5 秒上报心跳。某个 pod 挂掉后，它名下没提交的 chunk
 
 ### 8.5 管理操作走 leader 命令队列
 
-pause / resume / cancel / retry / rerun / skip / openGate 不由接收请求的 pod 直接执行，而是写入命令队列，由 leader 在 tick 里用自己的 epoch 取出执行并回写结果，请求方等待结果（`admin-timeout-millis`）。这样所有对控制面的变更都出自持有 fence 的 master。命令被取出后、执行前 leader 宕机会丢命令，客户端超时后重试即可。管理接口受 token 认证保护（`ADMIN` 可变更，`VIEWER` 只读，变更写审计日志），每个 pod 还提供静态的 Web UI（`/pg-ui/`）展示拓扑与 round 状态。细节见 README。
+pause / resume / cancel / retry / rerun / skip / openGate 不由接收请求的 pod 直接执行，而是写入命令队列，由 leader 在 tick 里用自己的 epoch 取出执行并回写结果，请求方等待结果（`admin-timeout-millis`）。这样所有对控制面的变更都出自持有 fence 的 master。每条命令带 id 和截止时间（提交时间 + `admin-timeout-millis`）；leader 每次只取出一条，取出前先确认自己仍是 leader，所以被取代时队列里其余命令留给下一任，不会丢；过期的命令不执行，结果记为 `expired`。客户端超时后先**撤回**命令（成功撤回即保证没有被执行），撤回不了说明已被取走，再宽限等待后仍无结果则报「结果未知」，需先看 round 状态再重试。leader 只对 plan hash 与 round 一致的图执行会改状态的命令。会被拒绝的情形（`retry`：round 已取消 / 已压缩 / in-gate 不是 OPEN；`skip`：另外还有 LOCAL run、没有死信；`openGate`：after-run 未成功且没有 `force`；`rerunFrom` / `retry` 使 attempt 达到 1000）见 README「管理操作规则」。管理接口受 token 认证保护（`ADMIN` 可变更，`VIEWER` 只读，变更写审计日志），每个 pod 还提供静态的 Web UI（`/pg-ui/`）展示拓扑与 round 状态。细节见 README。
 
 ## 9. 背压
 
@@ -444,7 +444,10 @@ public interface ControlPlaneStore {
     boolean fenceRound(String roundId, long epoch);        // master_epoch <= epoch 才成功
     long maxMasterEpoch();                                 // 新 epoch 的下限（已预留与 round 上的最大值）
     boolean reserveMasterEpoch(long epoch);                // 原子 compare-and-set，成功才拥有这个 epoch（8.1）
-    long maxRoundSeq();                                    // 新 round 序号的下限
+    long maxRoundSeq();                                    // 新 round 序号的下限：持久化的最大已签发 seq 与现存 round 的最大 seq 取大（retention 删光 round 后也不回落）
+    boolean setRoundIncomplete(String roundId, long epoch); // 与其他 master 写入一样按 round epoch fence
+    List<String> pendingPurges(int max);                   // purgeRounds 已删除、数据面 key 还没清的 round（与 purgeRounds 同一原子步骤写入）
+    void clearPendingPurges(Collection<String> roundIds);  // purgeRoundData 成功之后清除
     long countSinkChunks(String roundId, String pipelineId); // 调用过 sink 的 DONE chunk 数（externalCountOf 的期望值）
     boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch);
     boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch);
@@ -468,7 +471,7 @@ public interface ControlPlaneStore {
 | 数据过期 | **没有 TTL**。保留任务（10.6）按时间压缩、删除终态 round，对两种存储一视同仁：默认配置下 MySQL 的 `pg_chunk` 3 天后压缩、整个 round 30 天后删除；要长期留存需调大 `retention.chunk-days` / `round-days` 或关闭保留任务（关闭后 Redis 内存会随 round 数一直增长） | 同左 |
 | 条件更新 | `UPDATE ... WHERE status = ? AND master_epoch <= ?` | Lua 脚本内比较后写入 |
 | 额外依赖 | 多一个 MySQL | 无 |
-| Redis 数据全丢时 | round / run / gate 状态与已归并的 chunk 记录还在，已成功的 run 不动；master 重新登记活跃 round。epoch 计数器丢失由 epoch 下限兜底（8.1）。v1 不自动检测通道数据的丢失，未完成的 run 用 `rerunFrom` 重跑 | 控制面一起丢，只能整轮重跑 |
+| Redis 数据全丢时 | round / run / gate 状态与已归并的 chunk 记录还在，已成功的 run 不动；master 重新登记活跃 round。epoch 计数器丢失由 epoch 下限兜底（8.1）。master 会检测通道数据的丢失（split 队列与索引都没了而 chunk 记录仍是 PENDING，或输入 stream 缺消费组）并让该 run 失败，未完成的 run 用 `rerunFrom` 重跑 | 控制面一起丢，只能整轮重跑 |
 
 ### 10.4 MySQL 表结构
 
@@ -593,7 +596,10 @@ pg:{<roundId>}:chunk:<pipelineId>      HASH    chunkId → 状态 JSON
 pg:store:rounds / biz / active         全局索引：round 列表、(graph,bizKey) → roundId、活跃集合
 pg:store:finished / uncompacted        保留任务用的终态 / 待压缩索引
 pg:store:maxepoch                      STRING  已预留 / 所有 round 的最大 master epoch（8.1 的下限与预留，compare-and-set）
-pg:store:maxseq                        STRING  所有 round 的最大提交序号（round seq 的下限）
+pg:store:maxseq                        STRING  已签发的最大 round 提交序号（round seq 的下限，建 round 时抬高，不随 round 删除）
+pg:store:pendingpurge                  SET     purgeRounds 已删除、数据面 key 待清的 roundId
+pg:{<roundId>}:keys                    SET     该 round 的数据面 key 注册表（Lua 建 key 时登记，purge 按它删除）
+pg:purge:legacy / pg:purge:legacycur   SET/HASH 没有注册表的旧 round 待做增量 SCAN 清理的 roundId / 各自保存的 SCAN 游标
 ```
 
 ### 10.6 数据保留
@@ -607,7 +613,7 @@ pg:store:maxseq                        STRING  所有 round 的最大提交序�
 - **流到流**：恰好一次。确认输入和写出结果在同一个 Lua 脚本里，要么都发生，要么都不发生。两个 slave 同时处理同一个 chunk 时，`XACK` 的返回值保证只有一个提交成功。
 - **流到外部库**：至少一次投递，加上幂等写入，结果等同于恰好一次。写库发生在提交之前，提交前崩溃会重放这个 chunk，再写一次同样的数据。
 
-幂等写入的做法是**版本化写入**。每个 round 提交时拿到全局单调的 `seq`（`plane.nextRoundSeq(store.maxRoundSeq())`：计数器先抬到存储里已有的最大 seq 再自增，所以 Redis 数据丢失后新 round 的版本不会落到 sink 表里已有的版本之下；retention 把所有 round 都删光后这个下限随之消失），每次写入带版本 `pg_version = roundSeq * 1000 + attempt`（`attempt` 是 run 的 attempt，见 8.4）。版本越新的数据越能覆盖旧的，所以旧 attempt、旧 round 的僵尸写入（被 fence 的 master 之前派出的 slave、重跑前慢下来的线程）覆盖不了新结果：
+幂等写入的做法是**版本化写入**。每个 round 提交时拿到全局单调的 `seq`（`plane.nextRoundSeq(store.maxRoundSeq())`：计数器先抬到存储里已有的最大 seq 再自增，所以 Redis 数据丢失后新 round 的版本不会落到 sink 表里已有的版本之下；这个下限是持久化的最大已签发 seq（MySQL 单行表 `pg_round_seq`，建 round 的同一事务里抬高；Redis `pg:store:maxseq`），所以 retention 把所有 round 都删光后也不会回落），每次写入带版本 `pg_version = roundSeq * 1000 + attempt`（`attempt` 是 run 的 attempt，见 8.4）。版本越新的数据越能覆盖旧的，所以旧 attempt、旧 round 的僵尸写入（被 fence 的 master 之前派出的 slave、重跑前慢下来的线程）覆盖不了新结果：
 
 | 目标 | 做法 |
 | --- | --- |
@@ -632,7 +638,7 @@ pg:store:maxseq                        STRING  所有 round 的最大提交序�
 | master 在枚举 split 中途挂掉 | 新 master 重新枚举，已入队的 splitId 被跳过 | 无 |
 | 集群整体重启 | 通道和 journal 靠 Redis 持久化保留，控制面在存储里，启动后继续 | 未提交的 chunk |
 | Redis 主从切换，丢失约 1 秒写入 | 通道和 journal 一起回退到同一个时间点，被回退的 chunk 重新处理；收尾时行数对账兜底 | 最后约 1 秒提交的 chunk |
-| Redis 数据全丢（控制面在 MySQL） | 已成功的 run 不动；master 重新登记活跃 round，epoch 与 round 序号由存储里的下限兜底（8.1）。**v1 不会自动重置或重跑运行中的 run**：通道和 split 队列已丢，枚举标记还在，master 不会重新入队，未归并的 chunk 记录一直是 PENDING，round 停在 `RUNNING`。需要运维对未完成的 run 调用 `rerunFrom`（与 10.3 一致） | 未完成的 run（人工触发） |
+| Redis 数据全丢（控制面在 MySQL） | 已成功的 run 不动；master 重新登记活跃 round，epoch 与 round 序号由存储里的下限兜底（8.1）。**v1 不会自动重置或重跑运行中的 run**，但会检测并让它失败：split 队列和 split 索引都没了而 chunk 记录仍是 PENDING，或 RUNNING pipeline 的输入 stream 缺消费组（`DataPlane.groupExists`），master 把该 pipeline 记为 FAILED，错误为「data plane lost (...); rerunFrom required」并打 ERROR 日志，run 和 round 随之失败。运维对该 run 调用 `rerunFrom`（与 10.3 一致） | 未完成的 run（人工触发） |
 | `INLINE` / `LOCAL` 的 run 所在 pod 挂掉 | master 把 run 派给另一个 pod；这类 run 靠 `LOCAL_RUN_DONE` 事件完成（8.2） | 见 6.2 的断点粒度 |
 | 旧 master 冻结后恢复（僵尸） | round 级 fence 使它对控制面和数据面的写都失败，它退位 | 无 |
 
@@ -643,10 +649,10 @@ run 的边界都是落了表的 dataset，所以 run 是最后的重放单位：
 | 操作 | 效果 |
 | --- | --- |
 | `pause(roundId)` / `resume(roundId)` | 暂停后 slave 做完手上的 chunk 就停止拉取；恢复后从通道里剩下的继续 |
-| `retry(runId)` | 失败的 run 把死信放回通道，继续跑 |
+| `retry(runId)` | 失败的 run 把死信放回通道，继续跑；round 已取消 / 已压缩、run 的 in-gate 不是 OPEN 时拒绝；先（带 fence）requeue 再 CAS，中途失败时 run 仍是 FAILED，重新 retry 即可补完 |
 | `rerunFrom(runId)` | 一次原子的 `store.resetRuns`（MySQL 单事务 / Redis 单个 Lua）：该 run 及所有下游 run、它们的 pipeline、chunk 记录、相关闸门及其 signal 一起复位，run 的 attempt 加 1，round 回到 `RUNNING`；数据面旧 attempt 的 key 由 master 幂等清理 |
-| `skipChunk(chunkId)` | 把死信里的 chunk 标记为跳过，run 可以继续，round 结果打上"不完整"标记 |
-| `openGate(gateId)` | 人工放行 |
+| `skipChunk(chunkId)`（代码里是 `skipDeadLetters(runId)`） | 把死信里的 chunk 标记为跳过，run 可以继续，round 结果打上"不完整"标记（带 epoch 的 `setRoundIncomplete`）；只支持 CLUSTER run，没有死信时拒绝 |
+| `openGate(gateId)` | 人工放行 CLOSED 闸门；默认要求 after-run 都已 SUCCEEDED，`force` 跳过该检查 |
 
 以上操作都经 leader 的命令队列执行（8.5）。
 
@@ -741,6 +747,20 @@ pipelinegraph-spring-boot-starter
 | M2 | Redis Stream 通道、`commit.lua`、master 与 slave、背压 | 多 pod 跑 `CLUSTER`；随机杀 slave，结果与不杀时逐行一致 |
 | M3 | 五种闸门、MySQL 控制面、人工操作 | 杀 master、重启集群、清空 Redis 三种演练都能续跑 |
 | M4 | 监控指标、管理接口、告警 | 压测时能从指标直接定位瓶颈 pipeline |
+
+## 14.1 复审修复后的行为约定
+
+第二轮代码复审（138 条）之后落地的约定，凡与上文冲突以本节为准；配置项与接口细节见 README。
+
+- **标识符长度**：图名 ≤ 64、gate id（含自动 `barrier:<dataset>`）和 pipeline id ≤ 128，round id 为 `<graph>-<yyyyMMdd-HHmmss>-<12 hex>`（≤ 93）；`PipelineGraph.build()` 校验，MySQL 列按此定长（主键不超过 InnoDB 的 3072 字节），`init()` 自动加宽旧表。`parallelism` ≥ 1，`RuntimeConfig` 在引擎启动时整体校验（`max-attempts` ≥ 1、水位 `0 < low ≤ high`、各类超时 > 0；`stopJoinMillis` ≥ 0，限制 `stop()` 等待 worker / 本地 run 线程的时间）。
+- **执行模式**：`.mode()` 提示按 pipeline 生效，未提示的成员按自己的估算；`force-mode` 覆盖所有提示。
+- **读取 dataset 的 runner**：实例形式的 runner 实现 `ReadsDatasets`；类型形式（`row(Class)`）不会被 planner 实例化，只能声明 `public static Collection<String> readDatasets()`（一个类不可能同时有同签名的实例方法和静态方法，所以不要同时实现接口），planner 反射调用它来生成 `barrier:<dataset>`；只实现接口、没有静态方法时 plan 失败，而不是悄悄少规划一个 barrier。
+- **行值规范化**：`Row.set/of` 把值规范化为 JSON 往返后的同一组类型（`Long`、`BigDecimal`、`String`、`Boolean`、`List`、`Map`，时间类转 ISO 字符串，NaN / Infinity 存为 null），INLINE / LOCAL / CLUSTER 下 runner 看到的类型一致；`byte[]`、`UUID` 等其他类型抛 `IllegalArgumentException`，不再在 CLUSTER 的 JSON 往返里悄悄变形。
+- **attempt 上限**：`writeVersion = seq × 1000 + attempt`，所以 attempt < 1000。worker 的 `ChunkProcessor` 拒绝更大的 attempt；master 一侧在 `rerunFrom` / 本地 `retryRun`（先于任何修改）和 RunStarter 重新分配本地 run 时拒绝让 attempt 达到 1000——前者抛错，后者把 run 与 pipeline 标为 FAILED 并写明原因，不再让 worker 逐个 chunk 失败。
+- **purge 的持久性**：`purgeRounds` 在同一原子步骤里把 round id 写进存储侧的待清理集合，保留任务读出、`purgeRoundData` 成功后才清除；没有 key 注册表的旧 round 由有预算、可续跑的增量 SCAN（游标持久化在 Redis）补清（见 README「数据保留」）。
+- **消费组丢失**：`DataPlane.groupExists(stream)`（Redis：`XINFO GROUPS`）让 master 在 stream 还在、消费组没了时也能识别数据面丢失（10.3 / 11.2）。
+- **认证**：管理接口由 Spring MVC 拦截器 `AdminSecurityInterceptor` 保护（取代 servlet 过滤器 `AdminSecurityFilter`），随 `spring.mvc.servlet.path` / context path 变化依然生效。
+- **示例的外部算法**：`FakeAlgoService` 先把请求写入 MySQL 表 `ex_algo_request`（batch id 主键，`INSERT IGNORE`，同步完成才返回），各 pod 的 poller 用条件 `UPDATE` 原子认领（超过 `demo.algo-claim-timeout-ms` 的认领视为放弃），失败时释放认领，写 ClickHouse（ReplacingMergeTree）后按 batch id 幂等地 `signalGate` 并标记完成，所以 pod 被 kill 后回调不会丢。
 
 ## 15. 我做的假设
 

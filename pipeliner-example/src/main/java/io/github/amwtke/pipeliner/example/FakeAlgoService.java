@@ -181,7 +181,8 @@ public class FakeAlgoService {
         }
     }
 
-    private long insert(String planVersion, String payload) throws Exception {
+    /** Computes and stores the results (ClickHouse); package-private so tests can run the claim logic without ClickHouse. */
+    long insert(String planVersion, String payload) throws Exception {
         String sql = "INSERT INTO " + Demo.DB + ".ex_algo_gd (plan_version, material_id, group_id, kind, node, month, qty) VALUES (?,?,?,?,?,?,?)";
         long n = 0;
         try (Connection c = dataSources.get("ch").getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {

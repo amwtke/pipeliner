@@ -285,23 +285,33 @@ public final class Planner {
             d.addAll(((ReadsDatasets) inst).readDatasets());
         } else {
             Class<?> t = p.getRowRunnerType() != null ? p.getRowRunnerType() : p.getBatchRunnerType();
-            if (t != null && ReadsDatasets.class.isAssignableFrom(t)) d.addAll(staticReadDatasets(p.getId(), t));
+            if (t != null) {
+                // a class cannot both implement the instance method and declare a static one of the same signature, so a type-based runner
+                // declares the static method WITHOUT implementing ReadsDatasets; implementing the interface only is a loud failure
+                Collection<String> st = staticReadDatasets(p.getId(), t);
+                if (st != null) d.addAll(st);
+                else if (ReadsDatasets.class.isAssignableFrom(t)) throw new PlanException("pipeline " + p.getId() + ": runner type " + t.getName()
+                        + " implements ReadsDatasets but is declared by type, so the planner cannot call the instance method; add a public static "
+                        + "Collection<String> readDatasets() (instead of implementing the interface) or declare the runner as an instance");
+            }
         }
         return d;
     }
 
+    /** The result of the type's {@code public static Collection<String> readDatasets()}, or null when it declares none. */
     @SuppressWarnings("unchecked")
     private static Collection<String> staticReadDatasets(String pid, Class<?> t) {
+        java.lang.reflect.Method m;
         try {
-            java.lang.reflect.Method m = t.getMethod("readDatasets");
-            if (!Modifier.isStatic(m.getModifiers())) throw new NoSuchMethodException();
+            m = t.getMethod("readDatasets");
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+        if (!Modifier.isStatic(m.getModifiers())) return null;
+        try {
             m.setAccessible(true);
             Object r = m.invoke(null);
             return r == null ? Collections.<String>emptyList() : (Collection<String>) r;
-        } catch (NoSuchMethodException e) {
-            throw new PlanException("pipeline " + pid + ": runner type " + t.getName() + " implements ReadsDatasets but is declared by type, "
-                    + "so the planner cannot call the instance method; add a public static Collection<String> readDatasets() "
-                    + "or declare the runner as an instance");
         } catch (Exception e) {
             throw new PlanException("pipeline " + pid + ": static readDatasets() of " + t.getName() + " failed: " + e);
         }

@@ -28,6 +28,15 @@ public class RedisDataPlane implements DataPlane {
     private static final long WORKER_INFO_TTL_MS = 60_000L;
     private static final int REQUEUE_BATCH = 500;
     private static final int PURGE_BATCH = 200;
+    /** Rounds purged without a key registry (created before pg:{r}:keys existed) whose keys are still to be found by an incremental SCAN. */
+    static final String LEGACY_PENDING = "pg:purge:legacy";
+    /** round id to the persisted SCAN cursor of its legacy purge, so the scan resumes where the last call stopped (any pod, after a restart). */
+    static final String LEGACY_CURSOR = "pg:purge:legacycur";
+    private volatile long legacyScanBudgetMillis = 50;
+    private volatile int legacyScanCount = 500;
+
+    /** Time budget (per purgeRoundData call) and SCAN COUNT of the legacy pre-registry purge. A call always does at least one SCAN step. */
+    public void setLegacyScan(long budgetMillis, int count) { this.legacyScanBudgetMillis = Math.max(0, budgetMillis); this.legacyScanCount = Math.max(1, count); }
 
     private final RedisClient client;
     private final StatefulRedisConnection<String, String> shared;
@@ -424,6 +433,22 @@ public class RedisDataPlane implements DataPlane {
         fencedCmd(roundId, epoch, "DEL", keys.toArray(new String[0]));
     }
 
+    @Override public boolean groupExists(String streamKey) {
+        try {
+            for (Object g : cmd.xinfoGroups(streamKey)) {
+                if (!(g instanceof List)) continue;
+                List<?> kv = (List<?>) g;
+                for (int i = 0; i + 1 < kv.size(); i += 2)
+                    if ("name".equals(String.valueOf(kv.get(i))) && Keys.GROUP.equals(String.valueOf(kv.get(i + 1)))) return true;
+            }
+            return false;
+        } catch (io.lettuce.core.RedisCommandExecutionException e) {
+            String m = e.getMessage();
+            if (m != null && (m.startsWith("NOGROUP") || m.contains("no such key"))) return false;   // missing stream
+            throw e;
+        }
+    }
+
     @Override public long usedMemoryBytes() {
         for (String line : cmd.info("memory").split("\r?\n")) {
             if (line.startsWith("used_memory:")) return Long.parseLong(line.substring("used_memory:".length()).trim());
@@ -453,10 +478,11 @@ public class RedisDataPlane implements DataPlane {
 
     /** Deletes by the round's key registry (pg:{r}:keys, filled by the Lua scripts as keys are created) plus the fixed control keys; never scans the keyspace. */
     @Override public int purgeRoundData(Collection<String> roundIds) {
-        if (roundIds == null || roundIds.isEmpty()) return 0;
         int deleted = 0;
+        if (roundIds == null) roundIds = Collections.emptyList();
         for (String r : new LinkedHashSet<>(roundIds)) {
             String reg = Keys.registry(r);
+            if (cmd.exists(reg) == 0) cmd.sadd(LEGACY_PENDING, r);   // no registry: a round of an older version (or one that never created keys), finish by SCAN below
             List<String> batch = new ArrayList<>(PURGE_BATCH + 8);
             batch.addAll(Arrays.asList(Keys.journal(r), Keys.desired(r), Keys.assign(r), Keys.paused(r), Keys.fence(r)));
             ScanArgs args = ScanArgs.Builder.limit(PURGE_BATCH);
@@ -473,7 +499,50 @@ public class RedisDataPlane implements DataPlane {
             batch.add(reg);
             deleted += unlink(batch);
         }
+        return deleted + purgeLegacy();
+    }
+
+    /**
+     * Bounded, resumable migration for rounds without a key registry: for each pending round an incremental {@code SCAN cursor MATCH pg:{round}:*}
+     * whose cursor is persisted in {@link #LEGACY_CURSOR}. One call spends at most {@code legacyScanBudgetMillis} (plus one SCAN step of
+     * COUNT keys), then stops and leaves the rest for the next call; rounds with a stored cursor are continued first.
+     */
+    private int purgeLegacy() {
+        List<String> pending = cmd.srandmember(LEGACY_PENDING, 20);
+        if (pending == null || pending.isEmpty()) return 0;
+        long deadline = System.nanoTime() + legacyScanBudgetMillis * 1_000_000L;
+        List<String> order = new ArrayList<>(cmd.hkeys(LEGACY_CURSOR));
+        for (String r : pending) if (!order.contains(r)) order.add(r);
+        int deleted = 0;
+        for (String r : order) {
+            String cursor = cmd.hget(LEGACY_CURSOR, r);
+            ScanArgs args = ScanArgs.Builder.matches(globEscape("pg:{" + r + "}:") + "*").limit(legacyScanCount);
+            boolean finished = false;
+            do {
+                KeyScanCursor<String> kc = cmd.scan(ScanCursor.of(cursor == null ? "0" : cursor), args);
+                deleted += unlink(new ArrayList<>(kc.getKeys()));
+                cursor = kc.getCursor();
+                finished = kc.isFinished();
+            } while (!finished && System.nanoTime() < deadline);
+            if (finished) {
+                cmd.srem(LEGACY_PENDING, r);
+                cmd.hdel(LEGACY_CURSOR, r);
+            } else {
+                cmd.hset(LEGACY_CURSOR, r, cursor);   // resume here next call
+                break;                                // budget spent
+            }
+            if (System.nanoTime() >= deadline) break;
+        }
         return deleted;
+    }
+
+    private static String globEscape(String s) {
+        StringBuilder b = new StringBuilder();
+        for (char ch : s.toCharArray()) {
+            if (ch == '\\' || ch == '*' || ch == '?' || ch == '[' || ch == ']') b.append('\\');
+            b.append(ch);
+        }
+        return b.toString();
     }
 
     private int unlink(List<String> keys) {

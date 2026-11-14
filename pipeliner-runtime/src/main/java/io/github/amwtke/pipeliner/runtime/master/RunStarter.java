@@ -118,6 +118,17 @@ final class RunStarter {
         String pod = pickPod(d.round());
         if (pod == null) { log.warn("no live worker able to run local run {}/{}; will retry", roundId, run.getRunId()); return; }
         int attempt = run.getAttempt() + 1;
+        if (!io.github.amwtke.pipeliner.runtime.process.ChunkProcessor.attemptInRange(attempt)) {
+            // workers would refuse every chunk of such an attempt: fail the run with a clear error instead of assigning it
+            String msg = io.github.amwtke.pipeliner.runtime.process.ChunkProcessor.attemptLimitMessage(roundId, run.getRunId(), attempt);
+            log.error(msg);
+            if (c.s.store.casRunStatus(roundId, run.getRunId(), RunStatus.RUNNING, RunStatus.FAILED, msg, c.epoch())) {
+                for (String p : d.plan.run(run.getRunId()).getPipelineIds())
+                    c.s.store.casPipelineStatus(roundId, p, PipelineStatus.RUNNING, PipelineStatus.FAILED, msg, c.epoch());
+                d.touch();
+            }
+            return;
+        }
         if (!c.s.store.updateRunAssignment(roundId, run.getRunId(), pod, attempt, c.epoch())) return;
         c.s.plane.assignLocalRun(roundId, run.getRunId(), pod, attempt, c.epoch());
         d.touch();

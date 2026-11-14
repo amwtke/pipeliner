@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.runtime.worker;
 
+import io.github.amwtke.pipeliner.runtime.Interrupts;
 import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
 import io.github.amwtke.pipeliner.core.dataplane.DesiredState;
 import io.github.amwtke.pipeliner.core.plan.ExecutionPlan;
@@ -86,6 +87,7 @@ public final class WorkerAgent implements Runnable {
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable e) {   // incl. Errors (e.g. AbstractMethodError from an old custom plane): the worker agent thread must never die
+                if (Interrupts.ownInterrupt(stopped, e)) { log.debug("worker agent stopping ({})", e.toString()); return; }
                 log.warn("worker agent tick failed: {}", e.toString());
                 try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
             }
@@ -139,6 +141,7 @@ public final class WorkerAgent implements Runnable {
             if (!active.contains(roundOf(e.getKey()))) { e.getValue().executor.cancel(); it.remove(); }
         }
         roundCache.keySet().retainAll(active);
+        warned.retainAll(active);
     }
 
     private void reconcileRound(String roundId) {

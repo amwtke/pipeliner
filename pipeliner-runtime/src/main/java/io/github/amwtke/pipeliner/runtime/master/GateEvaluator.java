@@ -38,7 +38,7 @@ final class GateEvaluator {
                 }
                 GateDecision dec = decide(d, pg, g, now);
                 if (dec == GateDecision.OPEN) {
-                    if (c.s.store.casGateStatus(roundId, g.getGateId(), GateStatus.CLOSED, GateStatus.OPEN, pg.getType().name().toLowerCase(), new HashMap<String, String>(), c.epoch()))
+                    if (c.s.store.casGateStatus(roundId, g.getGateId(), GateStatus.CLOSED, GateStatus.OPEN, pg.getType().name().toLowerCase(java.util.Locale.ROOT), new HashMap<String, String>(), c.epoch()))
                         d.touch();
                 } else if (dec == GateDecision.REJECT) {
                     if (c.s.store.casGateStatus(roundId, g.getGateId(), GateStatus.CLOSED, GateStatus.REJECTED, "condition", new HashMap<String, String>(), c.epoch()))

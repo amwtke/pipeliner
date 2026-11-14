@@ -163,7 +163,11 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 + " split_spec TEXT, rows_in BIGINT, rows_out_json TEXT, rows_out_total BIGINT, sink_rows BIGINT NOT NULL DEFAULT 0, cost_ms INT, error TEXT, updated_at BIGINT,"
                 + " PRIMARY KEY (round_id, pipeline_id, chunk_id), KEY idx_run_status (round_id, run_id, status))" + TBL,
             // single row (id=1): the highest master epoch ever reserved (reserveMasterEpoch)
-            "CREATE TABLE IF NOT EXISTS pg_master_epoch (id TINYINT NOT NULL, max_epoch BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (id))" + TBL
+            "CREATE TABLE IF NOT EXISTS pg_master_epoch (id TINYINT NOT NULL, max_epoch BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (id))" + TBL,
+            // single row (id=1): the highest round seq ever created; survives retention purging every round
+            "CREATE TABLE IF NOT EXISTS pg_round_seq (id TINYINT NOT NULL, max_seq BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (id))" + TBL,
+            // round ids removed by purgeRounds whose data-plane keys still have to be purged
+            "CREATE TABLE IF NOT EXISTS pg_pending_purge (round_id VARCHAR(96) NOT NULL, PRIMARY KEY (round_id))" + TBL
         };
         try (Connection c = ds.getConnection(); Statement st = c.createStatement()) {
             for (String s : ddl) st.execute(s);
@@ -177,6 +181,8 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
             alter(st, "ALTER TABLE pg_round ADD KEY idx_seq (seq)");   // MAX(seq) = index lookup
             alter(st, "ALTER TABLE pg_chunk ADD COLUMN sink_rows BIGINT NOT NULL DEFAULT 0");   // rows written to sinks (0 for chunks stored before the column existed)
             st.execute("INSERT IGNORE INTO pg_master_epoch (id, max_epoch) VALUES (1, 0)");
+            st.execute("INSERT IGNORE INTO pg_round_seq (id, max_seq) VALUES (1, 0)");
+            st.execute("UPDATE pg_round_seq SET max_seq=(SELECT COALESCE(MAX(seq),0) FROM pg_round) WHERE id=1 AND max_seq<(SELECT COALESCE(MAX(seq),0) FROM pg_round)");   // backfill
             widenColumns(c);
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_counts TEXT");
             alter(st, "ALTER TABLE pg_pipeline ADD COLUMN sum_rows_in BIGINT");
@@ -279,6 +285,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                         r.getPlanHash(), r.getPlanJson(), json(r.getParams()), r.getStatus().name(), r.getMasterEpoch(),
                         r.getJournalOffset() == null ? "0-0" : r.getJournalOffset(), r.getCreatedAt(), r.getStartedAt(), r.getFinishedAt(), r.getError(),
                         r.isIncomplete(), r.getSeq(), r.isCompacted());
+                exec(c, "UPDATE pg_round_seq SET max_seq=? WHERE id=1 AND max_seq<?", r.getSeq(), r.getSeq());
                 for (RunRecord u : runs == null ? Collections.<RunRecord>emptyList() : runs)
                     exec(c, "INSERT INTO pg_run (round_id,run_id,stage,mode,status,attempt,assignee,master_epoch,started_at,finished_at,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             r.getRoundId(), u.getRunId(), u.getStage(), u.getMode() == null ? null : u.getMode().name(),
@@ -379,7 +386,7 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
 
     @Override
     public long maxRoundSeq() {
-        List<Long> r = query("SELECT COALESCE(MAX(seq),0) FROM pg_round", rs -> rs.getLong(1));
+        List<Long> r = query("SELECT GREATEST(COALESCE((SELECT max_seq FROM pg_round_seq WHERE id=1),0), COALESCE((SELECT MAX(seq) FROM pg_round),0))", rs -> rs.getLong(1));
         return r.isEmpty() ? 0L : r.get(0);
     }
 
@@ -460,7 +467,9 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override
-    public void setRoundIncomplete(String roundId) { update("UPDATE pg_round SET incomplete=1 WHERE round_id=?", roundId); }
+    public boolean setRoundIncomplete(String roundId, long epoch) {
+        return withConn(c -> fenceUpdate(c, "UPDATE pg_round SET incomplete=1, master_epoch=? WHERE round_id=? AND master_epoch<=?", roundId, epoch, epoch, roundId, epoch));
+    }
 
     @Override
     public boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch) {
@@ -748,11 +757,24 @@ public class MySqlControlPlaneStore implements ControlPlaneStore {
                 if (r == null || !terminalName((String) r[0]) || r[1] == null || (Long) r[1] >= finishedBeforeMillis) return false;
                 for (String t : new String[]{"pg_chunk", "pg_gate_signal", "pg_gate", "pg_pipeline", "pg_run"}) exec(c, "DELETE FROM " + t + " WHERE round_id=?", rid);
                 exec(c, "DELETE FROM pg_round WHERE round_id=?", rid);
+                exec(c, "INSERT IGNORE INTO pg_pending_purge (round_id) VALUES (?)", rid);
                 return true;
             });
             if (done) purged.add(rid);
         }
         return purged;
+    }
+
+    @Override
+    public List<String> pendingPurges(int max) {
+        if (max <= 0) return new ArrayList<>();
+        return query("SELECT round_id FROM pg_pending_purge ORDER BY round_id LIMIT ?", rs -> rs.getString(1), max);
+    }
+
+    @Override
+    public void clearPendingPurges(java.util.Collection<String> roundIds) {
+        if (roundIds == null) return;
+        for (String id : roundIds) update("DELETE FROM pg_pending_purge WHERE round_id=?", id);
     }
 
     @Override

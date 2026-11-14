@@ -44,12 +44,14 @@ final class CompletionChecker {
             for (String p : pr.getPipelineIds()) {
                 if (status.get(p) != PipelineStatus.RUNNING) continue;
                 PlanPipeline pp = d.plan.pipeline(p);
+                String groupless = streamWithoutGroup(roundId, pp, run.getAttempt());
+                if (groupless != null) { failLost(d, pr, run, p, status, "consumer group of input stream " + groupless + " is gone"); continue; }
                 boolean ready = pp.isSource() ? d.pipe(p).isEnumDone() : upstreamDone(pp, status);
                 if (!ready || !inputsEmpty(roundId, pp, run.getAttempt())) continue;
                 if (drainer.drain(roundId, d.plan).localApplied) d.touch();   // local-run events changed run/pipeline records
                 // a source is done only when every split chunk record left PENDING (DONE, or DEAD/SKIPPED): never on an empty queue alone
                 if (pp.isSource() && c.s.store.countChunks(roundId, p, ChunkStatus.PENDING) > 0) {
-                    if (dataPlaneLost(roundId, p, run.getAttempt())) failLost(d, pr, run, p, status);
+                    if (dataPlaneLost(roundId, p, run.getAttempt())) failLost(d, pr, run, p, status, "split queue and index of " + p + " are gone while its chunks are PENDING");
                     continue;
                 }
                 boolean failed = c.s.store.countChunks(roundId, p, ChunkStatus.DEAD) > 0;
@@ -90,8 +92,17 @@ final class CompletionChecker {
         return c.s.plane.streamLength(Keys.splitIndex(roundId, pipelineId, attempt)) == 0;
     }
 
-    private void failLost(RoundData d, PlanRun pr, RunRecord run, String p, Map<String, PipelineStatus> status) {
-        String msg = "data plane lost (split queue and index of " + p + " are gone while its chunks are PENDING); rerunFrom required";
+    /**
+     * The first input stream of the pipeline whose consumer group is gone (e.g. Redis was flushed, or the group was destroyed while the stream
+     * survived): workers can never read it again. The group is created before the pipeline turns RUNNING, so a RUNNING pipeline always has them.
+     */
+    private String streamWithoutGroup(String roundId, PlanPipeline pp, int attempt) {
+        for (String stream : RunKeys.inputStreams(roundId, pp, attempt).keySet()) if (!c.s.plane.groupExists(stream)) return stream;
+        return null;
+    }
+
+    private void failLost(RoundData d, PlanRun pr, RunRecord run, String p, Map<String, PipelineStatus> status, String reason) {
+        String msg = "data plane lost (" + reason + "); rerunFrom required";
         log.error("round {} pipeline {}: {}", d.roundId(), p, msg);
         if (c.s.store.casPipelineStatus(d.roundId(), p, PipelineStatus.RUNNING, PipelineStatus.FAILED, msg, c.epoch())) {
             status.put(p, PipelineStatus.FAILED);

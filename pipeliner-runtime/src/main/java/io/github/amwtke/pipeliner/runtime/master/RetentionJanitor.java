@@ -17,8 +17,6 @@ public final class RetentionJanitor {
     private final Services s;
     private final BooleanSupplier leader;
     private long lastRun;
-    /** Rounds already gone from the control plane whose data-plane keys still have to be purged (retried every pass until it succeeds). */
-    private final java.util.Set<String> pendingPurge = new java.util.LinkedHashSet<>();
     /** Rounds compactRound refused with a negative code (e.g. old Redis rounds without finishedAt): not retried every pass. */
     private final java.util.Set<String> uncompactable = new java.util.HashSet<>();
 
@@ -40,12 +38,11 @@ public final class RetentionJanitor {
             int batch = Math.max(1, cfg.getRetentionBatch());
             List<String> gone = s.store.purgeRounds(now - cfg.getRoundRetentionMillis(), batch);
             purged = gone.size();
-            pendingPurge.addAll(gone);   // the records are gone for good: the data plane purge must not depend on this pass finishing
-            if (!pendingPurge.isEmpty()) {
-                List<String> todo = new java.util.ArrayList<>(pendingPurge);
-                s.plane.purgeRoundData(todo);
-                pendingPurge.removeAll(todo);
-            }
+            // purgeRounds recorded every purged id in the store's durable pending set (same atomic step), so the data plane purge survives a
+            // master restart or failover; the ids are cleared only after purgeRoundData succeeded (retried every pass otherwise)
+            List<String> todo = s.store.pendingPurges(Math.max(batch, 100));
+            s.plane.purgeRoundData(todo);   // also when empty: advances the data plane's bounded legacy (pre-registry) key scan
+            if (!todo.isEmpty()) s.store.clearPendingPurges(todo);
             if (System.currentTimeMillis() < deadline) {
                 long cutoff = now - cfg.getChunkRetentionMillis();
                 if (uncompactable.size() > 10_000) uncompactable.clear();

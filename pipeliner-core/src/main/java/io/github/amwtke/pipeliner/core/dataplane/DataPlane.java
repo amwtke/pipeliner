@@ -86,6 +86,11 @@ public interface DataPlane extends AutoCloseable {
     /** Adds the split to the attempt's split index and, if new, to its split queue. Fenced. */
     boolean enqueueSplit(String roundId, String pipelineId, int attempt, Split split, long epoch);
     long streamLength(String streamKey);
+    /**
+     * Whether the consumer group ({@link Keys#GROUP}) exists on the stream. False for a missing stream or a missing group (a stream can outlive
+     * its group). The master uses it to detect a lost data plane. Default true (planes that cannot tell never report a loss).
+     */
+    default boolean groupExists(String streamKey) { return true; }
     /** XREADGROUP with ">"; blocking reads use a per-thread dedicated connection. */
     List<StreamEntry> read(String consumer, List<String> streamKeys, int count, long blockMillis);
     /** XAUTOCLAIM; the scan cursor is kept per stream across calls so entries behind many renewed ones are reached; claims at most {@code count} entries. */
@@ -113,6 +118,7 @@ public interface DataPlane extends AutoCloseable {
     PendingSummary pendingSummary(String streamKey);
     /** Deletes the remaining data plane keys (channels, split queues, DLQs, ...) of rounds that no longer exist in the control plane; returns the key count. */
     int purgeRoundData(Collection<String> roundIds);
+    // purgeRoundData may be called with an empty collection: implementations use that to advance any incremental clean-up they keep.
     /** Closes this thread's dedicated connection, if any. */
     void releaseThreadResources();
     @Override void close();

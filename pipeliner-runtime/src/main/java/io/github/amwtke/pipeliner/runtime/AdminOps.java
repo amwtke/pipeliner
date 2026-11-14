@@ -180,6 +180,7 @@ public final class AdminOps {
             List<String> runIds = new ArrayList<>();
             runIds.add(runId);
             runIds.addAll(x.plan.downstreamRuns(runId));
+            requireAttemptsLeft(x.view, Collections.singletonList(runId), "retryRun");
             s.store.resetRuns(roundId, Collections.singletonList(runId), gatesToReset(x.plan, runId, runIds), epoch());
             reviveRound(roundId);
             return;
@@ -210,8 +211,7 @@ public final class AdminOps {
         }
         if (pending == 0) throw new PipelinerException("run " + runId + " has no dead letters to skip");
         s.store.markChunksSkipped(roundId, runId, epoch());
-        if (!s.store.fenceRound(roundId, epoch())) throw new StaleEpochException("round " + roundId + " is held by a newer master epoch");
-        s.store.setRoundIncomplete(roundId);
+        if (!s.store.setRoundIncomplete(roundId, epoch())) throw new StaleEpochException("round " + roundId + " is held by a newer master epoch");
         if (x.run.getStatus() == RunStatus.FAILED) {
             requireCas(s.store.casRunStatus(roundId, runId, RunStatus.FAILED, RunStatus.RUNNING, null, epoch()), "skipDeadLetters");
             revivePipelines(x);
@@ -253,6 +253,7 @@ public final class AdminOps {
         runIds.add(runId);
         runIds.addAll(x.plan.downstreamRuns(runId));
         List<String> gateIds = gatesToReset(x.plan, runId, runIds);
+        requireAttemptsLeft(x.view, runIds, "rerunFrom");
         s.store.resetRuns(roundId, runIds, gateIds, epoch());
         RoundRecord now = requireRound(roundId);
         if (now.getStatus() == RoundStatus.PAUSED || now.getStatus() == RoundStatus.CREATED)
@@ -266,6 +267,16 @@ public final class AdminOps {
             s.plane.clearLocalRun(roundId, id, epoch());
         }
         log.info("round {} rerun from {} (reset runs {})", roundId, runId, runIds);
+    }
+
+    /** A reset bumps every listed run's attempt: refuse (before changing anything) when the new attempt would reach ChunkProcessor.VERSION_RADIX. */
+    private static void requireAttemptsLeft(RoundView v, List<String> runIds, String what) {
+        for (String id : runIds) {
+            RunRecord r = runOf(v, id);
+            if (r != null && !io.github.amwtke.pipeliner.runtime.process.ChunkProcessor.attemptInRange(r.getAttempt() + 1))
+                throw new PipelinerException(what + " refused: " + io.github.amwtke.pipeliner.runtime.process.ChunkProcessor.attemptLimitMessage(
+                        v.getRound().getRoundId(), id, r.getAttempt() + 1));
+        }
     }
 
     private Ctx ctx(String roundId, String runId) {

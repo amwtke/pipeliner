@@ -499,6 +499,80 @@ class RedisDataPlaneTest {
     }
 
     @Test
+    void groupExistsTellsAMissingStreamFromAMissingGroup() {
+        assertFalse(dp.groupExists(IN), "missing stream (ERR no such key)");
+        dp.ensureGroup(R, IN, E);
+        assertTrue(dp.groupExists(IN));
+        add(IN, "x");
+        raw.sync().xgroupDestroy(IN, Keys.GROUP);   // the stream and its entry survive, the group does not
+        assertEquals(1, dp.streamLength(IN));
+        assertFalse(dp.groupExists(IN), "NOGROUP");
+        raw.sync().xgroupCreate(io.lettuce.core.XReadArgs.StreamOffset.from(IN, "0"), "someone-else");
+        assertFalse(dp.groupExists(IN), "another group is not ours");
+        dp.ensureGroup(R, IN, E);
+        assertTrue(dp.groupExists(IN));
+    }
+
+    @Test
+    void preRegistryRoundsAreFoundByABoundedResumableScanAndOtherRoundsAreUntouched() {
+        // keys of a round created before pg:{r}:keys existed: no registry, not even a fixed control key
+        String legacy = "legacy1";
+        Set<String> mine = new HashSet<>();
+        for (String k : Arrays.asList(Keys.channel(legacy, "e1", 0), Keys.splitQueue(legacy, "p", 0), Keys.splitIndex(legacy, "p", 0), Keys.dlq(legacy, "p", 0))) {
+            raw.sync().xadd(k, Collections.singletonMap("c", "x"));
+            mine.add(k);
+        }
+        for (int i = 0; i < 300; i++) { String k = "pg:{legacy1}:filler:" + i; raw.sync().set(k, "v"); mine.add(k); }
+        for (int i = 0; i < 2000; i++) raw.sync().set("decoy:" + i, "v");   // the SCAN has to walk through unrelated keys too
+        seedRound("modern", "e1");
+        String other = "pg:{legacy10}:ch:e1:0";   // a round whose id merely starts with the same characters
+        raw.sync().set(other, "v");
+        dp.setLegacyScan(0, 20);   // budget 0: every call does exactly one SCAN step of 20, then stops
+        try {
+            dp.purgeRoundData(Collections.singletonList(legacy));
+            assertTrue(raw.sync().sismember(RedisDataPlane.LEGACY_PENDING, legacy), "no registry: queued for the scan");
+            assertNotNull(raw.sync().hget(RedisDataPlane.LEGACY_CURSOR, legacy), "the cursor is persisted between calls (one step cannot finish 2300+ keys)");
+            int calls = 1;
+            while (raw.sync().sismember(RedisDataPlane.LEGACY_PENDING, legacy) && calls < 5000) { dp.purgeRoundData(Collections.<String>emptyList()); calls++; }
+            assertTrue(calls > 3, "resumed over several calls: " + calls);
+            assertFalse(raw.sync().sismember(RedisDataPlane.LEGACY_PENDING, legacy));
+            assertNull(raw.sync().hget(RedisDataPlane.LEGACY_CURSOR, legacy));
+            for (String k : mine) assertEquals(0, raw.sync().exists(k), k);
+            assertEquals(1, raw.sync().exists(other), "pg:{legacy10}:* is another round");
+            assertEquals(1, raw.sync().exists(Keys.registry("modern")), "a round with a registry is never scanned for");
+            assertEquals(2000, raw.sync().keys("decoy:*").size());
+            assertFalse(raw.sync().sismember(RedisDataPlane.LEGACY_PENDING, "modern"));
+        } finally { dp.setLegacyScan(50, 500); }
+    }
+
+    @Test
+    void registryRoundsAreNotQueuedForTheLegacyScanButKeylessOnesAre() {
+        seedRound("reg", "e1");
+        dp.purgeRoundData(Collections.singletonList("reg"));
+        assertFalse(raw.sync().sismember(RedisDataPlane.LEGACY_PENDING, "reg"));
+        dp.purgeRoundData(Collections.singletonList("nokeys"));   // finishes within the first call: nothing to find
+        assertFalse(raw.sync().sismember(RedisDataPlane.LEGACY_PENDING, "nokeys"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void aReconnectingBlockingConnectionIsReusedNotOrphaned() throws Exception {   // F070
+        dp.ensureGroup(R, IN, E);
+        dp.read("c1", Collections.singletonList(IN), 1, 50);   // creates this thread's blocking connection
+        java.lang.reflect.Field f = RedisDataPlane.class.getDeclaredField("blockingAll");
+        f.setAccessible(true);
+        int before = ((Collection<Object>) f.get(dp)).size();
+        raw.sync().clientKill(io.lettuce.core.KillArgs.Builder.typeNormal().skipme());   // an outage: every other connection is cut
+        Thread.sleep(300);
+        for (int i = 0; i < 20; i++) {
+            try { dp.read("c1", Collections.singletonList(IN), 1, 50); } catch (RuntimeException ignored) { /* the first calls may fail while reconnecting */ }
+            Thread.sleep(50);
+        }
+        assertEquals(before, ((Collection<Object>) f.get(dp)).size(), "no replacement connection was created (the old one reconnected by itself)");
+        assertEquals(0, dp.read("c1", Collections.singletonList(IN), 1, 50).size(), "and it works again");
+    }
+
+    @Test
     void pruneWorkersRemovesOnlyStaleMembers() {
         dp.heartbeat("fresh", Collections.<String, String>emptyMap());
         raw.sync().zadd(Keys.workers(), (double) (System.currentTimeMillis() - 3_600_000L), "ancient");

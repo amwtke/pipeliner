@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.runtime.worker;
 
+import io.github.amwtke.pipeliner.runtime.Interrupts;
 import io.github.amwtke.pipeliner.core.dataplane.DataPlane;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -52,6 +53,7 @@ public final class ClaimRenewer {
                     try {
                         if (!plane.renew(c.consumer, c.streamKey, c.entryId)) claims.remove(c);   // acked or deleted meanwhile
                     } catch (Throwable e) {   // incl. Errors: the renewer thread must never die (claims would expire and be re-delivered)
+                        if (Interrupts.ownInterrupt(stopped, e)) return;
                         if (e instanceof RuntimeException && ClusterPipelineWorker.isNoGroup((RuntimeException) e)) claims.remove(c);   // the stream/group is gone (round cleaned up)
                         else log.warn("claim renew failed for {} {}: {}", c.streamKey, c.entryId, e.toString());
                     }
@@ -59,6 +61,7 @@ public final class ClaimRenewer {
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable e) {   // never let an unexpected Error end the loop
+                if (Interrupts.ownInterrupt(stopped, e)) break;
                 log.warn("claim renewer loop error: {}", e.toString());
             }
         }

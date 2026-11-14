@@ -49,6 +49,8 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     private static final String MAX_EPOCH = "pg:store:maxepoch";
     /** Highest round seq ever created (raised in the createRound script and by the init backfill). */
     private static final String MAX_SEQ = "pg:store:maxseq";
+    /** Rounds purged from the control plane whose data-plane keys still have to be purged (see ControlPlaneStore.pendingPurges). */
+    private static final String PENDING_PURGE = "pg:store:pendingpurge";
     /** Schema marker: the version of the one-time init backfill that has completed (raised only). */
     private static final String SCHEMA = "pg:store:schema";
     private static final long SCHEMA_VERSION = 2;
@@ -391,6 +393,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             + "redis.call('ZREM',KEYS[5],rid)\n"
             + "redis.call('ZREM',KEYS[6],rid)\n"
             + "redis.call('SREM',KEYS[4],rid)\n"
+            + "redis.call('SADD',KEYS[7],rid)\n"
             + "for i=1,#del,500 do redis.call('UNLINK',unpack(del,i,math.min(i+499,#del))) end\n"
             + "return 1\n";
 
@@ -872,7 +875,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
     }
 
     @Override
-    public void setRoundIncomplete(String roundId) { mutate(roundId, k(roundId, ROUND), new Ops(null, -1).set("incomplete", "1")); }
+    public boolean setRoundIncomplete(String roundId, long epoch) { return mutate(roundId, k(roundId, ROUND), new Ops(null, epoch).set("incomplete", "1")); }
 
     @Override
     public boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch) {
@@ -1185,7 +1188,7 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
         addList(args, RoundStatus.terminalNames());
         // the data plane's per-round keys that die with the round
         addList(args, java.util.Arrays.asList(Keys.desired(rid), Keys.assign(rid), Keys.paused(rid), Keys.fence(rid), Keys.journal(rid)));
-        return evalLong(PURGE, new String[]{k(rid, ROUND), ROUNDS, BIZ, ACTIVE, FINISHED, UNCOMPACTED}, args) == 1;
+        return evalLong(PURGE, new String[]{k(rid, ROUND), ROUNDS, BIZ, ACTIVE, FINISHED, UNCOMPACTED, PENDING_PURGE}, args) == 1;
     }
 
     @Override
@@ -1200,6 +1203,20 @@ public class RedisControlPlaneStore implements ControlPlaneStore {
             if (purge(rid, finishedBeforeMillis)) purged.add(rid);
         }
         return purged;
+    }
+
+    @Override
+    public List<String> pendingPurges(int max) {
+        List<String> out = new ArrayList<>();
+        if (max <= 0) return out;
+        out.addAll(r().srandmember(PENDING_PURGE, max));
+        return out;
+    }
+
+    @Override
+    public void clearPendingPurges(java.util.Collection<String> roundIds) {
+        if (roundIds == null || roundIds.isEmpty()) return;
+        r().srem(PENDING_PURGE, roundIds.toArray(new String[0]));
     }
 
     @Override

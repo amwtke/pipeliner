@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.runtime.worker;
 
+import io.github.amwtke.pipeliner.runtime.Interrupts;
 import io.github.amwtke.pipeliner.api.Chunk;
 import io.github.amwtke.pipeliner.api.Split;
 import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
@@ -128,7 +129,7 @@ public final class ClusterPipelineWorker implements Runnable {
                 } catch (InterruptedException e) {
                     return;
                 } catch (Throwable e) {   // incl. Errors: a worker loop must not die silently (chunk failures are handled in handle())
-                    if (killed || stopRequested) return;
+                    if (killed || stopRequested || Interrupts.isInterrupt(e)) return;
                     if (e instanceof RuntimeException && isNoGroup((RuntimeException) e)) {
                         log.debug("worker {}: stream gone ({})", consumer, e.getMessage());
                         sleepQuietly(500);

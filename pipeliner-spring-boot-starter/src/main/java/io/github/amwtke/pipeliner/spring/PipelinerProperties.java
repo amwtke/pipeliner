@@ -124,6 +124,6 @@ public class PipelinerProperties {
         } catch (Exception e) {
             host = "pod";
         }
-        return host + "-" + String.format("%04x", ThreadLocalRandom.current().nextInt(0x10000));
+        return host + "-" + String.format(java.util.Locale.ROOT, "%04x", ThreadLocalRandom.current().nextInt(0x10000));
     }
 }

@@ -143,7 +143,13 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
         return true;
     }
 
-    @Override public synchronized void setRoundIncomplete(String roundId) { rounds.get(roundId).setIncomplete(true); }
+    @Override public synchronized boolean setRoundIncomplete(String roundId, long epoch) {
+        RoundRecord r = rounds.get(roundId);
+        if (r == null || r.getMasterEpoch() > epoch) return false;
+        r.setMasterEpoch(epoch);
+        r.setIncomplete(true);
+        return true;
+    }
 
     @Override public synchronized boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch) {
         RunRecord r = runs.get(roundId).get(runId);
@@ -422,9 +428,18 @@ public class InMemoryControlPlaneStore implements ControlPlaneStore {
             rounds.remove(id); runs.remove(id); gates.remove(id); pipes.remove(id); chunks.remove(id);
             signals.keySet().removeIf(sk -> sk.startsWith(id + "|"));   // keyed roundId|gateId
             out.add(id);
+            pendingPurge.add(id);
         }
         return out;
     }
+
+    private final java.util.Set<String> pendingPurge = new java.util.LinkedHashSet<>();
+    @Override public synchronized List<String> pendingPurges(int max) {
+        List<String> out = new ArrayList<>();
+        for (String id : pendingPurge) { if (out.size() >= max) break; out.add(id); }
+        return out;
+    }
+    @Override public synchronized void clearPendingPurges(Collection<String> ids) { pendingPurge.removeAll(ids); }
 
     @Override public synchronized List<String> findTerminalRounds(long cutoff, int max) {
         findCalls.incrementAndGet();

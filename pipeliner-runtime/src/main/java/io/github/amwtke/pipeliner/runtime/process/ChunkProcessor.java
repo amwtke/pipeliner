@@ -37,6 +37,15 @@ public final class ChunkProcessor {
     /** writeVersion = roundSeq * VERSION_RADIX + attempt, so a run attempt must stay below VERSION_RADIX. */
     public static final int VERSION_RADIX = 1000;
 
+    /** Whether run attempt {@code attempt} is usable (0 .. VERSION_RADIX-1). */
+    public static boolean attemptInRange(int attempt) { return attempt >= 0 && attempt < VERSION_RADIX; }
+
+    /** Message of the refusal to start attempt {@code attempt} of a run (master side; workers refuse the same attempts in the constructor). */
+    public static String attemptLimitMessage(String roundId, String runId, int attempt) {
+        return "run " + runId + " of round " + roundId + " cannot start attempt " + attempt + ": attempts are limited to [0, " + VERSION_RADIX
+                + ") because the sink write version is roundSeq * " + VERSION_RADIX + " + attempt; cancel this round and submit a new one";
+    }
+
     /**
      * The lease supplies the resolved source and runner (own runner when the pipeline is perThread). attempt: the run attempt this
      * processor works for (must be < {@link #VERSION_RADIX}); roundSeq: RoundRecord.seq.

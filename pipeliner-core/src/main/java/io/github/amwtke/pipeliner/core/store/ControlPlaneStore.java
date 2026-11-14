@@ -81,7 +81,8 @@ public interface ControlPlaneStore {
      */
     boolean casRoundStatus(String roundId, RoundStatus expect, RoundStatus target, String error, long epoch);
 
-    void setRoundIncomplete(String roundId);
+    /** Marks the round incomplete (some chunks were skipped). Fenced like every master write: false (nothing written) when a higher epoch holds the round, or it is missing. */
+    boolean setRoundIncomplete(String roundId, long epoch);
 
     /** startedAt/finishedAt/error likewise (see {@link #casRoundStatus}). */
     boolean casRunStatus(String roundId, String runId, RunStatus expect, RunStatus target, String error, long epoch);
@@ -166,6 +167,16 @@ public interface ControlPlaneStore {
      * RUNNING can never lose data. Returns the purged round ids (oldest first).
      */
     List<String> purgeRounds(long finishedBeforeMillis, int max);
+
+    /**
+     * Durable set of round ids that {@link #purgeRounds} removed but whose data-plane keys ({@code DataPlane.purgeRoundData}) may not have been
+     * purged yet. {@code purgeRounds} adds every id it purges in the same atomic step; the retention janitor reads this set, purges the data plane
+     * and then calls {@link #clearPendingPurges}. Up to {@code max} ids. Default: empty (stores without durable tracking).
+     */
+    default List<String> pendingPurges(int max) { return new java.util.ArrayList<>(); }
+
+    /** Removes the ids from the pending set (after the data plane purge succeeded). Default no-op. */
+    default void clearPendingPurges(java.util.Collection<String> roundIds) { }
 
     /** Ids (oldest finished first, at most {@code max}) of terminal, not yet compacted rounds with finishedAt &lt; finishedBeforeMillis. */
     List<String> findTerminalRounds(long finishedBeforeMillis, int max);

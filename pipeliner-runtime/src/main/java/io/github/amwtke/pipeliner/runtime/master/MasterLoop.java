@@ -1,5 +1,6 @@
 package io.github.amwtke.pipeliner.runtime.master;
 
+import io.github.amwtke.pipeliner.runtime.Interrupts;
 import io.github.amwtke.pipeliner.api.PipelinerException;
 import io.github.amwtke.pipeliner.core.codec.ChunkCodec;
 import io.github.amwtke.pipeliner.core.store.StaleEpochException;
@@ -148,6 +149,7 @@ public final class MasterLoop implements Runnable {
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable e) {   // incl. Errors (e.g. AbstractMethodError from an old custom store): the master thread must never die
+                if (Interrupts.ownInterrupt(stopped, e)) { log.debug("master loop stopping ({})", e.toString()); return; }
                 log.error("master tick failed: {}", e.toString(), e);
                 try { Thread.sleep(s.cfg.getTickMillis()); } catch (InterruptedException ie) { return; }
             }
@@ -223,6 +225,7 @@ public final class MasterLoop implements Runnable {
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable e) {
+                if (Interrupts.ownInterrupt(stopped, e)) { log.debug("lease keeper stopping ({})", e.toString()); return; }
                 log.warn("lease keeper failed: {}", e.toString());
             }
         }

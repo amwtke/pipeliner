@@ -30,7 +30,7 @@ public class JdbcSink implements Sink {
         this.dataset = b.dataset;
         this.batchSize = b.batchSize;
         this.versionColumn = b.versionColumn;
-        if (b.upsertKeys != null) for (String k : b.upsertKeys) keys.add(k.toLowerCase());
+        if (b.upsertKeys != null) for (String k : b.upsertKeys) keys.add(k.toLowerCase(java.util.Locale.ROOT));
     }
 
     @Override public String datasetName() { return dataset != null ? dataset : table; }
@@ -91,7 +91,7 @@ public class JdbcSink implements Sink {
 
     private String mysqlSql(List<String> cols) {
         List<String> upd = new ArrayList<>();
-        for (String c : cols) if (!keys.contains(c.toLowerCase()) && !c.equalsIgnoreCase(versionColumn)) upd.add(c);
+        for (String c : cols) if (!keys.contains(c.toLowerCase(java.util.Locale.ROOT)) && !c.equalsIgnoreCase(versionColumn)) upd.add(c);
         if (upd.isEmpty() && versionColumn == null) upd = Arrays.asList(cols.get(0)); // no-op update keeps the statement valid
         StringBuilder sb = new StringBuilder(insertHead(cols)).append(" ON DUPLICATE KEY UPDATE ");
         for (int i = 0; i < upd.size(); i++) {

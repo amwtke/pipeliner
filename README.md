@@ -4,6 +4,19 @@
 
 设计文档：[docs/pipelinegraph-design.md](docs/pipelinegraph-design.md)（描述已实现的 v1 的设计；运维以本文为准）。
 
+### 相对 0.1.0-SNAPSHOT 4032200 的不兼容变更
+
+升级前请逐条核对（细节见各自章节）：
+
+- **接口**：`ControlPlaneStore.savePendingChunks(..., long epoch)` 与 `setRoundIncomplete(roundId, epoch)`（返回 `boolean`）带 epoch 并按 round 级 fence 校验；`DataPlane.deadLetter(...)` 返回 `boolean`（真正移入死信才为 true）；`PipelinerEngine.signalGate` 返回 `boolean`（过时回调返回 false）；`SinkContext.batchId(chunk)` 取代旧的两参 / 三参 `batchId` 重载（格式 `<roundId>:<pipelineId>:<chunkId>@<attempt>`）；`GateContextImpl` 的 8 参构造器和 `ChunkEvent.runAttempt` 已删除。新增的接口方法（`maxMasterEpoch`、`reserveMasterEpoch`、`maxRoundSeq`、`pendingPurges` / `clearPendingPurges`、`DataPlane.nextRoundSeq(floor)`、`groupExists` 等）都有默认实现，旧的自定义实现仍可编译。
+- **存储结构**：MySQL 新增 `pg_master_epoch`、`pg_round_seq`、`pg_pending_purge` 三张表，`pg_gate_signal.signal_key` 变为 `VARCHAR(512)`，`round_id` / `gate_id` / `pipeline_id` 加宽（`init()` 自动 `ALTER`）；Redis 控制面新增 `pg:store:maxepoch`、`maxseq`、`pendingpurge`；数据面新增 `pg:{r}:keys`（key 注册表）。示例应用新增 MySQL 表 `ex_algo_request`（`FakeAlgoService` 的持久化请求）。
+- **标识符与参数校验**：图名 ≤ 64、gate id / pipeline id ≤ 128（含自动 `barrier:<dataset>`），pipeline id 和输出口名不得含 `:`；`parallelism` ≥ 1；`max-attempts` ≥ 1；`RuntimeConfig` 各项在引擎启动时校验。run 的 attempt 必须 < 1000：master 在 `rerunFrom` / `retryRun` / 本地 run 重新分配时拒绝让 attempt 达到 1000。
+- **行值**：`Row.set/of` 规范化为统一类型（整数 → `Long`，浮点 → `BigDecimal`，时间 → ISO 字符串），`byte[]`、`UUID` 等不支持的类型直接抛 `IllegalArgumentException`。
+- **规划**：`pipeliner.plan.force-mode` 覆盖所有 `.mode()` 提示；类型形式（`row(Class)`）且读取别的 dataset 的 runner 必须声明 `public static Collection<String> readDatasets()`（不要再实现 `ReadsDatasets`，同一个类不可能同时有同签名的实例方法和静态方法），否则 plan 失败。
+- **闸门与管理操作**：`externalCountOf` 按当前 attempt 去重计数，过时回调被拒；`openGate` 默认要求所有 after-run 已 SUCCEEDED，需 `force=true` 才能越过；`retry` / `skip` 在多种状态下被拒绝（见「管理操作规则」）；管理命令带 id 和截止时间，超时即撤回；leader 对 plan hash 不同的 round 拒绝操作。
+- **认证**：`AdminSecurityFilter`（servlet 过滤器）改为 `AdminSecurityInterceptor`（Spring MVC 拦截器），包名不变；不再有过滤器 Bean。
+- **运行时**：EXTERNAL 模式下 leader 由本地 `pg-lease-keeper` 线程保活（见「外部触发 master 推进」）；`RuntimeConfig.stopJoinMillis`（默认 10000）限制 `stop()` 等待 worker / 本地 run 线程的时间；master 能识别数据面丢失（含只丢了消费组）。
+
 ## 模块一览
 
 | 模块 | 职责 |
@@ -236,17 +249,29 @@ runner 有两种声明方式：
 | POST | `/pg/runs/{roundId}/{runId}/retry` | 重试 run |
 | POST | `/pg/runs/{roundId}/{runId}/rerun` | 从该 run 起重跑 |
 | POST | `/pg/runs/{roundId}/{runId}/skip` | 跳过死信 |
-| POST | `/pg/gates/{roundId}/{gateId}/signal` | 向 external 闸门发信号，body：`{"key","payload"}` |
-| POST | `/pg/gates/{roundId}/{gateId}/open` | 打开闸门；操作人取自认证身份（token 名），仅在认证关闭时才使用参数 `operator`（默认 `admin`） |
+| POST | `/pg/gates/{roundId}/{gateId}/signal` | 向 external 闸门发信号，body：`{"key","payload"}`；`key` 为 1..512 个字符，否则 400。key 带 `@<attempt>` 且低于对应 run 的当前 attempt 的是过时回调，被忽略（返回仍是 ok，只在 DEBUG 日志里留痕） |
+| POST | `/pg/gates/{roundId}/{gateId}/open` | 打开 CLOSED 闸门；默认要求所有 after-run 已 SUCCEEDED，参数 `force=true` 跳过该检查；未知闸门、非 CLOSED（已 OPEN / TIMEOUT / REJECTED）的闸门返回错误；操作人取自认证身份（token 名），仅在认证关闭时才使用参数 `operator`（默认 `admin`） |
 | GET | `/pg/graphs/{name}/plan.json` | 结构化执行计划（runs / pipelines / channels / gates），供界面使用 |
 | GET | `/pg/rounds?graph=&limit=20` | 最近的 round：活跃的在前，其余按创建时间倒序 |
 | GET | `/pg/cluster/workers` | 所有存活 pod：leader 标记、心跳年龄、各自持有的 pipeline 实例（来自心跳里的 `live` 字段） |
 | POST | `/pg/master/tick` | 执行一次 master 推进（外部触发，ADMIN token），返回 `TickResult`，见「外部触发 master 推进」 |
 | GET | `/pg/cluster` | 当前 pod 的 `podId`、`isLeader`、`liveInstances`（本 pod 上已实例化的 pipeline） |
 
+### 管理操作规则
+
+pause / resume / cancel / retry / rerun / skip / openGate 都写入 leader 的命令队列，由 leader 在 tick 里用自己的 epoch 执行（`PipelinerEngine` 上对应方法在 leader 执行完才返回，失败抛 `PipelinerException`，HTTP 返回错误消息）。规则：
+
+- **命令 id、截止时间、撤回**：每条命令带随机 `id` 和 `deadline = 提交时间 + admin-timeout-millis`。leader 每次只取出一条命令，取出前先确认自己仍是 leader（被取代 / 租约丢失时剩下的命令留在队列里给下一任，不会丢）；已过截止时间的命令不执行，结果记为 `expired`（`ok=false`）。客户端等待超时后先把命令从队列里**撤回**（撤回成功即保证没有被执行，错误消息写明 `withdrawn (not executed)`）；撤回失败说明 leader 已取走，再宽限等待 2 秒，仍无结果时报「outcome is unknown」，需先查 round 状态再重试。命令结果保存 10 分钟。
+- **未知 round** 是普通错误，不会让 leader 退位；leader 若发现自己已被更新的 epoch 取代（round 级 fence 失败），命令返回 `leader deposed ... retry` 并退位，队列里其余命令不受影响。
+- **plan hash 检查**：round 创建时的 plan hash 与 leader 上注册的同名图不一致（滚动发布中途）时，所有会改状态的命令（`rerunFrom`、`retryRun`、`skipDeadLetters`、`cancel`、`openGate`）直接拒绝，错误为「was created under a different plan version」，待发布完成后再操作。
+- **`retryRun` 的拒绝条件**：round 已 CANCELLED；round 已被压缩（用 `rerunFrom`）；run 的某个 in-gate 不是 OPEN（TIMEOUT / REJECTED 说明 run 是因闸门失败的，用 `rerunFrom` 重跑上游 run 或重新打开闸门）；run 不是 FAILED 时只记 WARN 并返回，不做任何事。CLUSTER run 先（带 fence）把当前 attempt 的死信放回通道，再做 store 迁移（FAILED→RUNNING 的 CAS，清掉 error 与 finishedAt、保留 startedAt）；中途失败时 run 仍是 FAILED，重新发出 retry 即可补完（空 DLQ 的 requeue 是空操作）。LOCAL / INLINE run 按新 attempt 整体重放。
+- **`skipDeadLetters` 的拒绝条件**：除上面各项外，LOCAL / INLINE run 不支持（用 `retryRun` / `rerunFrom`）；run 没有任何死信（`DEAD` 记录和当前 DLQ 都为 0）时拒绝。执行顺序：先把 journal 排空（迟到的 DEAD 事件不会复活被跳过的 chunk），再在 store 里把 DEAD 记为 SKIPPED、round 标记 incomplete（带 epoch 的 `setRoundIncomplete`，被取代的 leader 写不进去），再恢复 run / pipeline，最后清 DLQ。
+- **`rerunFrom`**：一次原子的 `resetRuns`；复位的 run 的 attempt 加 1，加 1 后达到 1000 的拒绝（先于任何修改），CANCELLED 的 round 拒绝。
+- **`openGate`**：见上表；`force=true` 只跳过 after-run 检查，仍要求闸门为 CLOSED。
+
 ### 可视化界面
 
-每个 pod 都在 `http://<pod>:<port>/pg-ui/` 提供内置界面（纯静态页面，无构建、无外部依赖，内网可用；不经过 `/pg/*` 的认证过滤器）。
+每个 pod 都在 `http://<pod>:<port>/pg-ui/` 提供内置界面（纯静态页面，无构建、无外部依赖，内网可用；不经过 `/pg/*` 的认证拦截器）。
 
 - 展示：选定图的拓扑（stage 列 → run 框 → pipeline 节点，stream 边标通道长度、达到高水位变红，闸门为菱形，自动 barrier 标 `barrier:<dataset>`），以及所选 round 的实时状态：round 摘要（状态、当前阶段、用时、incomplete/compacted）、各 run / pipeline / 闸门状态、source 的 `done/total splits`、行数、DLQ、各 pod 持有的线程数。不选 round 时只显示拓扑。支持拖动平移、滚轮缩放、“适应”。
 - 点击 pipeline / run / 闸门打开侧栏：详情、失败 chunk，以及 重试 / 从此处重跑 / 跳过死信 / 打开闸门、暂停 / 恢复 / 取消（执行前有确认框，失败时显示服务端返回的错误）。
@@ -257,7 +282,7 @@ runner 有两种声明方式：
 
 ### 认证与授权
 
-`/pg/*` 由一个 servlet 过滤器保护（`io.github.amwtke.pipeliner.spring.security`，不依赖 Spring Security），默认开启。
+`/pg/*` 由 Spring MVC 拦截器 `AdminSecurityInterceptor` 保护（`io.github.amwtke.pipeliner.spring.security`，不依赖 Spring Security；旧版本的 servlet 过滤器 `AdminSecurityFilter` 已删除），默认开启。
 
 - **角色**：`ADMIN` 可调用所有接口；`VIEWER` 只能读。
 - **规则**：`GET`/`HEAD` 默认免 token；所有变更方法（POST/PUT/PATCH/DELETE）仅 `ADMIN`。`read-requires-token: true` 时读也需要 `VIEWER` 或 `ADMIN`。
@@ -269,7 +294,7 @@ runner 有两种声明方式：
 pipeliner:
   admin:
     security:
-      enabled: true            # 默认 true；false 则完全不注册过滤器（此时 open 的 operator 取自参数）
+      enabled: true            # 默认 true；false 则完全不注册拦截器（此时 open 的 operator 取自参数）
       read-requires-token: false
       header: Authorization
       tokens:
@@ -286,7 +311,7 @@ curl -H "X-PG-Token: $PG_ADMIN_TOKEN" -H 'content-type: application/json' \
 **审计日志**：每次变更调用写一行 INFO，logger `pipeliner.audit`：
 `principal=ops method=POST path=/pg/rounds/r1/pause round=r1 run/gate=- status=200`（不会记录 token）。
 
-**注意**：示例应用的 dev token（`dev-admin-token-change-me`）仅供本地，务必用 `PG_ADMIN_TOKEN`/`PG_VIEWER_TOKEN` 覆盖；e2e/chaos 脚本读取 `PG_ADMIN_TOKEN` 并在每次调用里带上。示例的 `/demo/*` 接口仅用于演示，**不经过**此过滤器、无认证。Actuator 端点同样不在保护范围内，请用 `management.server.port` 单独监听内网端口或由平台层保护。
+**注意**：示例应用的 dev token（`dev-admin-token-change-me`）仅供本地，务必用 `PG_ADMIN_TOKEN`/`PG_VIEWER_TOKEN` 覆盖；e2e/chaos 脚本读取 `PG_ADMIN_TOKEN` 并在每次调用里带上。示例的 `/demo/*` 接口仅用于演示，**不经过**此拦截器、无认证。Actuator 端点同样不在保护范围内，请用 `management.server.port` 单独监听内网端口或由平台层保护。
 
 示例应用另有 `POST /demo/seed`、`POST /demo/rounds?planVersion=`、`GET /demo/checksum?planVersion=`。
 
@@ -332,7 +357,7 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 
 **Fencing**：master 每次 tick 先 `store.fenceRound` 再 `plane.fenceRound(roundId, epoch)`（`pg:{r}:fence` 只增不减），任一返回 false 即退位。master 对数据面的所有写（期望并行度、本地 run 分配、入队 split、删 key、trim journal、paused 标志、requeue/clear DLQ、建 group、移出 active）都在 Lua 里先校验 fence ≤ epoch，否则抛 `StaleEpochException` 且不产生任何变更，所以冻结后恢复的僵尸 master 什么也改不了。管理命令也在 master tick 内用同一 epoch 执行。`pg:{r}:fence` 没有 TTL，只随 round 数据一起被 `purgeRoundData` 删除；`pg:{r}:keys` 是该 round 的 key 注册表（Lua 在建 key 时登记），purge 按它删除而不扫描整个 keyspace。Worker 的 commit / deadLetter 不需要 fence，但 commit.lua / dead_letter.lua 会校验 pending 条目仍属于提交的 consumer（被别的 pod autoclaim 后原 consumer 得到 CONFLICT / 不入 DLQ），renew 同理只续自己持有的条目。每个 tick master 还按 round 状态校正 `paused` 标志；`pg:throttle` 带 TTL（`max(3×tick, 5s)`），超限期间每 tick 续期。
 
-**版本化 sink**：每个 round 提交时拿到全局单调的 `RoundRecord.seq`（`plane.nextRoundSeq(store.maxRoundSeq())`：`pg:roundseq` 先被抬到存储里已有的最大 seq 再 `INCR`，所以 Redis 数据丢失后新 round 的版本仍高于 sink 表里已有的版本；MySQL 控制面的 `maxRoundSeq` 是 `MAX(pg_round.seq)`，Redis 控制面是 `pg:store:maxseq`；retention 删光所有 round 后这个下限随之消失），`SinkContext.writeVersion() = seq × 1000 + attempt`（`RunContext` 同样提供 `attempt()` / `writeVersion()`）。`JdbcSinks.xxx(...).versionColumn("pg_version")` 会在每一行写入该列：MySQL upsert 变为条件更新（`c = IF(VALUES(ver) >= ver, VALUES(c), c)`，版本列最后赋值），旧 attempt / 旧 round 的僵尸写入覆盖不了新结果；ClickHouse 需把表声明为 `ReplacingMergeTree(pg_version)`，`FINAL` 读取保留最高版本。校验和只覆盖业务列。外部系统（如算法回调）请按 batch id 幂等，batch id 必须全局唯一，由框架签发：sink 里调用 `ctx.batchId(chunk)`（`SinkContext.batchId(Chunk)`），格式 `<roundId>:<pipelineId>:<chunkId>@<attempt>`（`ChunkIds.batchId(roundId, pipelineId, chunkId, attempt)`）。chunk id 每个 round、每个源 pipeline 都按同样规则推出（`S0003`），只用 `chunkId@attempt` 的话，按 batch id 去重的外部服务会把下个月的 round、或同一 round 里另一个 pipeline 的 chunk 当成重复请求，所以 round id 和 pipeline id 都在 batch id 里（旧的两参、三参 `batchId` 重载已删除；pipeline id 和输出口名不允许含 `:`，图构建时会报错）。signal 按 round + 闸门存储，key 最长 512 个字符：`engine.signalGate` 对更长（或空）的 key 抛 `IllegalArgumentException`，不会静默截断（MySQL 的 `pg_gate_signal.signal_key` 为 `VARCHAR(512)`，`init()` 会把旧的 `VARCHAR(190)` 自动 `ALTER` 加宽；主键 64+64+512 个字符 × 4 字节 = 2560 字节，低于 InnoDB 的 3072）。`Gates.externalCountOf(p)` 的条件：当前 attempt 里按 chunk id **去重**后的 signal 数 ≥ 该 pipeline「真正调用过 sink 的 DONE chunk 数」（`GateContext.sinkChunkCount`：sink 写出行数 > 0 的 chunk；输出为空的 chunk 不会调用 sink，也就不会回调）。signal key 无 `@` 的算任意 attempt，以 `@<当前 attempt>` 结尾的算当前，旧格式（`chunk@attempt`、`round:chunk@attempt`）与新格式对应同一 chunk 时只算一次；`GateContext.runAttemptOf(pipelineId)` 提供当前 attempt。
+**版本化 sink**：每个 round 提交时拿到全局单调的 `RoundRecord.seq`（`plane.nextRoundSeq(store.maxRoundSeq())`：`pg:roundseq` 先被抬到存储里已有的最大 seq 再 `INCR`，所以 Redis 数据丢失后新 round 的版本仍高于 sink 表里已有的版本；`maxRoundSeq()` 返回「持久化的最大已签发 seq」与现存 round 最大 seq 中较大者：MySQL 是单行表 `pg_round_seq`（建 round 的同一事务里 `UPDATE ... WHERE max_seq < seq`，`init()` 从现有 round 回填）与 `MAX(pg_round.seq)`，Redis 控制面是 `pg:store:maxseq`（建 round 的脚本里抬高，`init()` 回填）；所以 retention 删光所有 round 后下限依然保留，新 round 的版本不会回落到 sink 表里已有的版本之下），`SinkContext.writeVersion() = seq × 1000 + attempt`（`RunContext` 同样提供 `attempt()` / `writeVersion()`）。`JdbcSinks.xxx(...).versionColumn("pg_version")` 会在每一行写入该列：MySQL upsert 变为条件更新（`c = IF(VALUES(ver) >= ver, VALUES(c), c)`，版本列最后赋值），旧 attempt / 旧 round 的僵尸写入覆盖不了新结果；ClickHouse 需把表声明为 `ReplacingMergeTree(pg_version)`，`FINAL` 读取保留最高版本。校验和只覆盖业务列。外部系统（如算法回调）请按 batch id 幂等，batch id 必须全局唯一，由框架签发：sink 里调用 `ctx.batchId(chunk)`（`SinkContext.batchId(Chunk)`），格式 `<roundId>:<pipelineId>:<chunkId>@<attempt>`（`ChunkIds.batchId(roundId, pipelineId, chunkId, attempt)`）。chunk id 每个 round、每个源 pipeline 都按同样规则推出（`S0003`），只用 `chunkId@attempt` 的话，按 batch id 去重的外部服务会把下个月的 round、或同一 round 里另一个 pipeline 的 chunk 当成重复请求，所以 round id 和 pipeline id 都在 batch id 里（旧的两参、三参 `batchId` 重载已删除；pipeline id 和输出口名不允许含 `:`，图构建时会报错）。signal 按 round + 闸门存储，key 最长 512 个字符：`engine.signalGate` 对更长（或空）的 key 抛 `IllegalArgumentException`，不会静默截断（MySQL 的 `pg_gate_signal.signal_key` 为 `VARCHAR(512)`，`init()` 会把旧的 `VARCHAR(190)` 自动 `ALTER` 加宽；主键 64+64+512 个字符 × 4 字节 = 2560 字节，低于 InnoDB 的 3072）。`Gates.externalCountOf(p)` 的条件：当前 attempt 里按 chunk id **去重**后的 signal 数 ≥ 该 pipeline「真正调用过 sink 的 DONE chunk 数」（`GateContext.sinkChunkCount`：sink 写出行数 > 0 的 chunk；输出为空的 chunk 不会调用 sink，也就不会回调）。signal key 无 `@` 的算任意 attempt，以 `@<当前 attempt>` 结尾的算当前，旧格式（`chunk@attempt`、`round:chunk@attempt`）与新格式对应同一 chunk 时只算一次；`GateContext.runAttemptOf(pipelineId)` 提供当前 attempt。
 
 **使用方的约束（正确性依赖这些假设）**：
 - Runner 与 `enumerate` 必须确定性（同样输入、同样输出，同样的 chunk 切分）。
@@ -357,7 +382,8 @@ e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external
 | `pipeliner.retention.batch` | `100` | 每轮压缩 / 删除的 round 上限 |
 
 - **压缩**（`ControlPlaneStore.compactRound`）：只处理终态（SUCCEEDED / FAILED / CANCELLED）且 `finishedAt` 早于截止时间、尚未压缩的 round。先把每个 pipeline 的汇总（各状态 chunk 数、rowsIn、rowsOut）写到 pipeline 记录上，再删除该 round 全部 chunk 记录和计数器，并标记 round 已压缩。压缩后 `GET /pg/rounds/{id}` 的 chunk 统计仍来自汇总，`/chunks` 列表为空。
-- **删除**（`purgeRounds`）：删除 round、run、gate、signal、pipeline、chunk、计数器、bizKey 索引和排序索引，之后同一个 bizKey 可以重新提交。数据面里残留的 key（失败 round 为了 retry 保留的通道 / DLQ）和 `pg:workers` 里超过 `10 × worker-dead-millis` 的心跳成员也一并清理。
+- **删除**（`purgeRounds`）：删除 round、run、gate、signal、pipeline、chunk、计数器、bizKey 索引和排序索引，之后同一个 bizKey 可以重新提交。数据面里残留的 key（失败 round 为了 retry 保留的通道 / DLQ）和 `pg:workers` 里超过 `10 × worker-dead-millis` 的心跳成员也一并清理。数据面 key 按 round 的 key 注册表 `pg:{r}:keys` 删除；`purgeRounds` 在删除控制面记录的**同一个原子步骤**里把 round id 写入存储侧的持久待清理集合（MySQL 表 `pg_pending_purge`，Redis `pg:store:pendingpurge`），保留任务每轮读出该集合、调用 `purgeRoundData`，成功后才 `clearPendingPurges`；所以数据面清理失败、leader 切换或重启都不会让 key 泄漏（接口方法 `pendingPurges(max)` / `clearPendingPurges(ids)`，默认空实现）。
+- **注册表之前的旧 round**：没有 `pg:{r}:keys` 的 round（升级前创建的）按注册表删不到它的通道 / split / DLQ。`purgeRoundData` 发现某个 round 没有注册表时，把它记入 `pg:purge:legacy`，再做**有预算、可续跑**的增量 `SCAN cursor MATCH pg:{<round>}:*`：每次调用最多花约 50 ms（外加一次 `COUNT 500` 的 SCAN 步），游标保存在 `pg:purge:legacycur`（任何 pod、重启后都从上次位置继续），扫完才移出待办；保留任务每轮即使没有新删除的 round 也调用一次 `purgeRoundData`，让待办继续推进。整个 keyspace 上的扫描只发生在没有注册表的 round 上，不会拖长 tick。
 - **与并发重跑的安全性**：终态判断与删除是同一个原子步骤——MySQL 是单事务内对 `pg_round` 行 `SELECT ... FOR UPDATE`，Redis 是单个 Lua（`UNLINK` 删除）。`rerunFrom` / `retryRun` 通过 `resetRuns` 把 round 改回 RUNNING 后，保留任务看到的就是非终态，不会删除；反过来先删除的话，重跑会得到"round 不存在"。压缩过的 round 被重跑时，被重置的 pipeline 的汇总同时清除，round 的压缩标记也清除，重新结束后会再次压缩。
 - MySQL 会在 `init()` 里幂等地加列（`pg_round.compacted`、`pg_pipeline.sum_*`）和索引 `(status, finished_at)`；Redis 会为已有的终态 round 补建 `pg:store:finished` / `pg:store:uncompacted` 索引。
 - **标识符长度与 round id**：round id 为 `<graph>-<yyyyMMdd-HHmmss>-<12 位 hex>`（48 位随机），图名最长 64、gate id（含自动 `barrier:<dataset>`）和 pipeline id 最长 128（`PipelineGraph.build()` / Planner 校验）。MySQL 列按此定长（`round_id` 96、`gate_id` / `pipeline_id` 128，`pg_gate_signal` 主键 736 字符 × 4 = 2944 字节 ≤ 3072），`init()` 会把旧表的窄列自动 `ALTER` 加宽。`createRound` 遇到已存在的 round id 抛 `DuplicateRoundIdException`（Redis 脚本和 MySQL 主键冲突都会检测），`submit()` 换新 id 重试。Redis 控制面的一次性回填（终态索引、按图索引 `pg:store:graph:<graph>`、chunk 索引、最大 epoch / seq）由 `pg:store:schema` 标记保证只跑一次；`init()` 由 `DefaultPipelinerEngine.start()` 调用一次。`loadRoundRecord` / `loadRoundState` 不带 `planJson`（只有 `loadRound` 带）。
@@ -403,7 +429,7 @@ curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
 
 ## 验证结果（v1）
 
-- 222 个单元 / 集成测试通过。
+- 全量 `mvn -o verify` 通过，504 个测试。
 - e2e：R2 期间 kill -9 一个 worker 和 leader，在 Redis（默认）与 MySQL（`STORE_PROFILE=mysql-store`）两种控制面上均通过，checksum 一致（600 个 material 时 BIG 19200 行 / FINE 28800 行）。
 - 全集群 kill -9 后重启，续跑到相同 checksum（`restart-resume.sh`，默认 Redis 控制面）。
 - 背压：通道长度被限制在高水位（默认 64；设为 6/3 时为 6）；core-grade 自动扩容 2→4；观察到上游 BUSY 等待。
@@ -413,10 +439,10 @@ curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
 
 - 不支持 Redis Cluster，只支持单机 Redis（Lua 脚本访问了未在 KEYS 中声明的 key）。
 - cap-alloc 这类 LOCAL 模式的 run 只在单个 pod 上执行。
-- 管理命令被 leader 取出后、执行前 leader 宕机，命令会丢失（客户端超时，重试即可）。
+- 管理命令被 leader 取出后、执行中 leader 宕机，该条命令的结果未知（客户端等到宽限期后报「outcome is unknown」，先查 round 状态再重试）；leader 每次只取一条命令并在取出前确认仍是 leader，其余命令不会因退位而丢失。
 - MySQL fencing 在读取 round epoch 的子查询与新 master 的 `fenceRound` 之间有极小窗口。
 - ClickHouse sink 的幂等依赖 ReplacingMergeTree 与 `FINAL` 读取。
 - `externalCountOf` 期望的回调数来自 chunk 记录里的 sink 行数（MySQL 列 `pg_chunk.sink_rows`、Redis 计数器 `_sink`）：行数为 0 的 split / chunk 不调用 sink，也不计入期望。升级前已落库的 chunk 记录没有该数值（按 0 计），跨升级进行中的 round 其 `externalCountOf` 闸门会少算，需要时用 `openGate` 或 `rerunFrom`。
-- Redis 数据面丢失（如被 FLUSHALL）时，运行中的 CLUSTER 源 pipeline（split 队列和 split 索引都没了、chunk 记录仍为 PENDING）会被 master 判为失败，错误为「data plane lost ... rerunFrom required」并打 ERROR 日志；需用 `rerunFrom` 重跑。只丢了消费组、队列还在的情形不会被识别。
+- Redis 数据面丢失（如被 FLUSHALL）时，运行中的 CLUSTER 源 pipeline（split 队列和 split 索引都没了、chunk 记录仍为 PENDING）会被 master 判为失败，错误为「data plane lost ... rerunFrom required」并打 ERROR 日志；需用 `rerunFrom` 重跑。另外，RUNNING 的 CLUSTER pipeline 的任一输入 stream 缺少消费组（`DataPlane.groupExists`，Redis 用 `XINFO GROUPS`，stream 不存在或 `NOGROUP` 都算缺失）也会按同样的错误失败：组是在 pipeline 变为 RUNNING 之前由 master 建好的，之后缺失只可能是数据面被清或被人为销毁。
 - 尚无 Kafka source、HTTP sink。
 - 未实现按 chunk 批量拉取（`pullBatch`）。

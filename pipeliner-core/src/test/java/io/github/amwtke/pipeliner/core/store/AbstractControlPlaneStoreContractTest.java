@@ -191,7 +191,7 @@ public abstract class AbstractControlPlaneStoreContractTest {
         r = store.loadRoundRecord(rid);
         assertEquals("oops", r.getError());
         assertNotNull(r.getFinishedAt());
-        store.setRoundIncomplete(rid);
+        assertTrue(store.setRoundIncomplete(rid, 7));
         assertTrue(store.loadRoundRecord(rid).isIncomplete());
     }
 
@@ -800,6 +800,47 @@ public abstract class AbstractControlPlaneStoreContractTest {
     }
 
     @Test
+    void setRoundIncompleteIsFencedByTheRoundEpoch() {
+        String rid = mk("incfence");
+        assertTrue(store.fenceRound(rid, 9));
+        assertFalse(store.setRoundIncomplete(rid, 8), "a deposed master (lower epoch) is rejected");
+        assertFalse(store.loadRoundRecord(rid).isIncomplete());
+        assertEquals(9, store.loadRoundRecord(rid).getMasterEpoch());
+        assertTrue(store.setRoundIncomplete(rid, 9));
+        assertTrue(store.loadRoundRecord(rid).isIncomplete());
+        assertFalse(store.setRoundIncomplete(rid("no-such-round"), 9), "a missing round");
+    }
+
+    @Test
+    void maxRoundSeqSurvivesRetentionPurgingEveryRound() {
+        long base = store.maxRoundSeq();
+        String rid = rid("seqpurge");
+        RoundRecord a = newRound(rid, "biz-seqpurge");
+        a.setSeq(base + 11);
+        store.createRound(a, Collections.singletonList(run(rid, "run1", 0)), Collections.<GateRecord>emptyList(), Collections.singletonList(pl(rid, "p1", "run1")));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.SUCCEEDED, null, 1));
+        assertTrue(store.purgeRounds(FUTURE, 1000).contains(rid));
+        assertNull(store.loadRoundRecord(rid));
+        assertTrue(store.maxRoundSeq() >= base + 11, "the highest issued seq is persisted, not derived from the rounds that exist: " + store.maxRoundSeq());
+    }
+
+    @Test
+    void purgedRoundsAreTrackedAsPendingUntilCleared() {
+        String rid = mk("pendpurge");
+        assertTrue(store.casRoundStatus(rid, RoundStatus.CREATED, RoundStatus.RUNNING, null, 1));
+        assertTrue(store.casRoundStatus(rid, RoundStatus.RUNNING, RoundStatus.SUCCEEDED, null, 1));
+        assertFalse(store.pendingPurges(10000).contains(rid));
+        assertTrue(store.purgeRounds(FUTURE, 1000).contains(rid));
+        assertTrue(store.pendingPurges(10000).contains(rid), "recorded by purgeRounds itself");
+        assertTrue(store.pendingPurges(10000).contains(rid), "reading does not remove it");
+        store.clearPendingPurges(Collections.singletonList(rid));
+        assertFalse(store.pendingPurges(10000).contains(rid));
+        store.clearPendingPurges(Collections.singletonList(rid));   // idempotent
+        assertEquals(0, store.pendingPurges(0).size());
+    }
+
+    @Test
     void maxRoundSeqTracksCreatedRounds() {
         long base = store.maxRoundSeq();
         RoundRecord a = newRound(rid("seqa"), "biz-seqa");
@@ -877,7 +918,7 @@ public abstract class AbstractControlPlaneStoreContractTest {
         store.setPipelineEnumDone(rid, "p1", true, 5);
         store.applyChunkEvents(rid, Collections.singletonList(ev(rid, "DONE", "p1", "S0000", "run1", "split", 3, m("e1", 3))), "1-0", 5);
         store.saveGateSignal(rid, "gate1", "k", "v");
-        store.setRoundIncomplete(rid);
+        assertTrue(store.setRoundIncomplete(rid, 5));
         assertEquals(5, store.loadRoundRecord(rid).getMasterEpoch());
 
         // run1 passes, run2 is rejected: the whole reset (including run1, the gate and the round epoch bump) is rolled back
@@ -909,7 +950,7 @@ public abstract class AbstractControlPlaneStoreContractTest {
     @Test
     void resetRunsClearsTheIncompleteFlag() {
         String rid = mk("resetincomplete");
-        store.setRoundIncomplete(rid);
+        assertTrue(store.setRoundIncomplete(rid, 1));
         assertTrue(store.loadRoundRecord(rid).isIncomplete());
         store.resetRuns(rid, Collections.singletonList("run1"), Collections.<String>emptyList(), 2);
         assertFalse(store.loadRoundRecord(rid).isIncomplete());

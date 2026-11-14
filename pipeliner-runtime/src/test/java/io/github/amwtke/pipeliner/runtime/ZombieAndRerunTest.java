@@ -111,6 +111,7 @@ class ZombieAndRerunTest {
             String queue = Keys.splitQueue(round, "p", 0);
             assertTrue(waitFor(() -> h.plane.streamLength(queue) == 3 && h.store.countChunks(round, "p", ChunkStatus.PENDING) == 3, 10000));
             h.plane.deleteKeys(round, Collections.singletonList(queue), h.plane.currentEpoch());   // queue empty, but nothing was processed
+            h.plane.ensureGroup(round, queue, h.plane.currentEpoch());   // an empty queue WITH its consumer group (without the group the master reports a lost data plane)
             Thread.sleep(600);
             assertEquals(0, h.plane.streamLength(queue));
             assertEquals(3, h.store.countChunks(round, "p", ChunkStatus.PENDING));

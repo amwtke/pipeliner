@@ -74,7 +74,7 @@ public class Seeder {
         List<Object[]> mat = new ArrayList<>();
         List<String> ids = new ArrayList<>();
         for (int i = 0; i < n; i++) {
-            String id = String.format("M%05d", i + 1);
+            String id = String.format(java.util.Locale.ROOT, "M%05d", i + 1);
             ids.add(id);
             int eol = rnd.nextInt(10) == 0 ? 8 + rnd.nextInt(8) : 99;
             mat.add(new Object[]{id, "G" + (i / 3), i < nBig ? "BIG" : "FINE", eol});

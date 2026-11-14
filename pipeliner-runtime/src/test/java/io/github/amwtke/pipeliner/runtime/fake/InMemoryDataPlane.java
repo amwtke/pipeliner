@@ -173,6 +173,9 @@ public class InMemoryDataPlane implements DataPlane {
         return true;
     }
 
+    @Override public synchronized boolean groupExists(String key) { Stream s = streams.get(key); return s != null && s.group; }
+    /** Test hook: destroys the consumer group but keeps the stream and its entries (XGROUP DESTROY). */
+    public synchronized void destroyGroup(String key) { Stream s = streams.get(key); if (s != null) s.group = false; }
     @Override public synchronized long streamLength(String key) { Stream s = streams.get(key); return s == null ? 0 : s.entries.size(); }
 
     @Override public List<StreamEntry> read(String consumer, List<String> keys, int count, long block) {

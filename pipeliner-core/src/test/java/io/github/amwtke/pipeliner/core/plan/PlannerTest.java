@@ -336,6 +336,19 @@ class PlannerTest {
         assertTrue(e.getMessage().contains("static"), e.getMessage());
     }
 
+    /** Declares the datasets it reads statically (it never implements ReadsDatasets: a class cannot have both). */
+    public static class StaticDimRunner extends RowR {
+        public static java.util.Collection<String> readDatasets() { return Collections.singletonList("dim"); }
+    }
+
+    @Test void typeBasedRunnerWithAStaticReadDatasetsPlansABarrier() {
+        ExecutionPlan plan = runnerReads(p -> p.source(new Src(null)).row(StaticDimRunner.class)).plan();
+        assertEquals(2, plan.getRuns().size());
+        assertTrue(plan.gate("barrier:dim").isAuto());
+        assertEquals(Arrays.asList("w"), plan.gate("barrier:dim").getAfterPipelines());
+        assertEquals(Arrays.asList("r"), plan.gate("barrier:dim").getBeforePipelines());
+    }
+
     @Test void selfReadWriteWithSecondReaderIsNotOnBothSidesOfItsGate() {
         PipelineGraph g = PipelineGraph.builder("g")
                 .pipeline("p1", p -> p.source(new Src("d")).sink(new Snk("d")))

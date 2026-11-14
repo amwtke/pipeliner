@@ -252,6 +252,27 @@ class MasterRound2Test {
         assertTrue(plane.purgedRoundData.contains(rid), "retried on the next pass");
     }
 
+    @Test void pendingPurgeSurvivesAMasterRestart() throws Exception {
+        InMemoryControlPlaneStore store = new InMemoryControlPlaneStore();
+        AtomicInteger fails = new AtomicInteger(1);
+        InMemoryDataPlane plane = new InMemoryDataPlane() {
+            @Override public synchronized int purgeRoundData(Collection<String> ids) {
+                if (fails.getAndDecrement() > 0) throw new IllegalStateException("scan timeout");
+                return super.purgeRoundData(ids);
+            }
+        };
+        RuntimeConfig c = cfg("j").retentionEnabled(true).chunkRetentionMillis(Long.MAX_VALUE / 4).roundRetentionMillis(0).retentionIntervalMillis(1).retentionBatch(5).build();
+        String rid = finishedRound(store, 1);
+        Thread.sleep(5);
+        assertTrue(new RetentionJanitor(services(c, store, plane, new RecordingMetrics()), () -> true).runIfDue(System.currentTimeMillis()));
+        assertTrue(store.pendingPurges(100).contains(rid), "the id is kept in the store, not in the janitor");
+        Thread.sleep(5);
+        // a different janitor instance (new leader / restarted pod) finishes the job
+        assertTrue(new RetentionJanitor(services(c, store, plane, new RecordingMetrics()), () -> true).runIfDue(System.currentTimeMillis()));
+        assertTrue(plane.purgedRoundData.contains(rid));
+        assertFalse(store.pendingPurges(100).contains(rid), "cleared after the data plane purge succeeded");
+    }
+
     @Test void onlyReallyCompactedRoundsAreCountedAndRefusedOnesAreNotRepeated() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         InMemoryControlPlaneStore store = new InMemoryControlPlaneStore() {
