@@ -5,6 +5,10 @@
 #      A_DELTA=7 A_BIG=20 A_FINE=20 plus everything chaos.sh takes (PODS MATERIALS STORE_PROFILE SEED SKIP_BUILD TIMEOUT_SEC OUT ...).
 # Exit status is non-zero on any violation. All pods are stopped at the end.
 set -uo pipefail
+if [ "${MASTER_TICK:-local}" = external ]; then
+  echo "$(basename "$0"): MASTER_TICK=external is not supported (nothing would tick the pods; rounds would stay CREATED). Unset MASTER_TICK; only e2e.sh drives external mode." >&2
+  exit 2
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$ROOT/.." && pwd)"
@@ -14,8 +18,8 @@ export OUT="${OUT:-$ROOT/chaos-out/admin-$(date +%Y%m%d-%H%M%S)-${STORE_PROFILE:
 export PG_ADMIN_TOKEN="${PG_ADMIN_TOKEN:-dev-admin-token-change-me}"   # sent on every /pg call; pods read it via application.yml
 mkdir -p "$OUT/pods"
 if [ -z "${SKIP_BUILD:-}" ]; then
-  echo "== building example (framework jars are taken from ~/.m2, not rebuilt)"
-  (cd "$REPO" && mvn -o -q -DskipTests -pl pipeliner-example package) || { echo "build failed" >&2; exit 2; }
+  echo "== building example and the framework modules of this tree (-am; never install)"
+  (cd "$REPO" && mvn -o -q -DskipTests -pl pipeliner-example -am package) || { echo "build failed" >&2; exit 2; }
 fi
 JAR="$(ls "$ROOT"/target/pipeliner-example-*.jar | grep -v original | head -1)"
 cp "$JAR" "$OUT/pipeliner-example.jar"   # private copy: a concurrent rebuild cannot change the pods under test

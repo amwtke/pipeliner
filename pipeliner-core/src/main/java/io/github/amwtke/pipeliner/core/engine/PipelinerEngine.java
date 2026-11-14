@@ -40,6 +40,10 @@ public interface PipelinerEngine {
     List<ChunkRecord> chunks(ChunkQuery q);
     /** "e1".., "split:&lt;p&gt;", "dlq:&lt;p&gt;" to XLEN for running runs. */
     Map<String, Long> channelLengths(String roundId);
+    /** Same as {@link #channelLengths(String)} for an already loaded view (saves a second loadRound). */
+    default Map<String, Long> channelLengths(io.github.amwtke.pipeliner.core.store.RoundView view) {
+        return view == null ? new java.util.LinkedHashMap<>() : channelLengths(view.getRound().getRoundId());
+    }
     RoundStatus awaitRound(String roundId, long timeoutMillis) throws InterruptedException;
     /** Pipelines currently instantiated (runner/source/sink resolved and opened) on this pod. */
     List<LiveInstance> liveInstances();

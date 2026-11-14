@@ -84,4 +84,16 @@ class PipelinerPropertiesTest {
             assertEquals(5, c.getRetentionBatch());
         });
     }
+
+    @Test
+    void runtimeKeysShadowedByDedicatedPropertiesFailFast() {
+        for (String bad : new String[] {"pipeliner.runtime.master-enabled=false", "pipeliner.runtime.worker-enabled=false", "pipeliner.runtime.pod-id=x",
+                "pipeliner.runtime.retention-enabled=false", "pipeliner.runtime.retention-batch=5", "pipeliner.runtime.plan-options.inline-max-rows=7"}) {
+            runner.withPropertyValues(bad).run(ctx -> {
+                IllegalStateException e = assertThrows(IllegalStateException.class, () -> ctx.getBean(PipelinerProperties.class).toRuntimeConfig(), bad);
+                assertTrue(e.getMessage().contains("pipeliner."), e.getMessage());
+            });
+        }
+        runner.withPropertyValues("pipeliner.runtime.tick-millis=500").run(ctx -> assertEquals(500, ctx.getBean(PipelinerProperties.class).toRuntimeConfig().getTickMillis()));
+    }
 }

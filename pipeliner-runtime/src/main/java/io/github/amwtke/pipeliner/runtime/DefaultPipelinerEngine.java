@@ -185,10 +185,12 @@ public class DefaultPipelinerEngine implements PipelinerEngine {
 
     @Override public List<ChunkRecord> chunks(ChunkQuery q) { return s.store.queryChunks(q); }
 
-    @Override public Map<String, Long> channelLengths(String roundId) {
+    @Override public Map<String, Long> channelLengths(String roundId) { return channelLengths(s.store.loadRound(roundId)); }
+
+    @Override public Map<String, Long> channelLengths(RoundView v) {
         Map<String, Long> out = new LinkedHashMap<>();
-        RoundView v = s.store.loadRound(roundId);
         if (v == null) return out;
+        String roundId = v.getRound().getRoundId();
         ExecutionPlan plan = s.registry.find(v.getRound().getGraphName());
         if (plan == null) return out;
         for (RunRecord r : v.getRuns()) {

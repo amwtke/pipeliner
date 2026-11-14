@@ -13,8 +13,15 @@ public final class TickResult {
     private final long durationMillis;
     private final boolean skipped;
     private final String skipReason;
+    private final String error;
 
     public TickResult(boolean leader, long epoch, int roundsTicked, int commandsExecuted, long durationMillis, boolean skipped, String skipReason) {
+        this(leader, epoch, roundsTicked, commandsExecuted, durationMillis, skipped, skipReason, null);
+    }
+
+    public TickResult(boolean leader, long epoch, int roundsTicked, int commandsExecuted, long durationMillis, boolean skipped, String skipReason,
+                      String error) {
+        this.error = error;
         this.leader = leader;
         this.epoch = epoch;
         this.roundsTicked = roundsTicked;
@@ -27,6 +34,14 @@ public final class TickResult {
     public static TickResult skipped(String reason, boolean leader, long epoch, long durationMillis) {
         return new TickResult(leader, epoch, 0, 0, durationMillis, true, reason);
     }
+
+    /** A tick that failed on an infrastructure error (Redis/store down); skipped, with {@link #getError()} set. */
+    public static TickResult failed(String error, long durationMillis) {
+        return new TickResult(false, 0, 0, 0, durationMillis, true, "error", error);
+    }
+
+    /** Null unless the tick failed with an infrastructure error. */
+    public String getError() { return error; }
 
     /** True when this pod holds the lease after the tick. */
     public boolean isLeader() { return leader; }

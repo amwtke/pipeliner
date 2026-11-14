@@ -15,15 +15,21 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Supplier;
 import javax.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import io.github.amwtke.pipeliner.spring.security.AdminSecurityFilter;
+import io.github.amwtke.pipeliner.spring.security.AdminSecurityInterceptor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import io.github.amwtke.pipeliner.api.PipelinerException;
+import org.springframework.beans.TypeMismatchException;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.bind.ServletRequestBindingException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -40,6 +46,7 @@ public class PipelinerAdminController {
     private static final Logger log = LoggerFactory.getLogger(PipelinerAdminController.class);
     private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER = new com.fasterxml.jackson.databind.ObjectMapper();
     private static final Logger AUDIT = LoggerFactory.getLogger("pipeliner.audit");
+    static final int MAX_CHUNK_LIMIT = 1000;
     private final PipelinerEngine engine;
     private final RuntimeConfig cfg;
     private final ControlPlaneStore store;
@@ -156,8 +163,10 @@ public class PipelinerAdminController {
     public List<ChunkRecord> chunks(@PathVariable String id, @RequestParam(required = false) String pipeline,
                                     @RequestParam(required = false) String status,
                                     @RequestParam(defaultValue = "100") int limit, @RequestParam(defaultValue = "0") int offset) {
+        if (limit < 1 || limit > MAX_CHUNK_LIMIT) throw new IllegalArgumentException("limit must be 1.." + MAX_CHUNK_LIMIT + ", got " + limit);
+        if (offset < 0) throw new IllegalArgumentException("offset must be >= 0, got " + offset);
         ChunkQuery q = ChunkQuery.builder().roundId(id).pipelineId(blankToNull(pipeline))
-                .status(blankToNull(status) == null ? null : ChunkStatus.valueOf(status.toUpperCase()))
+                .status(blankToNull(status) == null ? null : ChunkStatus.valueOf(status.trim().toUpperCase(Locale.ROOT)))
                 .limit(limit).offset(offset).build();
         return engine.chunks(q);
     }
@@ -171,7 +180,7 @@ public class PipelinerAdminController {
     public ResponseEntity<?> backpressure(@PathVariable String id) {
         RoundView v = engine.view(id);
         if (v == null) return notFound("round not found: " + id);
-        Map<String, Long> lengths = engine.channelLengths(id);
+        Map<String, Long> lengths = engine.channelLengths(v);   // reuse the loaded view: one loadRound per request
         ExecutionPlan plan = engine.plan(v.getRound().getGraphName());
         List<String> bottlenecks = new ArrayList<>();
         for (String pid : plan.getPipelines().keySet()) {
@@ -246,7 +255,7 @@ public class PipelinerAdminController {
                                     @RequestParam(defaultValue = "admin") String operator,
                                     @RequestParam(defaultValue = "false") boolean force, HttpServletRequest req) {
         // the authenticated principal wins; the query param is only honoured when no principal exists (security disabled)
-        Object principal = req.getAttribute(AdminSecurityFilter.PRINCIPAL_ATTR);
+        Object principal = req.getAttribute(AdminSecurityInterceptor.PRINCIPAL_ATTR);
         String op = principal != null ? principal.toString() : operator;
         return audited(req, roundId, "gate=" + gateId, () -> { if (force) engine.openGate(roundId, gateId, op, true); else engine.openGate(roundId, gateId, op); return ok(); });
     }
@@ -256,23 +265,26 @@ public class PipelinerAdminController {
         int status = 200;
         try {
             return call.get();
-        } catch (IllegalArgumentException e) {
-            status = 400;
-            throw e;
         } catch (RuntimeException e) {
-            status = 500;
+            status = statusOf(e).value();
             throw e;
         } finally {
-            Object p = req.getAttribute(AdminSecurityFilter.PRINCIPAL_ATTR);
+            Object p = req.getAttribute(AdminSecurityInterceptor.PRINCIPAL_ATTR);
             AUDIT.info("principal={} method={} path={} round={} {} status={}", p == null ? "-" : p, req.getMethod(),
                     req.getRequestURI(), round, target.contains("=") ? target : "run/gate=" + target, status);
         }
     }
 
-    /** Runs one master pass on this pod (for external schedulers such as xxl-job; ADMIN token). Always 200: see skipped/skipReason. */
+    /** Runs one master pass on this pod (for external schedulers such as xxl-job; ADMIN token). Always 200: see skipped/skipReason, and error on an infrastructure failure. */
     @PostMapping("/master/tick")
     public io.github.amwtke.pipeliner.core.engine.TickResult masterTick() {
-        return engine.tick();   // not audited per call (fires every second or so); rejected calls are audited by the security filter
+        try {
+            return engine.tick();
+        } catch (RuntimeException e) {
+            // infrastructure failure (Redis/store down): external schedulers treat non-2xx as job failure, so answer 200 with an error field
+            log.warn("master tick failed: {}", e.toString());
+            return io.github.amwtke.pipeliner.core.engine.TickResult.failed(shortMessage(e), 0);
+        }   // not audited per call (fires every second or so); rejected calls are audited by the security filter
     }
 
     @GetMapping("/cluster")
@@ -284,18 +296,52 @@ public class PipelinerAdminController {
         return m;
     }
 
-    @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<Map<String, String>> badRequest(IllegalArgumentException e) {
+    @ExceptionHandler({IllegalArgumentException.class, TypeMismatchException.class, ServletRequestBindingException.class,
+            HttpMessageNotReadableException.class})
+    public ResponseEntity<Map<String, String>> badRequest(Exception e) {
         return error(HttpStatus.BAD_REQUEST, e);
+    }
+
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<Map<String, String>> unsupportedMedia(Exception e) {
+        return error(HttpStatus.UNSUPPORTED_MEDIA_TYPE, e);
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, String>> failure(Exception e) {
-        return error(HttpStatus.INTERNAL_SERVER_ERROR, e);
+        HttpStatus s = statusOf(e);
+        if (s == HttpStatus.INTERNAL_SERVER_ERROR) log.error("admin API call failed", e);
+        return error(s, e);
+    }
+
+    /** Client errors map to 4xx; unknown round/graph/run (PipelinerException "unknown ...") to 404; everything else is a 500. */
+    static HttpStatus statusOf(Throwable e) {
+        if (e instanceof IllegalArgumentException || e instanceof TypeMismatchException || e instanceof ServletRequestBindingException
+                || e instanceof HttpMessageNotReadableException) return HttpStatus.BAD_REQUEST;
+        if (e instanceof HttpMediaTypeNotSupportedException) return HttpStatus.UNSUPPORTED_MEDIA_TYPE;
+        if (e instanceof PipelinerException) {
+            String m = e.getMessage();
+            if (m != null && (m.startsWith("unknown round") || m.startsWith("unknown graph") || m.startsWith("unknown run")
+                    || m.startsWith("unknown gate"))) return HttpStatus.NOT_FOUND;
+        }
+        return HttpStatus.INTERNAL_SERVER_ERROR;
+    }
+
+    /** Short client-safe message: deliberate messages (4xx, PipelinerException) pass through, anything else is just the exception type. */
+    private static String shortMessage(Throwable e) {
+        boolean deliberate = e instanceof PipelinerException || statusOf(e) != HttpStatus.INTERNAL_SERVER_ERROR;
+        String m = e.getMessage();
+        if (deliberate && m != null && !m.isEmpty()) return m.length() > 300 ? m.substring(0, 300) : m;
+        return "internal error (" + e.getClass().getSimpleName() + ")";
     }
 
     private static ResponseEntity<Map<String, String>> error(HttpStatus s, Exception e) {
-        String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        String msg;
+        if (e instanceof HttpMessageNotReadableException) msg = "malformed or missing request body";
+        else if (e instanceof org.springframework.web.method.annotation.MethodArgumentTypeMismatchException)
+            msg = "invalid value for parameter '" + ((org.springframework.web.method.annotation.MethodArgumentTypeMismatchException) e).getName() + "'";
+        else if (e instanceof TypeMismatchException) msg = "invalid request parameter value";
+        else msg = shortMessage(e);
         return ResponseEntity.status(s).body(Collections.singletonMap("error", msg));
     }
 

@@ -153,4 +153,79 @@ class AdminUiEndpointsTest {
                 .andExpect(jsonPath("$[1].leader").value(true))
                 .andExpect(jsonPath("$[1].instances.length()").value(0));
     }
+
+    @Test
+    void chunksLimitAndOffsetAreValidated() throws Exception {
+        when(engine.chunks(org.mockito.ArgumentMatchers.any())).thenReturn(Collections.emptyList());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("limit", "-1")).andExpect(status().isBadRequest());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("limit", "0")).andExpect(status().isBadRequest());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("limit", "2147483647")).andExpect(status().isBadRequest());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("limit", "1001")).andExpect(status().isBadRequest());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("offset", "-5")).andExpect(status().isBadRequest());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("limit", "1000").param("offset", "0")).andExpect(status().isOk());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("limit", "1")).andExpect(status().isOk());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("status", "pending")).andExpect(status().isOk());
+    }
+
+    @Test
+    void chunkStatusParsingIsLocaleIndependent() throws Exception {
+        java.util.Locale old = java.util.Locale.getDefault();
+        java.util.Locale.setDefault(new java.util.Locale("tr", "TR"));
+        try {
+            when(engine.chunks(org.mockito.ArgumentMatchers.any())).thenReturn(Collections.emptyList());
+            mvc.perform(get("/pg/rounds/r1/chunks").param("status", "pending")).andExpect(status().isOk());
+            mvc.perform(get("/pg/rounds/r1/chunks").param("status", "skipped")).andExpect(status().isOk());
+        } finally {
+            java.util.Locale.setDefault(old);
+        }
+    }
+
+    @Test
+    void clientErrorsAre4xx() throws Exception {
+        mvc.perform(get("/pg/rounds").param("limit", "abc")).andExpect(status().isBadRequest()).andExpect(jsonPath("$.error").isNotEmpty());
+        mvc.perform(get("/pg/rounds/r1/chunks").param("status", "bogus")).andExpect(status().isBadRequest());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds")
+                .contentType("application/json").content("{not json")).andExpect(status().isBadRequest());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds")
+                .contentType("application/json").content("{\"graph\":\"demo\"}")).andExpect(status().isBadRequest());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds")
+                .contentType("text/plain").content("x")).andExpect(status().isUnsupportedMediaType());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds")
+                .contentType("application/json")).andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void unknownRoundOrGraphIs404AndUnexpectedIs500WithShortMessage() throws Exception {
+        org.mockito.Mockito.doThrow(new io.github.amwtke.pipeliner.api.PipelinerException("unknown round: nope")).when(engine).cancel("nope");
+        org.mockito.Mockito.doThrow(new RuntimeException("Unable to connect to 10.1.2.3:6380 secret")).when(engine).pause("r1");
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds/nope/cancel")).andExpect(status().isNotFound());
+        when(engine.submit(eq("ghost"), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyMap()))
+                .thenThrow(new io.github.amwtke.pipeliner.api.PipelinerException("unknown graph: ghost"));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds").contentType("application/json")
+                .content("{\"graph\":\"ghost\",\"bizKey\":\"k\"}")).andExpect(status().isNotFound());
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/rounds/r1/pause"))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.error").value("internal error (RuntimeException)"));
+    }
+
+    @Test
+    void masterTickInfrastructureFailureIs200WithErrorField() throws Exception {
+        when(engine.tick()).thenThrow(new RuntimeException("Unable to connect to 127.0.0.1:6380"));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/pg/master/tick"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.skipped").value(true))
+                .andExpect(jsonPath("$.error").value("internal error (RuntimeException)"));
+    }
+
+    @Test
+    void backpressureLoadsTheViewOnce() throws Exception {
+        io.github.amwtke.pipeliner.core.store.RoundView v = io.github.amwtke.pipeliner.core.store.RoundView.builder()
+                .round(RoundRecord.builder().roundId("r1").graphName("demo").status(RoundStatus.RUNNING).build())
+                .runs(Collections.emptyList()).build();
+        when(engine.view("r1")).thenReturn(v);
+        when(engine.channelLengths(v)).thenReturn(Collections.singletonMap("e1", 3L));
+        mvc.perform(get("/pg/rounds/r1/backpressure")).andExpect(status().isOk()).andExpect(jsonPath("$.channels.e1").value(3));
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.times(1)).view("r1");
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.never()).channelLengths(org.mockito.ArgumentMatchers.anyString());
+    }
 }

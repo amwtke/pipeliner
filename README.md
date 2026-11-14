@@ -183,7 +183,7 @@ runner 有两种声明方式：
 
 ## 配置项
 
-前缀 `pipeliner`，由 `PipelinerProperties` 绑定；`runtime.*` 绑定 `RuntimeConfig`，`plan.*` 绑定 `PlanOptions`。下表为框架默认值，`pipeliner-example/application.yml` 对 `runtime.*` 中的若干项做了缩短（tick 500ms、leader-ttl 6000ms 等）。
+前缀 `pipeliner`，由 `PipelinerProperties` 绑定；`runtime.*` 绑定 `RuntimeConfig`，`plan.*` 绑定 `PlanOptions`。`runtime.*` 里由专用属性接管的键（`runtime.pod-id`、`master-enabled`、`worker-enabled`、`plan-options`、`retention-*`）不能再用 `runtime.*` 设置：值与默认值不同时启动直接失败，并提示该用哪个属性（`pipeliner.pod-id`、`pipeliner.master-enabled`、`pipeliner.worker-enabled`、`pipeliner.plan.*`、`pipeliner.retention.*`）。错误响应：客户端错误（参数类型/缺失、坏 JSON、不支持的媒体类型）返回 400/415，未知 round / graph / run 返回 404，其余异常为 500 且只带简短消息。下表为框架默认值，`pipeliner-example/application.yml` 对 `runtime.*` 中的若干项做了缩短（tick 500ms、leader-ttl 6000ms 等）。
 
 | 属性 | 默认 | 说明 |
 |---|---|---|
@@ -217,7 +217,7 @@ runner 有两种声明方式：
 | `pipeliner.plan.default-parallelism` | `2` | 默认并行度 |
 | `pipeliner.plan.force-mode` | 无 | 强制所有 run 的执行模式 |
 
-示例应用另有 `demo.core-grade-delay-ms`（默认 0，e2e 脚本设为 3，用于拉长 core-grade 便于注入故障/观察背压）和 `demo.algo-delay-ms`。
+示例应用另有 `demo.core-grade-delay-ms`（默认 0，e2e 脚本设为 3，用于拉长 core-grade 便于注入故障/观察背压）和 `demo.algo-delay-ms`。`FakeAlgoService` 把每个请求先同步写入 MySQL 表 `ex_algo_request`（batch id 为主键，`INSERT IGNORE`），再由每个 pod 上的后台 poller 原子认领（条件 `UPDATE`；认领超过 `demo.algo-claim-timeout-ms`（默认 10000）视为放弃）、写 ClickHouse（ReplacingMergeTree，重放幂等）、`signalGate`（按 batch id 幂等）并标记完成；pod 被 kill -9 后其未完成的请求由其他 pod 接手，回调不会丢。
 
 ## 管理接口
 
@@ -229,7 +229,7 @@ runner 有两种声明方式：
 | GET | `/pg/graphs/{name}/plan` | 执行计划（text/plain） |
 | POST | `/pg/rounds` | 提交，body：`{"graph","bizKey","params":{}}`，返回 `roundId` |
 | GET | `/pg/rounds/{id}` | round / run / gate 状态 |
-| GET | `/pg/rounds/{id}/chunks` | chunk 列表，参数 `pipeline`、`status`、`limit`（100）、`offset`（0） |
+| GET | `/pg/rounds/{id}/chunks` | chunk 列表，参数 `pipeline`、`status`、`limit`（默认 100，范围 1..1000）、`offset`（默认 0，>= 0）；非法值返回 400 |
 | GET | `/pg/rounds/{id}/channels` | 各通道当前长度 |
 | GET | `/pg/rounds/{id}/backpressure` | 高/低水位、通道长度、瓶颈 pipeline |
 | POST | `/pg/rounds/{id}/pause` · `/resume` · `/cancel` | 暂停 / 恢复 / 取消 |
@@ -251,7 +251,7 @@ runner 有两种声明方式：
 - 展示：选定图的拓扑（stage 列 → run 框 → pipeline 节点，stream 边标通道长度、达到高水位变红，闸门为菱形，自动 barrier 标 `barrier:<dataset>`），以及所选 round 的实时状态：round 摘要（状态、当前阶段、用时、incomplete/compacted）、各 run / pipeline / 闸门状态、source 的 `done/total splits`、行数、DLQ、各 pod 持有的线程数。不选 round 时只显示拓扑。支持拖动平移、滚轮缩放、“适应”。
 - 点击 pipeline / run / 闸门打开侧栏：详情、失败 chunk，以及 重试 / 从此处重跑 / 跳过死信 / 打开闸门、暂停 / 恢复 / 取消（执行前有确认框，失败时显示服务端返回的错误）。
 - 自动刷新：所选 round 活跃时每 2 秒轮询一次。深链：`/pg-ui/?graph=<图>&round=<roundId>`，可加 `&theme=dark|light`。
-- Token：右上角输入框（只存 `sessionStorage`），每个 `/pg` 请求都以 `Authorization: Bearer` 发送。读取默认免 token；所有操作按钮需要 `ADMIN` token；服务端配了 `read-requires-token` 时读取也需要，界面会明确提示 401 / 403。
+- Token：右上角输入框（只存 `sessionStorage`），每个 `/pg` 请求都以 `X-PG-Token` 头发送（服务端始终接受该头，与 `header` 配置无关）。读取默认免 token；所有操作按钮需要 `ADMIN` token；服务端配了 `read-requires-token` 时读取也需要，界面会明确提示 401 / 403。
 - 关闭：`pipeliner.admin.ui.enabled=false`（默认 `true`），此时 `/pg-ui/**` 返回 404。
 - 注意：pod 持有的实例来自心跳（`heartbeat-millis`，默认 5 秒），略有延迟。
 
@@ -263,7 +263,7 @@ runner 有两种声明方式：
 - **规则**：`GET`/`HEAD` 默认免 token；所有变更方法（POST/PUT/PATCH/DELETE）仅 `ADMIN`。`read-requires-token: true` 时读也需要 `VIEWER` 或 `ADMIN`。
 - **失败响应**：缺失/未知 token → `401` + `WWW-Authenticate: Bearer`，body `{"error": "..."}`；`VIEWER` 做变更 → `403`。
 - **安全默认**：开启但未配置任何 token 时，启动 WARN，所有变更接口返回 `403`（只读仍可用）。token 短于 16 字符会 WARN（仍可用）。token 用常量时间比较。
-- **传递方式**：`Authorization: Bearer <token>`，或 `X-PG-Token: <token>`（`header` 可改默认的 `Authorization` 头名）。
+- **传递方式**：`Authorization: Bearer <token>`，或 `X-PG-Token: <token>`（`header` 可改默认的 `Authorization` 头名）。鉴权是 Spring MVC 拦截器，作用于 `PipelinerAdminController` 的所有处理器和 DispatcherServlet 内 `/pg` 下的路径，所以 `spring.mvc.servlet.path` / context path 改变后依然生效；`pipeliner.admin.ui.enabled=false` 的 `/pg-ui` 404 开关同理。配置的 token 会 trim（并对首尾空白或内部空白打 WARN）。
 
 ```yaml
 pipeliner:
@@ -320,7 +320,7 @@ curl -X POST -H "Authorization: Bearer $PG_ADMIN_TOKEN" http://<pod>:8080/pg/mas
 # {"leader":true,"epoch":7,"roundsTicked":1,"commandsExecuted":0,"durationMillis":12,"skipped":false,"skipReason":null}
 ```
 
-该接口是变更类接口，需要 ADMIN token；始终返回 200，是否推进看 `skipped`。指标：`pipeliner_master_last_tick_timestamp_seconds`（每次完成的 leader tick 更新）、`pipeliner_master_tick_duration_seconds`。告警 `PipelinerMasterNotTicking`（`deploy/prometheus/pipeliner-alerts.yml`）：有活跃 round（`pipeliner_active_rounds > 0`）而 30 秒内没有 leader tick 时触发（阈值取 max(30s, 5 × 预期间隔)，间隔 > 6 秒需调大）。
+该接口是变更类接口，需要 ADMIN token；始终返回 200，是否推进看 `skipped`；Redis / 存储等基础设施故障时同样返回 200，`skipped=true` 且 `error` 字段带简短原因（外部调度器把非 2xx 当作任务失败，所以不用 5xx）。指标：`pipeliner_master_last_tick_timestamp_seconds`（每次完成的 leader tick 更新）、`pipeliner_master_tick_duration_seconds`。告警 `PipelinerMasterNotTicking`（`deploy/prometheus/pipeliner-alerts.yml`）：有活跃 round（`pipeliner_active_rounds > 0`）而 60 秒内没有 leader tick 并持续 1 分钟（`for: 1m`）时触发。阈值取 max(60s, 2 × scrape_interval + 5 × 预期 tick 间隔)：样本最多比真实 tick 旧一个抓取间隔，再留一个抓取间隔的余量；60 秒适用于抓取间隔 ≤ 15 秒且 tick 间隔 ≤ 6 秒，更大时按公式调大规则里的 60。
 
 e2e：`MASTER_TICK=external pipeliner-example/scripts/e2e.sh`（pod 用 external 模式，脚本每秒向随机存活 pod 发一次 `POST /pg/master/tick`，leader-ttl 设为 3 秒）。
 
@@ -399,7 +399,7 @@ curl -s localhost:8081/actuator/prometheus | grep '^pipeliner_'
 
 **停滞 chunk 告警**：master 每隔几个 tick 对 RUNNING 的 CLUSTER pipeline 的输入 stream（source 为 split 队列，其余为输入通道）做一次 XPENDING（汇总 + 最老一条的扩展查询，开销很小），把最老待确认条目的空闲时间写入 `pipeliner_oldest_pending_seconds`。空闲超过 `pipeliner.runtime.stalled-chunk-alert-millis`（默认 300000）时，对每个 (round, pipeline, entry) 只输出一条 WARN（含 consumer、投递次数、待确认数），并让 `pipeliner_stalled_chunk_alerts_total` 加 1。注意：worker 正常存活时 claim 续租会不断重置空闲时间，所以这个告警抓的是"没人续租 / 没人接手"的条目（worker 卡死且续租线程也停了、没有存活 worker、autoclaim 被关闭等）；worker 线程卡在 runner 里但续租仍在运行的情况需另行通过 `pipeliner_chunk_duration_seconds` 或 run 耗时观察。
 
-**告警规则**：[deploy/prometheus/pipeliner-alerts.yml](deploy/prometheus/pipeliner-alerts.yml)（在 Prometheus 配置的 `rule_files` 里引用），包含：出现死信、round 失败、闸门等待过久 / 超时、chunk 停滞、持续背压（通道 10 分钟都在高水位）、1 分钟无 leader、多 leader、leader 频繁切换、Redis 内存过高、保留任务未运行。阈值是示例值，按环境调整。
+**告警规则**：[deploy/prometheus/pipeliner-alerts.yml](deploy/prometheus/pipeliner-alerts.yml)（在 Prometheus 配置的 `rule_files` 里引用），包含：出现死信、round 失败、闸门等待过久 / 超时、chunk 停滞、持续背压（通道 10 分钟都在高水位：`min_over_time[10m]`，无 `for:`）、1 分钟无 leader、多 leader、leader 频繁切换、Redis 内存过高、保留任务未运行。阈值是示例值，按环境调整。
 
 ## 验证结果（v1）
 

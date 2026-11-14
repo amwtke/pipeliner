@@ -4,6 +4,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+. "$HERE/lib.sh"   # LOGS (honours PIPELINER_LOGS), pod_pid, kill_pod
 REPO="$(cd "$ROOT/.." && pwd)"
 MATERIALS="${MATERIALS:-600}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-600}"
@@ -29,7 +30,8 @@ wait_up() { for _ in $(seq 1 120); do [ "$(api -o /dev/null -w '%{http_code}' "h
 
 if [ -z "${SKIP_BUILD:-}" ]; then
   echo "== building"
-  (cd "$REPO" && mvn -o -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example package || mvn -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example package) || die "build"
+  # -am builds the framework modules of this tree too, so the jar under test contains this tree's code (never `install`: ~/.m2 is shared)
+  (cd "$REPO" && mvn -o -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example -am package || mvn -q -DskipTests -pl pipeliner-spring-boot-starter,pipeliner-example -am package) || die "build"
 fi
 
 trap '"$HERE/stop-pods.sh" >/dev/null 2>&1' EXIT
@@ -93,15 +95,19 @@ print(''.join(r['status'] for r in d.get('runs',[]) if r['runId']=='R2'))" 2>/de
 done
 [ "$rs" = RUNNING ] || die "run R2 never became RUNNING"
 sleep 3
-LEADER=""
-for i in 0 1 2; do [ "$(api "http://127.0.0.1:${PORTS[$i]}/pg/cluster" | json isLeader)" = "True" ] && LEADER=${PODS[$i]}; done
-[ -n "$LEADER" ] || LEADER=pod1
+# the real leader is the lease holder (pg:leader in Redis, served by /pg/cluster/workers); isLeader polling is wrong in external mode where a deposed
+# pod keeps reporting true until its next tick
+LEADER=$(api "http://127.0.0.1:$P1/pg/cluster/workers" | python3 -c "import sys,json
+print(next((w['podId'] for w in json.load(sys.stdin) if w.get('leader')), ''))" 2>/dev/null)
+[ -n "$LEADER" ] || die "no lease holder found (GET /pg/cluster/workers on pod1)"
+case " ${PODS[*]} " in *" $LEADER "*) ;; *) die "lease holder '$LEADER' is not one of ${PODS[*]}";; esac
 WORKER=""
 for p in "${PODS[@]}"; do [ "$p" != "$LEADER" ] && { WORKER=$p; break; }; done
 SURVIVOR=""
 for p in "${PODS[@]}"; do [ "$p" != "$LEADER" ] && [ "$p" != "$WORKER" ] && SURVIVOR=$p; done
 echo "killing leader=$LEADER worker=$WORKER, survivor=$SURVIVOR"
-kill -9 "$(cat "$ROOT/logs/$LEADER.pid")" "$(cat "$ROOT/logs/$WORKER.pid")" 2>/dev/null
+kill_pod "$LEADER" || die "could not kill leader $LEADER"
+kill_pod "$WORKER" || die "could not kill worker $WORKER"
 sleep 3
 echo "restarting killed pods"
 start_pod "$LEADER"; start_pod "$WORKER"
@@ -120,7 +126,7 @@ if ka != kb:
 print("checksums match")
 PY
 if [ "${MASTER_TICK:-local}" = external ]; then
-  TL="$ROOT/logs/tick-loop.log"
+  TL="$LOGS/tick-loop.log"
   echo "tick-loop: total=$(wc -l < "$TL") failed(pod down)=$(grep -c FAILED "$TL") not-leader=$(grep -c 'not leader' "$TL") in-progress=$(grep -c 'tick in progress' "$TL") advanced=$(grep -c '"skipped":false' "$TL")"
 fi
 echo "E2E PASSED"

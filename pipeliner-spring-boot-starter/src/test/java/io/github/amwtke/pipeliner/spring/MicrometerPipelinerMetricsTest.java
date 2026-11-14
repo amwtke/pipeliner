@@ -126,4 +126,33 @@ class MicrometerPipelinerMetricsTest {
         assertEquals(2, reg.get("pipeliner.retention.compacted.rounds").counter().count());
         assertTrue(reg.get("pipeliner.retention.last.run.timestamp").gauge().value() > 1_700_000_000.0);
     }
+
+    @Test void leaderLostResetsRedisMemoryAndLeaderChangesIsPreRegistered() {
+        assertEquals(0, reg.get("pipeliner.leader.changes").counter().count());
+        m.leaderChanged("p1", 1);
+        assertEquals(1, reg.get("pipeliner.leader.changes").counter().count());
+        m.redisUsedMemory(2L << 30);
+        assertEquals(2L << 30, gauge("pipeliner.redis.used.memory").value());
+        m.leaderLost("p1");
+        assertTrue(Double.isNaN(gauge("pipeliner.redis.used.memory").value()));
+        m.redisUsedMemory(5);   // leads again
+        assertEquals(5, gauge("pipeliner.redis.used.memory").value());
+    }
+
+    @Test void concurrentUpdatesAndRemovalsKeepMapAndRegistryConsistent() throws Exception {
+        java.util.concurrent.ExecutorService ex = java.util.concurrent.Executors.newFixedThreadPool(4);
+        for (int t = 0; t < 4; t++) {
+            final int tt = t;
+            ex.submit(() -> {
+                for (int i = 0; i < 3000; i++) {
+                    if (tt % 2 == 0) m.oldestPending("net-r1", "load", i);
+                    else m.roundFinished("net-demand", "net-r1", "SUCCEEDED");
+                }
+            });
+        }
+        ex.shutdown();
+        assertTrue(ex.awaitTermination(30, TimeUnit.SECONDS));
+        m.oldestPending("net-r1", "load", 7000);   // after the dust settles the gauge must be registered and readable
+        assertEquals(7.0, gauge("pipeliner.oldest.pending", "round", "net-r1").value(), 1e-9);
+    }
 }

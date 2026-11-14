@@ -2,16 +2,21 @@ package io.github.amwtke.pipeliner.spring;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import java.io.IOException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
+import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.ViewControllerRegistry;
+import org.springframework.web.util.UrlPathHelper;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 /**
- * The static UI under META-INF/resources/pg-ui is served at /pg-ui/. With pipeliner.admin.ui.enabled=false a filter answers 404 for
- * /pg-ui/** so the files are not reachable. It lives outside /pg/* and therefore outside the token filter.
+ * The static UI under META-INF/resources/pg-ui is served at /pg-ui/. With pipeliner.admin.ui.enabled=false an interceptor answers 404 for
+ * /pg-ui/** so the files are not reachable. It lives outside /pg and therefore outside the token check.
  */
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
@@ -31,13 +36,29 @@ public class PipelinerUiAutoConfiguration {
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = "pipeliner.admin.ui", name = "enabled", havingValue = "false")
     static class Disabled {
+        /** Answers 404 for /pg-ui[/**] relative to the servlet mapping, whatever spring.mvc.servlet.path is. */
         @Bean
-        public FilterRegistrationBean<javax.servlet.Filter> pipelinerUiDisabledFilter() {
-            javax.servlet.Filter f = (req, res, chain) -> ((javax.servlet.http.HttpServletResponse) res).sendError(404);
-            FilterRegistrationBean<javax.servlet.Filter> r = new FilterRegistrationBean<>(f);
-            r.addUrlPatterns("/pg-ui", "/pg-ui/*");
-            r.setOrder(Ordered.HIGHEST_PRECEDENCE + 5);
-            return r;
+        public WebMvcConfigurer pipelinerUiDisabledConfigurer() {
+            return new WebMvcConfigurer() {
+                @Override
+                public void addInterceptors(InterceptorRegistry registry) {
+                    registry.addInterceptor(new UiDisabledInterceptor()).order(Ordered.HIGHEST_PRECEDENCE + 5);
+                }
+            };
+        }
+    }
+
+    static final class UiDisabledInterceptor implements HandlerInterceptor {
+        private static final UrlPathHelper PATHS = new UrlPathHelper();
+
+        @Override
+        public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) throws IOException {
+            String path = PATHS.getPathWithinServletMapping(req);
+            if (path.equals("/pg-ui") || path.startsWith("/pg-ui/")) {
+                res.sendError(HttpServletResponse.SC_NOT_FOUND);
+                return false;
+            }
+            return true;
         }
     }
 }

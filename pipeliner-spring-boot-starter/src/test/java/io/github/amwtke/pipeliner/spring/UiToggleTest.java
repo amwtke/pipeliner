@@ -1,6 +1,7 @@
 package io.github.amwtke.pipeliner.spring;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -8,26 +9,30 @@ import java.io.InputStream;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
 
 class UiToggleTest {
     final WebApplicationContextRunner runner = new WebApplicationContextRunner().withConfiguration(AutoConfigurations.of(PipelinerUiAutoConfiguration.class));
 
     @Test
-    void enabledByDefaultNoBlockingFilter() {
-        runner.run(ctx -> assertTrue(ctx.getBeansOfType(FilterRegistrationBean.class).isEmpty()));
+    void enabledByDefaultNoBlockingInterceptor() {
+        runner.run(ctx -> assertFalse(ctx.containsBean("pipelinerUiDisabledConfigurer")));
     }
 
     @Test
-    void disabledRegistersFilterAnswering404() {
+    void disabledAnswers404UnderAnyServletPath() {
         runner.withPropertyValues("pipeliner.admin.ui.enabled=false").run(ctx -> {
-            assertEquals(1, ctx.getBeansOfType(FilterRegistrationBean.class).size());
-            FilterRegistrationBean<?> r = ctx.getBean(FilterRegistrationBean.class);
-            assertTrue(r.getUrlPatterns().contains("/pg-ui/*"));
-            org.springframework.mock.web.MockHttpServletResponse res = new org.springframework.mock.web.MockHttpServletResponse();
-            r.getFilter().doFilter(new org.springframework.mock.web.MockHttpServletRequest("GET", "/pg-ui/app.js"), res,
-                    new org.springframework.mock.web.MockFilterChain());
-            assertEquals(404, res.getStatus());
+            assertTrue(ctx.containsBean("pipelinerUiDisabledConfigurer"));
+            PipelinerUiAutoConfiguration.UiDisabledInterceptor i = new PipelinerUiAutoConfiguration.UiDisabledInterceptor();
+            for (String[] c : new String[][] {{"/pg-ui/app.js", ""}, {"/api/pg-ui/app.js", "/api"}, {"/api/pg-ui", "/api"}}) {
+                org.springframework.mock.web.MockHttpServletRequest req = new org.springframework.mock.web.MockHttpServletRequest("GET", c[0]);
+                req.setServletPath(c[1]);
+                org.springframework.mock.web.MockHttpServletResponse res = new org.springframework.mock.web.MockHttpServletResponse();
+                assertFalse(i.preHandle(req, res, new Object()), c[0]);
+                assertEquals(404, res.getStatus(), c[0]);
+            }
+            org.springframework.mock.web.MockHttpServletRequest other = new org.springframework.mock.web.MockHttpServletRequest("GET", "/api/pg/graphs");
+            other.setServletPath("/api");
+            assertTrue(i.preHandle(other, new org.springframework.mock.web.MockHttpServletResponse(), new Object()));
         });
     }
 

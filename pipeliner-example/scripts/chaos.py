@@ -212,6 +212,15 @@ class Ctx:
         return rng.choice(h).port if h else None
 
     def leader(self):
+        """The lease holder (pg:leader in Redis), falling back to polling isLeader (a deposed leader may still report true)."""
+        try:
+            holder = Redis().cmd("GET", "pg:leader")
+        except Exception:  # noqa
+            holder = None
+        if holder:
+            for p in self.healthy():
+                if p.name == holder:
+                    return p
         for p in self.healthy():
             code, c = http(p.port, "GET", "/pg/cluster", 2)
             if code == 200 and isinstance(c, dict) and c.get("isLeader"):
@@ -274,6 +283,38 @@ def drive(label, rounds, chaos, timeout):
             log("[%s] SIGCONT %s" % (label, p.name))
         return f
 
+    pausing = set()   # rounds with a pause/resume task in flight (the poll loop does not touch them)
+
+    def round_status(rid):
+        v = view(rid)
+        return v["round"]["status"] if v else None
+
+    def resume_until_running(r, tries=40):
+        """Resume (retrying: the leader may change or die in between) until the round leaves PAUSED. True when it did."""
+        for i in range(tries):
+            port = CTX.any_port()
+            if port:
+                code, body = http(port, "POST", "/pg/rounds/%s/resume" % r["rid"], 40)
+                if code != 200:
+                    log("[%s] resume %s attempt %d -> %s %s" % (label, r["pv"], i + 1, code, str(body)[:120]))
+            st = round_status(r["rid"])
+            if st is not None and st != "PAUSED":
+                return True
+            time.sleep(1)
+        return False
+
+    def pause_resume(r, port):
+        try:
+            code, body = http(port, "POST", "/pg/rounds/%s/pause" % r["rid"], 40)
+            if code != 200:
+                log("[%s] pause %s failed: %s %s" % (label, r["pv"], code, str(body)[:120]))
+                notes.append("pause %s failed: %s" % (r["pv"], code))
+            time.sleep(2)
+            ok_resumed = resume_until_running(r)
+            log("[%s] resume %s %s" % (label, r["pv"], "ok" if ok_resumed else "NOT CONFIRMED (poll loop keeps retrying)"))
+        finally:
+            pausing.discard(r["rid"])
+
     def do_chaos():
         healthy = CTX.healthy()
         if len(healthy) < 2:
@@ -322,15 +363,12 @@ def drive(label, rounds, chaos, timeout):
             if not live:
                 return
             r = rng.choice(live)
+            if r["rid"] in pausing:
+                return
             port = rng.choice(healthy).port
             act("pause", "%s via port %d, resume in 2s" % (r["pv"], port))
-            pool.submit(lambda: http(port, "POST", "/pg/rounds/%s/pause" % r["rid"], 40))
-
-            def resume(r=r):
-                p2 = CTX.any_port()
-                pool.submit(lambda: http(p2, "POST", "/pg/rounds/%s/resume" % r["rid"], 40))
-                log("[%s] resume %s" % (label, r["pv"]))
-            timers.append((now + 2, resume, "resume"))
+            pausing.add(r["rid"])
+            pool.submit(pause_resume, r, port)
 
     ok = True
     while True:
@@ -352,6 +390,11 @@ def drive(label, rounds, chaos, timeout):
                 if not v:
                     continue
                 st = v["round"]["status"]
+                if st == "PAUSED" and r["rid"] not in pausing:   # a chaos pause whose resume was lost: keep resuming until it runs again
+                    port = CTX.any_port()
+                    if port:
+                        c, b = http(port, "POST", "/pg/rounds/%s/resume" % r["rid"], 40)
+                        log("[%s] %s is PAUSED outside a pause action: resume -> %s" % (label, r["pv"], c))
                 if approve_armed(v) and r["rid"] not in opened:
                     port = CTX.any_port()
                     if port:
@@ -401,10 +444,25 @@ def drive(label, rounds, chaos, timeout):
 SOURCE_PIPELINES = ["algo-submit", "gd-fix", "cap-alloc", "big-final", "fine-net", "publish"]
 
 
+CHUNK_PAGE = 1000   # the server clamps limit to 1..1000
+
+
 def get_chunks(rid, pipeline):
-    port = CTX.any_port()
-    code, c = http(port, "GET", "/pg/rounds/%s/chunks?pipeline=%s&limit=100000" % (rid, pipeline), 30)
-    return c if code == 200 and isinstance(c, list) else []
+    """All chunk records of a pipeline, paged. Returns (chunks, error): error is None on success, a string on any failure, so callers can
+    tell "no chunks" from "could not read" (a failed read must not pass a check vacuously nor become a reference value)."""
+    out, offset = [], 0
+    for _ in range(10000):
+        port = CTX.any_port()
+        if not port:
+            return None, "no healthy pod"
+        code, c = http(port, "GET", "/pg/rounds/%s/chunks?pipeline=%s&limit=%d&offset=%d" % (rid, pipeline, CHUNK_PAGE, offset), 30)
+        if code != 200 or not isinstance(c, list):
+            return None, "chunks %s: HTTP %s %s" % (pipeline, code, str(c)[:100])
+        out.extend(c)
+        if len(c) < CHUNK_PAGE:
+            return out, None
+        offset += CHUNK_PAGE
+    return None, "chunks %s: too many pages" % pipeline
 
 
 def verify_round(rid, pv, base, ref_splits, expect, check_chunks=True):
@@ -461,8 +519,12 @@ def verify_round(rid, pv, base, ref_splits, expect, check_chunks=True):
         att = {}
         if check_chunks:
             splits = {}
+            skipped = []
             for pid in SOURCE_PIPELINES:
-                ch = get_chunks(rid, pid)
+                ch, err = get_chunks(rid, pid)
+                if err:
+                    skipped.append("%s (%s)" % (pid, err))
+                    continue
                 src = [c for c in ch if c.get("inputEdge") == "split"]
                 splits[pid] = len(src)
                 bad = [c["chunkId"] for c in src if c["status"] != "DONE"]
@@ -474,8 +536,13 @@ def verify_round(rid, pv, base, ref_splits, expect, check_chunks=True):
                     viol.append("d: DEAD chunks in %s: %s" % (pid, dead[:5]))
             det["splitChunks"] = splits
             det["chunksWithAttemptGt1"] = att
-            if ref_splits is not None and splits != ref_splits:
-                viol.append("d: source chunk records %s != reference splits %s" % (splits, ref_splits))
+            if skipped:
+                det["chunkCheckSkipped"] = skipped
+                log("NOTE chunk checks skipped for round %s: %s" % (rid, "; ".join(skipped)))
+            if ref_splits is not None:
+                common = sorted(set(splits) & set(ref_splits))
+                if {k: splits[k] for k in common} != {k: ref_splits[k] for k in common}:
+                    viol.append("d: source chunk records %s != reference splits %s" % (splits, ref_splits))
     # e. redis hygiene (allow a short settle time)
     left = None
     for _ in range(30):

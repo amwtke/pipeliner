@@ -66,7 +66,45 @@ class AdminSecurityTest {
 
     MockMvc mvc(PipelinerSecurityProperties p) {
         PipelinerAdminController c = new PipelinerAdminController(engine, new RuntimeConfig());
-        return MockMvcBuilders.standaloneSetup(c).addFilter(new AdminSecurityFilter(p), "/pg/*").build();
+        return MockMvcBuilders.standaloneSetup(c).addInterceptors(new AdminSecurityInterceptor(p)).build();
+    }
+
+    @Test
+    void nonDefaultServletPathStillEnforcesAuth() throws Exception {
+        MockMvc m = mvc(props(true));
+        m.perform(post("/api/pg/rounds/r1/cancel").servletPath("/api")).andExpect(status().isUnauthorized());
+        m.perform(post("/api/pg/rounds/r1/cancel").servletPath("/api").header("Authorization", "Bearer " + VIEW)).andExpect(status().isForbidden());
+        m.perform(post("/api/pg/master/tick").servletPath("/api")).andExpect(status().isUnauthorized());
+        verify(engine, never()).cancel(anyString());
+        verify(engine, never()).tick();
+        m.perform(post("/api/pg/rounds/r1/cancel").servletPath("/api").header("X-PG-Token", ADMIN)).andExpect(status().isOk());
+        verify(engine).cancel("r1");
+        m.perform(get("/api/pg/graphs").servletPath("/api")).andExpect(status().isOk());
+    }
+
+    @Test
+    void nonDefaultServletPathPrincipalWinsOverOperatorParam() throws Exception {
+        mvc(props(true)).perform(post("/api/pg/gates/r1/g1/open?operator=mallory").servletPath("/api").header("X-PG-Token", ADMIN))
+                .andExpect(status().isOk());
+        verify(engine).openGate("r1", "g1", "ops");
+        mvc(props(true)).perform(post("/api/pg/gates/r1/g1/open?operator=mallory").servletPath("/api")).andExpect(status().isUnauthorized());
+        verify(engine, never()).openGate("r1", "g1", "mallory");
+    }
+
+    @Test
+    void nonDefaultServletPathReadRequiresToken() throws Exception {
+        PipelinerSecurityProperties p = props(true);
+        p.setReadRequiresToken(true);
+        mvc(p).perform(get("/api/pg/graphs").servletPath("/api")).andExpect(status().isUnauthorized());
+        mvc(p).perform(get("/api/pg/graphs").servletPath("/api").header("X-PG-Token", VIEW)).andExpect(status().isOk());
+    }
+
+    @Test
+    void configuredTokenIsTrimmed() throws Exception {
+        PipelinerSecurityProperties p = new PipelinerSecurityProperties();
+        p.getTokens().add(entry("ops", ADMIN + "\n", PipelinerSecurityProperties.Role.ADMIN));
+        mvc(p).perform(post("/pg/rounds/r1/pause").header("Authorization", "Bearer " + ADMIN)).andExpect(status().isOk());
+        verify(engine).pause("r1");
     }
 
     @Test
@@ -133,10 +171,10 @@ class AdminSecurityTest {
         new org.springframework.boot.test.context.runner.WebApplicationContextRunner()
                 .withConfiguration(org.springframework.boot.autoconfigure.AutoConfigurations.of(PipelinerSecurityAutoConfiguration.class))
                 .withPropertyValues("pipeliner.admin.security.enabled=false")
-                .run(ctx -> assertFalse(ctx.containsBean("pipelinerAdminSecurityFilter")));
+                .run(ctx -> assertFalse(ctx.containsBean("pipelinerAdminSecurityInterceptor")));
         new org.springframework.boot.test.context.runner.WebApplicationContextRunner()
                 .withConfiguration(org.springframework.boot.autoconfigure.AutoConfigurations.of(PipelinerSecurityAutoConfiguration.class))
-                .run(ctx -> assertTrue(ctx.containsBean("pipelinerAdminSecurityFilter")));
+                .run(ctx -> assertTrue(ctx.containsBean("pipelinerAdminSecurityInterceptor")));
     }
 
     @Test

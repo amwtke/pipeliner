@@ -57,9 +57,10 @@ groups:
           summary: "最老待确认 chunk 空闲 {{ $value | humanizeDuration }}：round={{ $labels.round }} pipeline={{ $labels.pipeline }}"
 
       - alert: PipelinerBackpressureSustained
-        # 通道长度在水位线上持续 10 分钟：下游处理不过来（autoscale 已到上限或下游卡住）
+        # 通道长度在水位线上持续 10 分钟：下游处理不过来（autoscale 已到上限或下游卡住）。
+        # 时间由 min_over_time 的 10 分钟窗口给出（窗口内每个样本都 >= 水位线），所以不再叠加 for:，否则要 ~20 分钟才触发。
         expr: min_over_time(pipeliner_channel_length[10m]) >= scalar(max(pipeliner_channel_high_watermark))
-        for: 10m
+        for: 0m
         labels:
           severity: warning
         annotations:
@@ -87,7 +88,11 @@ groups:
           description: "短暂重叠可能是抓取时间差；持续存在说明有 pod 没有感知到失去租约。fencing 保证数据正确，但需排查。"
 
       - alert: PipelinerLeaderFlapping
-        expr: sum(increase(pipeliner_leader_changes_total[10m])) > 3
+        # pipeliner_leader_changes_total 在每个进程启动时就以 0 注册，所以首次当选也计入 increase()；
+        # 备用分支用 leader gauge 的翻转次数（每次换主 = 旧主 1→0 + 新主 0→1，共 2 次变化），不依赖 counter 的首个增量。
+        expr: |
+          sum(increase(pipeliner_leader_changes_total[10m])) > 3
+          or sum(changes(pipeliner_leader[10m])) > 6
         for: 0m
         labels:
           severity: warning
@@ -117,14 +122,16 @@ groups:
           description: "由 leader 每 interval-minutes 分钟执行一次；确认 pipeliner.retention.enabled=true 且有 leader。若有意关闭保留，请屏蔽本规则。"
 
       - alert: PipelinerMasterNotTicking
-        # 阈值 = max(30s, 5 × 预期触发间隔)；外部触发间隔 ≤ 6 s 时 30 s 已够，间隔更大请相应调大
+        # 阈值 = max(60s, 2 × scrape_interval + 5 × 预期 tick 间隔)：样本最多比真实 tick 旧一个抓取间隔，再留一个抓取间隔的抓取延迟/失败余量。
+        # 60 s 适用于 scrape_interval <= 15 s 且 tick 间隔（LOCAL tick-millis / EXTERNAL external-tick-interval-millis）<= 6 s；
+        # 抓取间隔或触发间隔更大时按公式调大 60，并相应调整 for:。for: 1m 再吸收一次错过的 tick（leader 切换）。
         expr: |
-          (time() - max(pipeliner_master_last_tick_timestamp_seconds) > 30
+          (time() - max(pipeliner_master_last_tick_timestamp_seconds) > 60
            or absent(pipeliner_master_last_tick_timestamp_seconds))
           and max(pipeliner_active_rounds) > 0
-        for: 0m
+        for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "有活跃 round，但 master 已超过 30 秒没有完成 leader tick"
-          description: "LOCAL 模式：检查是否有 leader / pg-master 线程；EXTERNAL 模式：检查调度器（xxl-job 等）是否在触发 POST /pg/master/tick 或 engine.tick()，以及 leader-ttl-millis >= 3 × external-tick-interval-millis。"
+          summary: "有活跃 round，但 master 已超过 60 秒没有完成 leader tick"
+          description: "LOCAL 模式：检查是否有 leader / pg-master 线程；EXTERNAL 模式：检查调度器（xxl-job 等）是否在触发 POST /pg/master/tick 或 engine.tick()，以及 leader-ttl-millis >= 3 × external-tick-interval-millis。阈值公式见规则注释。"

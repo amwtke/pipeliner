@@ -27,6 +27,7 @@ public class MicrometerPipelinerMetrics implements PipelinerMetrics {
 
     private static final class G {
         final AtomicLong value = new AtomicLong();
+        volatile boolean valid = true;   // false exports NaN (no current sample)
         volatile Meter.Id id;
         final String round;   // null for process-level gauges (never swept)
         volatile long updated = System.currentTimeMillis();
@@ -35,6 +36,8 @@ public class MicrometerPipelinerMetrics implements PipelinerMetrics {
 
     private final MeterRegistry reg;
     private final Function<String, String> graphOf;
+    /** Guards gauge map + registry updates as one step (register / sweep / remove must not interleave). */
+    private final Object lock = new Object();
     private final Map<String, G> gauges = new ConcurrentHashMap<>();
     private final Map<String, String> graphCache = java.util.Collections.synchronizedMap(new LinkedHashMap<String, String>(64, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, String> e) { return size() > GRAPH_CACHE_SIZE; }
@@ -47,6 +50,7 @@ public class MicrometerPipelinerMetrics implements PipelinerMetrics {
     public MicrometerPipelinerMetrics(MeterRegistry reg, Function<String, String> graphOf) {
         this.reg = reg;
         this.graphOf = graphOf;
+        reg.counter("pipeliner.leader.changes");   // pre-registered at 0 so increase()/rate() see the first election of every process
     }
 
     // ------------------------------------------------------------ hooks
@@ -105,6 +109,7 @@ public class MicrometerPipelinerMetrics implements PipelinerMetrics {
         leaderGauge(podId).value.set(0);
         removeRoundGauges(null);   // another pod owns the rounds now: this pod's round gauges would only go stale
         activeRounds(0);
+        gauge("pipeliner.redis.used.memory", "bytes", 1, null, null).valid = false;   // only the leader samples it: a former leader must not keep exporting its last value
     }
 
     @Override public void masterTick(long durationMillis) {
@@ -153,30 +158,35 @@ public class MicrometerPipelinerMetrics implements PipelinerMetrics {
 
     /** Registers (once) and updates a gauge; value null leaves the current value. {@code scale} divides the stored value for display. */
     private G gauge(String name, String unit, double scale, Number value, String round, String... tags) {
+        synchronized (lock) {
         long now = System.currentTimeMillis();
         sweep(now);
         StringBuilder key = new StringBuilder(name);
         for (int i = 1; i < tags.length; i += 2) key.append('|').append(tags[i]);
         G g = gauges.computeIfAbsent(key.toString(), k -> {
             G h = new G(round);
-            Gauge.Builder<AtomicLong> b = Gauge.builder(name, h.value, v -> v.get() / scale).tags(tags);
+            Gauge.Builder<AtomicLong> b = Gauge.builder(name, h.value, v -> h.valid ? v.get() / scale : Double.NaN).tags(tags);
             if (unit != null) b.baseUnit(unit);
             h.id = b.register(reg).getId();
             return h;
         });
         g.updated = now;
-        if (value != null) g.value.set(value.longValue());
+        if (value != null) { g.value.set(value.longValue()); g.valid = true; }
         return g;
+        }
     }
 
     private void removeRoundGauges(String round) {
-        for (Map.Entry<String, G> e : gauges.entrySet()) {
-            G g = e.getValue();
-            if (g.round != null && (round == null || round.equals(g.round)) && gauges.remove(e.getKey(), g)) reg.remove(g.id);
+        synchronized (lock) {
+            for (Map.Entry<String, G> e : gauges.entrySet()) {
+                G g = e.getValue();
+                if (g.round != null && (round == null || round.equals(g.round)) && gauges.remove(e.getKey(), g)) reg.remove(g.id);
+            }
         }
         if (round != null) graphCache.remove(round);
     }
 
+    /** Called with {@link #lock} held. */
     private void sweep(long now) {
         if (now - lastSweep < SWEEP_EVERY_MILLIS) return;
         lastSweep = now;
